@@ -58,20 +58,17 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- start_or_resume_session(workspace, issue, dispatch_id) do
       try do
-        with :ok <-
-               do_run_codex_turns(
-                 session,
-                 workspace,
-                 issue,
-                 codex_update_recipient,
-                 opts,
-                 issue_state_fetcher,
-                 1,
-                 max_turns
-               ) do
-          persist_session_meta(workspace, session, dispatch_id, issue)
-          :ok
-        end
+        do_run_codex_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          dispatch_id,
+          1,
+          max_turns
+        )
       after
         AppServer.stop_session(session)
       end
@@ -85,6 +82,7 @@ defmodule SymphonyElixir.AgentRunner do
          codex_update_recipient,
          opts,
          issue_state_fetcher,
+         dispatch_id,
          turn_number,
          max_turns
        ) do
@@ -101,6 +99,10 @@ defmodule SymphonyElixir.AgentRunner do
         "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
       )
 
+      # Persist session meta eagerly after each turn so it survives
+      # orchestrator kill on issue state change (race condition fix)
+      persist_session_meta(workspace, app_session, dispatch_id, issue)
+
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info(
@@ -114,6 +116,7 @@ defmodule SymphonyElixir.AgentRunner do
             codex_update_recipient,
             opts,
             issue_state_fetcher,
+            dispatch_id,
             turn_number + 1,
             max_turns
           )
