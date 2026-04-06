@@ -80,12 +80,10 @@ defmodule SymphonyElixir.AppServerTest do
           2)
             ;;
           3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-resumed"}}}'
+            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resumed"}}}'
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-resumed"}}}'
-            ;;
-          5)
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;

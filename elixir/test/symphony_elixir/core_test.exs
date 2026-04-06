@@ -1121,6 +1121,7 @@ defmodule SymphonyElixir.CoreTest do
       trace_file = Path.join(test_root, "codex-resume.trace")
       counter_file = Path.join(test_root, "codex-run.counter")
 
+      File.mkdir_p!(test_root)
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-resume.trace}"
@@ -1159,7 +1160,7 @@ defmodule SymphonyElixir.CoreTest do
           2:2)
             ;;
           2:3)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-resumed"}}}'
+            printf '%s\\n' '{"id":4,"result":{"thread":{"id":"thread-resumed"}}}'
             ;;
           2:4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-second"}}}'
@@ -1242,6 +1243,7 @@ defmodule SymphonyElixir.CoreTest do
       trace_file = Path.join(test_root, "codex-resume-fallback.trace")
       counter_file = Path.join(test_root, "codex-run.counter")
 
+      File.mkdir_p!(test_root)
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-resume-fallback.trace}"
