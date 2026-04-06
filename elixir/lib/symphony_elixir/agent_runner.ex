@@ -20,7 +20,9 @@ defmodule SymphonyElixir.AgentRunner do
           else
             {:error, reason} ->
               Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-              raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+
+              raise RuntimeError,
+                    "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
           end
         after
           Workspace.run_after_run_hook(workspace, issue)
@@ -48,18 +50,44 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace) do
+    issue_state_fetcher =
+      Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+
+    dispatch_id = build_dispatch_id(issue, opts)
+
+    with {:ok, session} <- start_or_resume_session(workspace, issue, dispatch_id) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        with :ok <-
+               do_run_codex_turns(
+                 session,
+                 workspace,
+                 issue,
+                 codex_update_recipient,
+                 opts,
+                 issue_state_fetcher,
+                 1,
+                 max_turns
+               ) do
+          persist_session_meta(workspace, session, dispatch_id, issue)
+          :ok
+        end
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -69,11 +97,15 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+      )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          Logger.info(
+            "Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}"
+          )
 
           do_run_codex_turns(
             app_session,
@@ -87,7 +119,9 @@ defmodule SymphonyElixir.AgentRunner do
           )
 
         {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          Logger.info(
+            "Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator"
+          )
 
           :ok
 
@@ -114,7 +148,8 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher)
+       when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) do
@@ -146,6 +181,134 @@ defmodule SymphonyElixir.AgentRunner do
     state_name
     |> String.trim()
     |> String.downcase()
+  end
+
+  defp start_or_resume_session(workspace, issue, dispatch_id) do
+    expanded_workspace = Path.expand(workspace)
+
+    case Workspace.load_session_meta(workspace) do
+      {:ok, %{thread_id: thread_id, cwd: saved_cwd}} when byte_size(thread_id) > 0 ->
+        if saved_cwd != nil and Path.expand(saved_cwd) != expanded_workspace do
+          Logger.warning(
+            "Session meta cwd mismatch for #{issue_context(issue)} saved=#{saved_cwd} current=#{expanded_workspace}; starting fresh"
+          )
+
+          maybe_invalidate_stale_session_meta(workspace, issue, dispatch_id, :cwd_mismatch)
+          start_fresh_session(workspace, issue, dispatch_id)
+        else
+          Logger.info(
+            "Starting Codex session via resume for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace} thread_id=#{thread_id}"
+          )
+
+          case AppServer.resume_session(workspace, thread_id) do
+            {:ok, session} ->
+              {:ok, session}
+
+            {:error, reason} ->
+              Logger.warning(
+                "Codex session resume failed for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace} thread_id=#{thread_id}: #{inspect(reason)}"
+              )
+
+              maybe_invalidate_stale_session_meta(workspace, issue, dispatch_id, reason)
+              start_fresh_session(workspace, issue, dispatch_id)
+          end
+        end
+
+      {:ok, %{thread_id: _}} ->
+        Logger.warning(
+          "Session meta has empty thread_id for #{issue_context(issue)}; starting fresh"
+        )
+
+        maybe_invalidate_stale_session_meta(workspace, issue, dispatch_id, :empty_thread_id)
+        start_fresh_session(workspace, issue, dispatch_id)
+
+      {:error, :enoent} ->
+        start_fresh_session(workspace, issue, dispatch_id)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Ignoring unreadable session metadata for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace}: #{inspect(reason)}"
+        )
+
+        maybe_invalidate_stale_session_meta(workspace, issue, dispatch_id, reason)
+        start_fresh_session(workspace, issue, dispatch_id)
+    end
+  end
+
+  defp start_fresh_session(workspace, issue, dispatch_id) do
+    Logger.info(
+      "Starting Codex session fresh for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace}"
+    )
+
+    AppServer.start_session(workspace)
+  end
+
+  defp maybe_invalidate_stale_session_meta(workspace, issue, dispatch_id, reason) do
+    case Workspace.invalidate_session_meta(workspace) do
+      :ok ->
+        :ok
+
+      {:error, invalidate_reason} ->
+        Logger.warning(
+          "Failed to invalidate stale session metadata for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace} original_reason=#{inspect(reason)} invalidate_reason=#{inspect(invalidate_reason)}; overwriting with empty meta to prevent retry loop"
+        )
+
+        # If we can't delete the stale meta, overwrite it with an invalid one
+        # to prevent the next dispatch from retrying the same stale thread_id
+        File.write(Path.join(workspace, ".symphony_session.json"), "{}")
+        :ok
+    end
+  end
+
+  defp persist_session_meta(workspace, session, dispatch_id, issue) do
+    session_meta = %{
+      thread_id: session.thread_id,
+      dispatch_id: dispatch_id,
+      cwd: Path.expand(workspace),
+      git_head: current_git_head(workspace),
+      updated_at: DateTime.utc_now()
+    }
+
+    case Workspace.save_session_meta(workspace, session_meta) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to persist session metadata for #{issue_context(issue)} dispatch_id=#{dispatch_id} workspace=#{workspace}: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp current_git_head(workspace) do
+    task = Task.async(fn ->
+      System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true)
+    end)
+
+    case Task.yield(task, 5_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} ->
+        case String.trim(output) do
+          "" -> nil
+          git_head -> git_head
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp build_dispatch_id(%Issue{id: issue_id, identifier: identifier}, opts) do
+    dispatch_token = System.unique_integer([:positive, :monotonic])
+
+    case Keyword.get(opts, :attempt) do
+      attempt when is_integer(attempt) ->
+        "#{issue_id || identifier || "dispatch"}-attempt-#{attempt}-#{dispatch_token}"
+
+      _ ->
+        "#{issue_id || identifier || "dispatch"}-#{dispatch_token}"
+    end
   end
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do

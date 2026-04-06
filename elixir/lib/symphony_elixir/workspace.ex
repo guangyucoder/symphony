@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.Config
 
   @excluded_entries MapSet.new([".elixir_ls", "tmp"])
+  @session_meta_file ".symphony_session.json"
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
@@ -24,8 +25,53 @@ defmodule SymphonyElixir.Workspace do
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
-        Logger.error("Workspace creation failed #{issue_log_context(issue_context)} error=#{Exception.message(error)}")
+        Logger.error(
+          "Workspace creation failed #{issue_log_context(issue_context)} error=#{Exception.message(error)}"
+        )
+
         {:error, error}
+    end
+  end
+
+  @spec save_session_meta(Path.t(), map()) :: :ok | {:error, term()}
+  def save_session_meta(workspace, %{thread_id: thread_id} = meta)
+      when is_binary(workspace) and is_binary(thread_id) do
+    meta_path = session_meta_path(workspace)
+    tmp_path = "#{meta_path}.tmp-#{System.unique_integer([:positive])}"
+
+    with :ok <- File.mkdir_p(workspace),
+         {:ok, encoded_meta} <- Jason.encode(serialized_session_meta(meta)),
+         :ok <- File.write(tmp_path, encoded_meta),
+         :ok <- File.rename(tmp_path, meta_path) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(tmp_path)
+        {:error, reason}
+
+      error ->
+        File.rm(tmp_path)
+        error
+    end
+  end
+
+  def save_session_meta(_workspace, _meta), do: {:error, :invalid_session_meta}
+
+  @spec load_session_meta(Path.t()) :: {:ok, map()} | {:error, term()}
+  def load_session_meta(workspace) when is_binary(workspace) do
+    with {:ok, contents} <- File.read(session_meta_path(workspace)),
+         {:ok, meta} <- Jason.decode(contents),
+         {:ok, normalized_meta} <- normalize_session_meta(meta) do
+      {:ok, normalized_meta}
+    end
+  end
+
+  @spec invalidate_session_meta(Path.t()) :: :ok | {:error, term()}
+  def invalidate_session_meta(workspace) when is_binary(workspace) do
+    case File.rm(session_meta_path(workspace)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -112,9 +158,45 @@ defmodule SymphonyElixir.Workspace do
     Path.join(Config.workspace_root(), safe_id)
   end
 
+  defp session_meta_path(workspace) when is_binary(workspace) do
+    Path.join(workspace, @session_meta_file)
+  end
+
   defp safe_identifier(identifier) do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
   end
+
+  defp serialized_session_meta(meta) when is_map(meta) do
+    %{
+      "thread_id" => meta[:thread_id],
+      "dispatch_id" => meta[:dispatch_id],
+      "cwd" => meta[:cwd],
+      "git_head" => meta[:git_head],
+      "updated_at" => serialize_session_meta_updated_at(meta[:updated_at])
+    }
+  end
+
+  defp serialize_session_meta_updated_at(%DateTime{} = updated_at),
+    do: DateTime.to_iso8601(updated_at)
+
+  defp serialize_session_meta_updated_at(updated_at), do: updated_at
+
+  defp normalize_session_meta(%{"thread_id" => thread_id} = meta) when is_binary(thread_id) do
+    {:ok,
+     %{
+       thread_id: thread_id,
+       dispatch_id: normalize_optional_session_meta_value(meta["dispatch_id"]),
+       cwd: normalize_optional_session_meta_value(meta["cwd"]),
+       git_head: normalize_optional_session_meta_value(meta["git_head"]),
+       updated_at: normalize_optional_session_meta_value(meta["updated_at"])
+     }}
+  end
+
+  defp normalize_session_meta(_meta), do: {:error, :invalid_session_meta}
+
+  defp normalize_optional_session_meta_value(value) when is_binary(value), do: value
+  defp normalize_optional_session_meta_value(nil), do: nil
+  defp normalize_optional_session_meta_value(_value), do: nil
 
   defp clean_tmp_artifacts(workspace) do
     Enum.each(MapSet.to_list(@excluded_entries), fn entry ->
@@ -166,7 +248,9 @@ defmodule SymphonyElixir.Workspace do
   defp run_hook(command, workspace, issue_context, hook_name) do
     timeout_ms = Config.workspace_hooks()[:timeout_ms]
 
-    Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace}")
+    Logger.info(
+      "Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace}"
+    )
 
     task =
       Task.async(fn ->
@@ -180,7 +264,9 @@ defmodule SymphonyElixir.Workspace do
       nil ->
         Task.shutdown(task, :brutal_kill)
 
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms}")
+        Logger.warning(
+          "Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms}"
+        )
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
     end
@@ -193,7 +279,9 @@ defmodule SymphonyElixir.Workspace do
   defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name) do
     sanitized_output = sanitize_hook_output_for_log(output)
 
-    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
+    Logger.warning(
+      "Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}"
+    )
 
     {:error, {:workspace_hook_failed, hook_name, status, output}}
   end
