@@ -82,6 +82,17 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  test "compact_between_turns config defaults and overrides" do
+    write_workflow_file!(Workflow.workflow_file_path())
+    assert Config.codex_compact_between_turns?() == true
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_compact_between_turns: false)
+    assert Config.codex_compact_between_turns?() == false
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_compact_between_turns: true)
+    assert Config.codex_compact_between_turns?() == true
+  end
+
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
@@ -1022,6 +1033,10 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
+            printf '%s\\n' '{"id":5,"result":{"status":"completed"}}'
+            printf '%s\\n' '{"method":"thread/compacted","params":{}}'
+            ;;
+          6)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
@@ -1402,6 +1417,10 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
+            printf '%s\\n' '{"id":5,"result":{"status":"completed"}}'
+            printf '%s\\n' '{"method":"thread/compacted","params":{}}'
+            ;;
+          6)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;

@@ -96,6 +96,18 @@ defmodule SymphonyElixir.Workspace do
     {:ok, true}
   end
 
+  @doc "Ensure the .symphony/ control directory exists inside a workspace."
+  @spec ensure_symphony_dir(Path.t()) :: :ok | {:error, term()}
+  def ensure_symphony_dir(workspace) when is_binary(workspace) do
+    File.mkdir_p(Path.join(workspace, ".symphony"))
+  end
+
+  @doc "Return the .symphony/ directory path for a workspace."
+  @spec symphony_dir(Path.t()) :: Path.t()
+  def symphony_dir(workspace) when is_binary(workspace) do
+    Path.join(workspace, ".symphony")
+  end
+
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace) do
     case File.exists?(workspace) do

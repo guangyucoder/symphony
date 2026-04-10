@@ -36,7 +36,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      unit_history: %{}
     ]
   end
 
@@ -146,6 +147,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> maybe_record_unit_history(issue_id, update)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -598,9 +600,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt) do
     recipient = self()
 
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt)
-         end) do
+    runner_fn =
+      if Config.unit_lite?() do
+        fn -> AgentRunner.run_unit_lite(issue, recipient, attempt: attempt) end
+      else
+        fn -> AgentRunner.run(issue, recipient, attempt: attempt) end
+      end
+
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, runner_fn) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
@@ -625,7 +632,10 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            unit_kind: nil,
+            unit_display_name: nil,
+            reasoning_effort: nil
           })
 
         %{
@@ -670,9 +680,27 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        unit_history: Map.delete(state.unit_history, issue_id)
     }
   end
+
+  # Accumulate completed unit entries so the dashboard can show stage history.
+  defp maybe_record_unit_history(state, issue_id, %{event: :unit_completed} = update) do
+    entry = %{
+      unit_kind: Map.get(update, :unit_kind),
+      unit_display_name: Map.get(update, :unit_display_name),
+      reasoning_effort: Map.get(update, :reasoning_effort),
+      tokens: Map.get(update, :unit_tokens, %{}),
+      result: Map.get(update, :closeout_result, :accepted),
+      completed_at: Map.get(update, :timestamp)
+    }
+
+    history = Map.get(state.unit_history, issue_id, [])
+    %{state | unit_history: Map.put(state.unit_history, issue_id, history ++ [entry])}
+  end
+
+  defp maybe_record_unit_history(state, _issue_id, _update), do: state
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
@@ -795,22 +823,28 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) do
-      {:noreply, dispatch_issue(state, issue, attempt)}
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+    cond do
+      Map.has_key?(state.running, issue.id) ->
+        Logger.debug("Retry skipped: #{issue_context(issue)} already running")
+        {:noreply, state}
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+      retry_candidate_issue?(issue, terminal_state_set()) and
+          dispatch_slots_available?(issue, state) ->
+        {:noreply, dispatch_issue(state, issue, attempt)}
+
+      true ->
+        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "no available orchestrator slots"
+           })
+         )}
     end
   end
 
@@ -936,7 +970,11 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          unit_kind: Map.get(metadata, :unit_kind),
+          unit_display_name: Map.get(metadata, :unit_display_name),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
+          completed_units: Map.get(state.unit_history, issue_id, [])
         }
       end)
 
@@ -995,23 +1033,34 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
-      Map.merge(running_entry, %{
-        last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
-        session_id: session_id_for_update(running_entry.session_id, update),
-        last_codex_event: event,
-        codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
-        codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
-        codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
-        codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
-        codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-        codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
-        codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
-    }
+    merged = Map.merge(running_entry, %{
+      last_codex_timestamp: timestamp,
+      last_codex_message: summarize_codex_update(update),
+      session_id: session_id_for_update(running_entry.session_id, update),
+      last_codex_event: event,
+      codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
+      codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
+      codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
+      codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+      codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
+      codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
+      codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+      turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+    })
+
+    # Capture unit-lite stage info from :unit_dispatched events
+    merged =
+      if event == :unit_dispatched do
+        Map.merge(merged, %{
+          unit_kind: Map.get(update, :unit_kind),
+          unit_display_name: Map.get(update, :unit_display_name),
+          reasoning_effort: Map.get(update, :reasoning_effort)
+        })
+      else
+        merged
+      end
+
+    {merged, token_delta}
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})

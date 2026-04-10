@@ -97,6 +97,38 @@ defmodule SymphonyElixir.Config do
                                  max_concurrent_agents_by_state: [
                                    type: {:map, :string, :pos_integer},
                                    default: %{}
+                                 ],
+                                 execution_mode: [
+                                   type: {:in, ["legacy", "unit_lite"]},
+                                   default: "legacy"
+                                 ]
+                               ]
+                             ],
+                             verification: [
+                               type: :map,
+                               default: %{},
+                               keys: [
+                                 baseline_commands: [
+                                   type: {:list, :string},
+                                   default: []
+                                 ],
+                                 full_commands: [
+                                   type: {:list, :string},
+                                   default: []
+                                 ],
+                                 timeout_ms: [
+                                   type: :pos_integer,
+                                   default: 300_000
+                                 ]
+                               ]
+                             ],
+                             docs: [
+                               type: :map,
+                               default: %{},
+                               keys: [
+                                 doc_impact_command: [
+                                   type: {:or, [:string, nil]},
+                                   default: nil
                                  ]
                                ]
                              ],
@@ -116,6 +148,10 @@ defmodule SymphonyElixir.Config do
                                  stall_timeout_ms: [
                                    type: :integer,
                                    default: @default_codex_stall_timeout_ms
+                                 ],
+                                 compact_between_turns: [
+                                   type: :boolean,
+                                   default: true
                                  ]
                                ]
                              ],
@@ -249,6 +285,34 @@ defmodule SymphonyElixir.Config do
     get_in(validated_workflow_options(), [:hooks, :timeout_ms])
   end
 
+  @spec execution_mode() :: String.t()
+  def execution_mode do
+    get_in(validated_workflow_options(), [:agent, :execution_mode])
+  end
+
+  @spec unit_lite?() :: boolean()
+  def unit_lite?, do: execution_mode() == "unit_lite"
+
+  @spec verification_baseline_commands() :: [String.t()]
+  def verification_baseline_commands do
+    get_in(validated_workflow_options(), [:verification, :baseline_commands]) || []
+  end
+
+  @spec verification_full_commands() :: [String.t()]
+  def verification_full_commands do
+    get_in(validated_workflow_options(), [:verification, :full_commands]) || []
+  end
+
+  @spec verification_timeout_ms() :: pos_integer()
+  def verification_timeout_ms do
+    get_in(validated_workflow_options(), [:verification, :timeout_ms]) || 300_000
+  end
+
+  @spec doc_impact_command() :: String.t() | nil
+  def doc_impact_command do
+    get_in(validated_workflow_options(), [:docs, :doc_impact_command])
+  end
+
   @spec max_concurrent_agents() :: pos_integer()
   def max_concurrent_agents do
     get_in(validated_workflow_options(), [:agent, :max_concurrent_agents])
@@ -317,6 +381,11 @@ defmodule SymphonyElixir.Config do
     validated_workflow_options()
     |> get_in([:codex, :stall_timeout_ms])
     |> max(0)
+  end
+
+  @spec codex_compact_between_turns?() :: boolean()
+  def codex_compact_between_turns? do
+    get_in(validated_workflow_options(), [:codex, :compact_between_turns])
   end
 
   @spec workflow_prompt() :: String.t()
@@ -453,7 +522,9 @@ defmodule SymphonyElixir.Config do
       codex: extract_codex_options(section_map(config, "codex")),
       hooks: extract_hooks_options(section_map(config, "hooks")),
       observability: extract_observability_options(section_map(config, "observability")),
-      server: extract_server_options(section_map(config, "server"))
+      server: extract_server_options(section_map(config, "server")),
+      verification: extract_verification_options(section_map(config, "verification")),
+      docs: extract_docs_options(section_map(config, "docs"))
     }
   end
 
@@ -486,6 +557,7 @@ defmodule SymphonyElixir.Config do
       :max_concurrent_agents_by_state,
       state_limits_value(Map.get(section, "max_concurrent_agents_by_state"))
     )
+    |> put_if_present(:execution_mode, scalar_string_value(Map.get(section, "execution_mode")))
   end
 
   defp extract_codex_options(section) do
@@ -494,6 +566,7 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:turn_timeout_ms, integer_value(Map.get(section, "turn_timeout_ms")))
     |> put_if_present(:read_timeout_ms, integer_value(Map.get(section, "read_timeout_ms")))
     |> put_if_present(:stall_timeout_ms, integer_value(Map.get(section, "stall_timeout_ms")))
+    |> put_if_present(:compact_between_turns, boolean_value(Map.get(section, "compact_between_turns")))
   end
 
   defp extract_hooks_options(section) do
@@ -516,6 +589,18 @@ defmodule SymphonyElixir.Config do
     %{}
     |> put_if_present(:port, non_negative_integer_value(Map.get(section, "port")))
     |> put_if_present(:host, scalar_string_value(Map.get(section, "host")))
+  end
+
+  defp extract_verification_options(section) do
+    %{}
+    |> put_if_present(:baseline_commands, csv_value(Map.get(section, "baseline_commands")))
+    |> put_if_present(:full_commands, csv_value(Map.get(section, "full_commands")))
+    |> put_if_present(:timeout_ms, positive_integer_value(Map.get(section, "timeout_ms")))
+  end
+
+  defp extract_docs_options(section) do
+    %{}
+    |> put_if_present(:doc_impact_command, scalar_string_value(Map.get(section, "doc_impact_command")))
   end
 
   defp section_map(config, key) do

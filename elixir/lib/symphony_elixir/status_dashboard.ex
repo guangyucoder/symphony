@@ -579,15 +579,58 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       running
       |> Enum.sort_by(& &1.identifier)
-      |> Enum.map(&format_running_summary(&1, running_event_width))
+      |> Enum.flat_map(fn entry ->
+        completed_rows = format_completed_unit_rows(entry)
+        current_row = format_running_summary(entry, running_event_width)
+        completed_rows ++ [current_row]
+      end)
+    end
+  end
+
+  # Render completed units as dim sub-rows above the current running entry.
+  defp format_completed_unit_rows(running_entry) do
+    completed = Map.get(running_entry, :completed_units, [])
+
+    if completed == [] do
+      []
+    else
+      Enum.map(completed, fn cu ->
+        kind = compact_unit_kind(
+          cu[:unit_kind] || "",
+          cu[:unit_display_name]
+        )
+        effort = effort_label(cu[:reasoning_effort])
+        tokens = Map.get(cu[:tokens] || %{}, :total_tokens, 0)
+        result_icon = case cu[:result] do
+          :accepted -> "✓"
+          {:retry, _} -> "↻"
+          {:fail, _} -> "✗"
+          _ -> "✓"
+        end
+
+        stage_text = format_cell("#{result_icon} #{kind} #{effort}", @running_stage_width)
+        tokens_text = format_count(tokens) |> format_cell(@running_tokens_width, :right)
+
+        "│   " <>
+          format_cell("", @running_id_width) <>
+          " " <>
+          colorize(stage_text, @ansi_dim) <>
+          " " <>
+          format_cell("", @running_pid_width) <>
+          " " <>
+          format_cell("", @running_age_width) <>
+          " " <>
+          colorize(tokens_text, @ansi_dim) <>
+          " " <>
+          colorize(format_cell("done", @running_session_width), @ansi_dim)
+      end)
     end
   end
 
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
-    state_display = format_cell(to_string(state), @running_stage_width)
+    stage_display = format_stage_display(running_entry)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
     total_tokens = running_entry.codex_total_tokens || 0
@@ -608,13 +651,15 @@ defmodule SymphonyElixir.StatusDashboard do
         _ -> @ansi_blue
       end
 
+    effort_color = effort_color(Map.get(running_entry, :reasoning_effort))
+
     [
       "│ ",
       status_dot(status_color),
       " ",
       colorize(issue, @ansi_cyan),
       " ",
-      colorize(state_display, status_color),
+      colorize(stage_display, effort_color),
       " ",
       colorize(pid, @ansi_yellow),
       " ",
@@ -628,6 +673,44 @@ defmodule SymphonyElixir.StatusDashboard do
     ]
     |> Enum.join("")
   end
+
+  # Format the STAGE column: show unit kind + effort when in unit-lite mode,
+  # fall back to Linear issue state for legacy mode.
+  defp format_stage_display(running_entry) do
+    case Map.get(running_entry, :unit_kind) do
+      kind when is_binary(kind) and kind != "" ->
+        effort = effort_label(Map.get(running_entry, :reasoning_effort))
+        # Compact unit display name for long names like "implement_subtask:plan-1"
+        compact = compact_unit_kind(kind, Map.get(running_entry, :unit_display_name))
+        format_cell("#{compact} #{effort}", @running_stage_width)
+
+      _ ->
+        state = running_entry.state || "unknown"
+        format_cell(to_string(state), @running_stage_width)
+    end
+  end
+
+  defp compact_unit_kind("implement_subtask", display_name) when is_binary(display_name) do
+    # "implement_subtask:plan-1" → "impl:plan-1"
+    case String.split(display_name, ":", parts: 2) do
+      [_, id] -> "impl:#{id}"
+      _ -> "impl"
+    end
+  end
+
+  defp compact_unit_kind(kind, _display_name), do: kind
+
+  defp effort_label("low"), do: "L"
+  defp effort_label("medium"), do: "M"
+  defp effort_label("high"), do: "H"
+  defp effort_label("xhigh"), do: "XH"
+  defp effort_label(_), do: ""
+
+  defp effort_color("low"), do: @ansi_dim
+  defp effort_color("medium"), do: @ansi_blue
+  defp effort_color("high"), do: @ansi_yellow
+  defp effort_color("xhigh"), do: @ansi_green
+  defp effort_color(_), do: @ansi_gray
 
   @doc false
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()

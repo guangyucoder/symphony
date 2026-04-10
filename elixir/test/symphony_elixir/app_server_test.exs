@@ -1191,4 +1191,186 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "compact_thread sends thread/compact/start and handles success" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-compact-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-compact")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-compact.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      # Fake codex that handles: initialize, thread/start, turn/start+completed,
+      # then thread/compact/start with success response
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-compact.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-compact-1"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":5,"result":{"status":"completed"}}'
+            printf '%s\\n' '{"method":"thread/compacted","params":{}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never",
+        codex_thread_sandbox: "danger-full-access",
+        codex_turn_sandbox_policy: %{type: "dangerFullAccess", networkAccess: true}
+      )
+
+      issue = %Issue{
+        id: "issue-compact",
+        identifier: "MT-compact",
+        title: "Test compact",
+        description: "Verify thread compact protocol",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-compact",
+        labels: []
+      }
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+      assert session.thread_id == "thread-compact-1"
+
+      assert {:ok, _turn_result} = AppServer.run_turn(session, "Do work", issue)
+
+      assert :ok = AppServer.compact_thread(session)
+
+      AppServer.stop_session(session)
+      # Allow the fake codex process to finish writing its trace file
+      Process.sleep(100)
+
+      # Verify compact message was sent
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["method"] == "thread/compact/start" &&
+                   get_in(payload, ["params", "threadId"]) == "thread-compact-1"
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "compact_thread handles error response gracefully" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-compact-err-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-compact-err")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      # Fake codex that returns an error for compact
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-err"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-err"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":5,"error":{"code":-32600,"message":"compact not supported"}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never",
+        codex_thread_sandbox: "danger-full-access",
+        codex_turn_sandbox_policy: %{type: "dangerFullAccess", networkAccess: true}
+      )
+
+      issue = %Issue{
+        id: "issue-compact-err",
+        identifier: "MT-compact-err",
+        title: "Test compact error",
+        description: "Verify compact error handling",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-compact-err",
+        labels: []
+      }
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+      assert {:ok, _turn_result} = AppServer.run_turn(session, "Do work", issue)
+
+      # Compact fails but returns error, not crash
+      assert {:error, {:compact_error, _}} = AppServer.compact_thread(session)
+
+      AppServer.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end

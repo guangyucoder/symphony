@@ -5,7 +5,398 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Workspace}
+
+  @max_escalate_attempts 3
+
+  @doc """
+  Unit-lite mode: resolve the next unit, run a single fresh Codex session for it,
+  then exit. The orchestrator will re-dispatch for the next unit.
+  """
+  @spec run_unit_lite(map(), pid() | nil, keyword()) :: :ok | no_return()
+  def run_unit_lite(issue, codex_update_recipient \\ nil, opts \\ []) do
+    case Workspace.create_for_issue(issue) do
+      {:ok, workspace} ->
+        Workspace.ensure_symphony_dir(workspace)
+        run_unit_lite_in_workspace(workspace, issue, codex_update_recipient, opts)
+
+      {:error, reason} ->
+        Logger.error("unit_lite: workspace creation failed for #{issue_context(issue)}: #{inspect(reason)}")
+        raise RuntimeError, "unit_lite workspace failed: #{inspect(reason)}"
+    end
+  end
+
+  defp run_unit_lite_in_workspace(workspace, issue, codex_update_recipient, opts) do
+    # 1. Initialize issue_exec if needed
+    case IssueExec.read(workspace) do
+      {:ok, %{"mode" => "unit_lite"}} -> :ok
+      {:ok, _} -> IssueExec.init(workspace)
+      {:error, _} -> IssueExec.init(workspace)
+    end
+
+    # 1b. Clear stale exec state when entering Rework.
+    # The previous cycle may have left current_unit set (e.g., "handoff" was
+    # in-flight when the issue moved to Rework). We clear it so DispatchResolver
+    # sees a clean state. Also invalidate last_verified_sha so verify is
+    # required after fixes.
+    issue_state = issue_state_string(issue)
+
+    if issue_state == "rework" do
+      case IssueExec.read(workspace) do
+        {:ok, exec_check} when is_map(exec_check) ->
+          current = exec_check["current_unit"]
+          last = exec_check["last_accepted_unit"]
+
+          # 1. Fresh rework entry: last_accepted is handoff/verify/merge from
+          #    previous cycle, current_unit is nil (clean exit). Clear
+          #    rework_fix_applied so the fix rule fires for this new cycle.
+          fresh_rework? = is_nil(current) and
+                          is_map(last) and last["kind"] in ["handoff", "verify", "merge"]
+
+          if fresh_rework? do
+            IssueExec.update(workspace, %{
+              "rework_fix_applied" => false,
+              "last_verified_sha" => nil
+            })
+          end
+
+          # 2. Stale current_unit from previous cycle (e.g., handoff was
+          #    in-flight). Clear it so DispatchResolver sees clean state.
+          #    Do NOT clear rework_fix_applied here — verify/doc_fix during
+          #    rework are part of the current cycle, not stale.
+          stale? = current != nil and
+                   not (is_binary(current["subtask_id"]) and
+                        String.starts_with?(current["subtask_id"], "rework-"))
+
+          if stale? do
+            IssueExec.update(workspace, %{
+              "current_unit" => nil,
+              "last_verified_sha" => nil
+            })
+          end
+
+        _ ->
+          Logger.warning("unit_lite: could not read exec for rework cleanup, skipping")
+      end
+    end
+
+    # 2. Read workpad text — from opts or fetch from Linear
+    workpad_text =
+      case Keyword.get(opts, :workpad_text) do
+        text when is_binary(text) -> text
+        _ -> fetch_workpad_from_linear(issue)
+      end
+
+    # 3. Get git HEAD
+    git_head = current_git_head(workspace)
+
+    # 5. Read exec state and resolve next unit
+    {:ok, exec} = IssueExec.read(workspace)
+
+    ctx = %{
+      issue: issue_to_dispatch_map(issue),
+      exec: exec,
+      workpad_text: workpad_text,
+      git_head: git_head
+    }
+
+    case DispatchResolver.resolve(ctx) do
+      {:dispatch, unit} ->
+        Logger.info("unit_lite: dispatching #{unit.display_name} (effort=#{unit.reasoning_effort}) for #{issue_context(issue)}")
+        execute_unit(workspace, issue, unit, codex_update_recipient, opts)
+
+      {:stop, :circuit_breaker} ->
+        Logger.error("unit_lite: circuit breaker tripped for #{issue_context(issue)}")
+        escalate_to_human(workspace, issue, "Circuit breaker: unit crashed #{@max_escalate_attempts}+ times consecutively")
+
+      {:stop, :no_matching_rule} ->
+        Logger.warning("unit_lite: no matching rule for #{issue_context(issue)} — possible infrastructure issue (git_head=nil?)")
+        escalate_to_human(workspace, issue, "No matching dispatch rule — check workspace git state")
+
+      {:stop, reason} ->
+        Logger.info("unit_lite: stopping for #{issue_context(issue)} reason=#{inspect(reason)}")
+        :ok
+
+      :skip ->
+        Logger.info("unit_lite: skip for #{issue_context(issue)}")
+        :ok
+    end
+  end
+
+  defp execute_unit(workspace, issue, unit, codex_update_recipient, opts) do
+    # Record unit start
+    IssueExec.start_unit(workspace, Unit.to_map(unit))
+    Ledger.unit_started(workspace, Unit.to_map(unit))
+
+    # Notify orchestrator/dashboard of unit dispatch
+    send_codex_update(codex_update_recipient, issue, %{
+      event: :unit_dispatched,
+      timestamp: DateTime.utc_now(),
+      unit_kind: to_string(unit.kind),
+      unit_display_name: unit.display_name,
+      reasoning_effort: unit.reasoning_effort
+    })
+
+    # Run before_run hook
+    Workspace.run_before_run_hook(workspace, issue)
+
+    # Build prompt
+    prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
+
+    # Per-unit debug log
+    {:ok, unit_log_path} = UnitLog.open(workspace, unit)
+    UnitLog.log_prompt(unit_log_path, prompt)
+
+    # Token counter — accumulates from codex events during this unit
+    token_counter = :counters.new(3, [:atomics])
+    # indices: 1=input, 2=output, 3=total
+
+    token_tracking_handler = fn message ->
+      # Forward to orchestrator for dashboard
+      send_codex_update(codex_update_recipient, issue, message)
+      # Also accumulate locally for per-unit ledger entry
+      track_unit_tokens(token_counter, message)
+      # Per-unit debug log
+      UnitLog.log_codex_event(unit_log_path, message)
+    end
+
+    try do
+      case AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort) do
+        {:ok, session} ->
+        try do
+          case AppServer.run_turn(
+                 session,
+                 prompt,
+                 issue,
+                 on_message: token_tracking_handler
+               ) do
+            {:ok, _turn_session} ->
+              Logger.info("unit_lite: worker finished #{unit.display_name} for #{issue_context(issue)}")
+
+              # Run closeout — this is where verification, doc-impact, and
+              # acceptance checks actually happen. Without this, all protection
+              # mechanisms are dead code.
+              closeout_opts = Keyword.take(opts, [:workpad_text])
+              unit_map = Unit.to_map(unit)
+
+              unit_token_stats = read_token_counter(token_counter)
+
+              closeout_result = Closeout.run(workspace, unit_map, issue, closeout_opts)
+              UnitLog.log_closeout(unit_log_path, closeout_result, unit_token_stats)
+
+              case closeout_result do
+                :accepted ->
+                  commit_sha = current_git_head(workspace)
+                  IssueExec.accept_unit(workspace)
+
+                  if commit_sha do
+                    IssueExec.set_commit_sha(workspace, commit_sha)
+                  end
+
+                  Ledger.unit_accepted(workspace, unit_map, %{"commit" => commit_sha})
+                  Ledger.unit_tokens(workspace, unit_map, unit_token_stats)
+
+                  # Notify orchestrator so dashboard shows completed stage history
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: :accepted
+                  })
+
+                  Logger.info("unit_lite: accepted #{unit.display_name} tokens=#{unit_token_stats[:total_tokens]}")
+                  :ok
+
+                {:retry, reason} ->
+                  Logger.warning("unit_lite: closeout retry for #{unit.display_name}: #{reason}")
+                  Ledger.unit_failed(workspace, unit_map, reason)
+
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: {:retry, reason}
+                  })
+
+                  :ok
+
+                {:fail, reason} ->
+                  Logger.error("unit_lite: closeout rejected #{unit.display_name}: #{reason}")
+                  Ledger.unit_failed(workspace, unit_map, reason)
+
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: {:fail, reason}
+                  })
+
+                  raise RuntimeError, "unit_lite closeout rejected: #{reason}"
+              end
+
+            {:error, reason} ->
+              Logger.error("unit_lite: turn failed for #{unit.display_name}: #{inspect(reason)}")
+              UnitLog.log_error(unit_log_path, inspect(reason))
+              Ledger.unit_failed(workspace, Unit.to_map(unit), inspect(reason))
+              raise RuntimeError, "unit_lite turn failed: #{inspect(reason)}"
+          end
+        after
+          AppServer.stop_session(session)
+        end
+
+        {:error, reason} ->
+          Logger.error("unit_lite: session start failed for #{unit.display_name}: #{inspect(reason)}")
+          UnitLog.log_error(unit_log_path, "session_start_failed: #{inspect(reason)}")
+          Ledger.unit_failed(workspace, Unit.to_map(unit), "session_start_failed: #{inspect(reason)}")
+          raise RuntimeError, "unit_lite session start failed: #{inspect(reason)}"
+      end
+    after
+      Workspace.run_after_run_hook(workspace, issue)
+    end
+  end
+
+  # Track token usage from Codex on_message events.
+  # Codex reports tokens via "thread/tokenUsage/updated" events.
+  # Values are CUMULATIVE (not deltas), so we use :counters.put.
+  # We search multiple paths to match what the orchestrator does in extract_token_usage.
+  defp track_unit_tokens(counter, message) when is_map(message) do
+    usage = extract_usage_from_message(message)
+
+    if is_map(usage) do
+      input = first_integer(usage, ["inputTokens", "input_tokens", "prompt_tokens",
+                                    :inputTokens, :input_tokens])
+      output = first_integer(usage, ["outputTokens", "output_tokens", "completion_tokens",
+                                     :outputTokens, :output_tokens])
+      total = first_integer(usage, ["totalTokens", "total_tokens", "total",
+                                    :totalTokens, :total_tokens, :total])
+
+      # Cumulative values — put (not add)
+      if is_integer(input) and input > 0, do: :counters.put(counter, 1, input)
+      if is_integer(output) and output > 0, do: :counters.put(counter, 2, output)
+      if is_integer(total) and total > 0, do: :counters.put(counter, 3, total)
+    end
+  end
+
+  defp track_unit_tokens(_counter, _message), do: :ok
+
+  # Search all known paths where Codex puts token usage
+  defp extract_usage_from_message(msg) do
+    # Path priority (matching orchestrator's absolute_token_usage_from_payload):
+    # 1. payload.params.tokenUsage.total (raw JSON-RPC in payload)
+    # 2. payload.tokenUsage.total
+    # 3. params.tokenUsage.total (if emit_message merged params)
+    # 4. payload.params.msg.payload.info.total_token_usage (legacy)
+    # 5. :usage top-level (if AppServer's maybe_set_usage found "usage" key)
+    # 6. payload.usage (turn/completed with inline usage)
+    dig(msg, [:payload, "params", "tokenUsage", "total"]) ||
+      dig(msg, [:payload, "tokenUsage", "total"]) ||
+      dig(msg, ["params", "tokenUsage", "total"]) ||
+      dig(msg, [:payload, "params", "msg", "payload", "info", "total_token_usage"]) ||
+      Map.get(msg, :usage) ||
+      Map.get(msg, "usage") ||
+      dig(msg, [:payload, "usage"]) ||
+      dig(msg, [:details, "tokenUsage", "total"])
+  end
+
+  defp dig(map, []) when is_map(map), do: map
+  defp dig(map, [key | rest]) when is_map(map) do
+    case Map.get(map, key) do
+      nil -> nil
+      val -> dig(val, rest)
+    end
+  end
+  defp dig(_, _), do: nil
+
+  defp first_integer(map, keys) when is_map(map) do
+    Enum.find_value(keys, fn k ->
+      case Map.get(map, k) do
+        v when is_integer(v) -> v
+        _ -> nil
+      end
+    end)
+  end
+
+  defp read_token_counter(counter) do
+    %{
+      input_tokens: :counters.get(counter, 1),
+      output_tokens: :counters.get(counter, 2),
+      total_tokens: :counters.get(counter, 3)
+    }
+  end
+
+
+  defp fetch_workpad_from_linear(%Issue{id: issue_id}) when is_binary(issue_id) do
+    case Adapter.fetch_workpad_text(issue_id) do
+      {:ok, text} ->
+        Logger.info("unit_lite: fetched workpad from Linear for issue_id=#{issue_id}")
+        text
+
+      {:error, reason} ->
+        Logger.debug("unit_lite: no workpad found for issue_id=#{issue_id}: #{inspect(reason)}")
+        nil
+    end
+  end
+
+  defp fetch_workpad_from_linear(_issue), do: nil
+
+  defp escalate_to_human(workspace, issue, reason) do
+    issue_id = case issue do
+      %Issue{id: id} -> id
+      %{id: id} -> id
+      _ -> nil
+    end
+
+    if is_binary(issue_id) do
+      # Move ticket to Human Input Needed
+      case Adapter.update_issue_state(issue_id, "Human Input Needed") do
+        :ok ->
+          Logger.info("unit_lite: escalated #{issue_context(issue)} to Human Input Needed")
+
+        {:error, err} ->
+          Logger.warning("unit_lite: failed to escalate #{issue_context(issue)}: #{inspect(err)}")
+      end
+
+      # Post reason as comment
+      case Adapter.create_comment(issue_id, "**Symphony escalation**: #{reason}\n\nThis ticket needs human attention. Check `.symphony/ledger.jsonl` and `.symphony/units/` logs in the workspace for details.") do
+        :ok -> :ok
+        {:error, err} -> Logger.warning("unit_lite: escalation comment failed for #{issue_id}: #{inspect(err)}")
+      end
+    end
+
+    # Clear current_unit so when a human moves the ticket back to active,
+    # dispatch starts fresh instead of hitting the circuit breaker again.
+    IssueExec.update(workspace, %{"current_unit" => nil})
+    Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
+    :ok
+  end
+
+  defp issue_to_dispatch_map(%Issue{} = issue) do
+    %{state: issue.state || "Unknown"}
+  end
+
+  defp issue_to_dispatch_map(issue) when is_map(issue) do
+    %{state: Map.get(issue, :state) || Map.get(issue, "state") || "Unknown"}
+  end
+
+  defp issue_state_string(%Issue{state: state}) when is_binary(state) do
+    state |> String.trim() |> String.downcase()
+  end
+
+  defp issue_state_string(issue) when is_map(issue) do
+    state = Map.get(issue, :state) || Map.get(issue, "state") || ""
+    state |> to_string() |> String.trim() |> String.downcase()
+  end
+
+  defp issue_state_string(_), do: ""
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -109,6 +500,8 @@ defmodule SymphonyElixir.AgentRunner do
             "Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}"
           )
 
+          maybe_compact_thread(app_session, refreshed_issue)
+
           do_run_codex_turns(
             app_session,
             workspace,
@@ -145,9 +538,10 @@ defmodule SymphonyElixir.AgentRunner do
 
     - The previous Codex turn completed normally, but the Linear issue is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    - Resume from the current workspace and workpad state. Do not restart from scratch.
+    - Read the workpad to determine which phase was last completed, then continue with the next phase.
+    - The original task instructions and prior turn context are already present in this thread.
+    - Follow the Yield Policy: end the turn after completing the current phase.
     """
   end
 
@@ -170,6 +564,24 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp maybe_compact_thread(app_session, issue) do
+    if Config.codex_compact_between_turns?() do
+      Logger.info("Compacting thread before continuation for #{issue_context(issue)}")
+
+      case AppServer.compact_thread(app_session) do
+        :ok -> :ok
+        {:error, reason} ->
+          Logger.warning(
+            "Thread compact failed for #{issue_context(issue)}: #{inspect(reason)}; continuing without compact"
+          )
+
+          :ok
+      end
+    else
+      :ok
+    end
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

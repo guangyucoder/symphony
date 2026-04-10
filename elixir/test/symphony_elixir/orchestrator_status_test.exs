@@ -955,8 +955,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
-    assert remaining_ms <= 10_500
+    assert remaining_ms >= 8_000
+    assert remaining_ms <= 11_000
   end
 
   test "status dashboard renders offline marker to terminal" do

@@ -37,6 +37,112 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @comments_query """
+  query SymphonyFetchComments($issueId: String!) {
+    issue(id: $issueId) {
+      comments(first: 50) {
+        nodes {
+          id
+          body
+          user { name }
+          createdAt
+        }
+      }
+    }
+  }
+  """
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    case client_module().graphql(@comments_query, %{issueId: issue_id}) do
+      {:ok, response} ->
+        comments = get_in(response, ["data", "issue", "comments", "nodes"]) || []
+        {:ok, comments}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "Fetch the Codex Workpad comment body for an issue, if it exists."
+  @spec fetch_workpad_text(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def fetch_workpad_text(issue_id) when is_binary(issue_id) do
+    case fetch_issue_comments(issue_id) do
+      {:ok, comments} ->
+        workpad =
+          comments
+          |> Enum.find(fn c ->
+            body = c["body"] || ""
+            String.contains?(body, "## Codex Workpad") or String.contains?(body, "### Plan")
+          end)
+
+        case workpad do
+          %{"body" => body} -> {:ok, body}
+          _ -> {:error, :workpad_not_found}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @update_comment_mutation """
+  mutation SymphonyUpdateComment($commentId: String!, $body: String!) {
+    commentUpdate(id: $commentId, input: {body: $body}) {
+      success
+    }
+  }
+  """
+
+  @doc """
+  Mark a subtask as done in the workpad checklist on Linear.
+  Finds the workpad comment, replaces `- [ ] [subtask_id]` with `- [x] [subtask_id]`,
+  and updates the comment via API. Orchestrator-owned — agent compliance not required.
+  """
+  @spec mark_subtask_done(String.t(), String.t()) :: :ok | {:error, term()}
+  def mark_subtask_done(issue_id, subtask_id) when is_binary(issue_id) and is_binary(subtask_id) do
+    with {:ok, comments} <- fetch_issue_comments(issue_id),
+         {:ok, comment} <- find_workpad_comment(comments),
+         {:ok, updated_body} <- check_off_subtask(comment["body"], subtask_id),
+         :ok <- update_comment(comment["id"], updated_body) do
+      :ok
+    end
+  end
+
+  defp find_workpad_comment(comments) do
+    case Enum.find(comments, fn c ->
+      body = c["body"] || ""
+      String.contains?(body, "## Codex Workpad") or String.contains?(body, "### Plan")
+    end) do
+      nil -> {:error, :workpad_not_found}
+      comment -> {:ok, comment}
+    end
+  end
+
+  defp check_off_subtask(body, subtask_id) when is_binary(body) do
+    pattern = ~r/- \[ \] \[#{Regex.escape(subtask_id)}\]/
+    if Regex.match?(pattern, body) do
+      {:ok, Regex.replace(pattern, body, "- [x] [#{subtask_id}]")}
+    else
+      # Already checked or not found — not an error
+      {:ok, body}
+    end
+  end
+
+  defp update_comment(comment_id, body) when is_binary(comment_id) and is_binary(body) do
+    case client_module().graphql(@update_comment_mutation, %{commentId: comment_id, body: body}) do
+      {:ok, response} ->
+        if get_in(response, ["data", "commentUpdate", "success"]) == true do
+          :ok
+        else
+          {:error, :comment_update_failed}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 
