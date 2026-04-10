@@ -78,9 +78,11 @@ defmodule SymphonyElixir.Closeout do
       IssueExec.update(workspace, %{"rework_fix_applied" => true})
     end
 
-    # 1c. Clear verify_error for verify-fix-* subtasks so verify re-dispatches
+    # 1c. Clear verify_error and reset verify_attempt for verify-fix-* subtasks.
+    # Resetting the attempt gives verify a fresh shot after the fix — the
+    # circuit breaker on verify-fix crashes (via replay) prevents infinite loops.
     if is_binary(subtask_id) and String.starts_with?(subtask_id, "verify-fix-") do
-      IssueExec.clear_verify_error(workspace)
+      IssueExec.update(workspace, %{"verify_error" => nil, "verify_attempt" => 0})
     end
 
     # 2. Doc impact check deferred — runs once before verify, not after every subtask.
@@ -94,6 +96,7 @@ defmodule SymphonyElixir.Closeout do
   end
 
   @max_verify_attempts 3
+  @max_verify_fix_cycles 2
 
   defp do_closeout("verify", workspace, _unit, issue, opts) do
     # Use persistent attempt counter that survives verify-fix cycles.
@@ -114,8 +117,8 @@ defmodule SymphonyElixir.Closeout do
           Ledger.verify_passed(workspace, head)
         end
 
-        # Reset counters on success for future re-verification
-        IssueExec.update(workspace, %{"verify_attempt" => 0, "verify_error" => nil})
+        # Reset all verify counters on success
+        IssueExec.update(workspace, %{"verify_attempt" => 0, "verify_error" => nil, "verify_fix_count" => 0})
         :accepted
 
       {:fail, output} when attempt >= @max_verify_attempts ->
@@ -138,17 +141,28 @@ defmodule SymphonyElixir.Closeout do
         {:fail, "Verification exhausted #{attempt} attempts: #{truncate(output, 512)}"}
 
       {:fail, output} ->
-        # Set verify_error so DispatchResolver dispatches verify-fix
-        # instead of blindly retrying verify against the same broken code.
-        # Clear current_unit so replay_current_unit_rule does NOT fire.
-        truncated_error = truncate(output, 1500)
-        IssueExec.set_verify_error(workspace, truncated_error)
-        IssueExec.update(workspace, %{"current_unit" => nil})
-        Ledger.append(workspace, :verify_failed_will_fix, %{
-          "attempt" => attempt,
-          "error" => truncate(output, 512)
-        })
-        {:retry, "Verification failed (verify-fix will be dispatched): #{truncate(output, 1024)}"}
+        # Dispatch verify-fix if we haven't exhausted fix cycles.
+        # After @max_verify_fix_cycles, fall back to plain retry → exhaust.
+        {:ok, exec_state} = IssueExec.read(workspace)
+        fix_count = exec_state["verify_fix_count"] || 0
+
+        if fix_count < @max_verify_fix_cycles do
+          truncated_error = truncate(output, 1500)
+          IssueExec.set_verify_error(workspace, truncated_error)
+          IssueExec.update(workspace, %{
+            "current_unit" => nil,
+            "verify_fix_count" => fix_count + 1
+          })
+          Ledger.append(workspace, :verify_failed_will_fix, %{
+            "attempt" => attempt,
+            "fix_cycle" => fix_count + 1,
+            "error" => truncate(output, 512)
+          })
+          {:retry, "Verification failed (verify-fix ##{fix_count + 1} will be dispatched): #{truncate(output, 1024)}"}
+        else
+          # No more fix cycles — plain retry, will exhaust on next attempt
+          {:retry, "Verification failed (fix cycles exhausted): #{truncate(output, 1024)}"}
+        end
     end
   end
 

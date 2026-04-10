@@ -705,8 +705,8 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
   # Scenario P: verify-fix cycle exhausts after max attempts
   # ──────────────────────────────────────────────────────────────────
 
-  describe "Scenario P: verify-fix cycle exhausts and escalates" do
-    test "verify-fix x2 then verify exhausts at attempt 3", %{workspace: ws} do
+  describe "Scenario P: verify-fix cycle cap and eventual exhaustion" do
+    test "after 2 fix cycles, 3rd failure stops dispatching fixes and exhausts", %{workspace: ws} do
       System.cmd("git", ["init"], cd: ws)
       File.write!(Path.join(ws, "test.txt"), "hello")
       System.cmd("git", ["add", "."], cd: ws)
@@ -722,31 +722,46 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [x] [plan-1] Done
       """
 
-      # Cycle 1: verify fails → fix
+      # Fix cycle 1: verify fails → sets verify_error → verify-fix dispatched
       IssueExec.start_unit(ws, %{"kind" => "verify"})
       assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
       {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_attempt"] == 1
+      assert exec["verify_fix_count"] == 1
+      assert is_binary(exec["verify_error"])
 
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                resolve(ws, @issue, workpad)
       simulate_verify_fix_done(ws)
       IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
-      # Cycle 2: verify fails → fix
+      # Fix cycle 2: verify fails → fix again
       IssueExec.start_unit(ws, %{"kind" => "verify"})
       assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
       {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_attempt"] == 2
+      assert exec["verify_fix_count"] == 2
+      assert is_binary(exec["verify_error"])
 
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                resolve(ws, @issue, workpad)
       simulate_verify_fix_done(ws)
       IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
-      # Cycle 3: verify fails → exhausted (attempt 3 >= max 3)
+      # 3rd verify failure: fix_count >= 2 → no verify_error, plain retry
       IssueExec.start_unit(ws, %{"kind" => "verify"})
-      assert {:fail, reason} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:retry, _} = result
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_error"] == nil, "should NOT set verify_error when fix cycles exhausted"
+
+      # Next retries will accumulate verify_attempt until @max_verify_attempts → exhaustion
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:retry, _} = result
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:fail, reason} = result
       assert reason =~ "exhausted"
     end
   end

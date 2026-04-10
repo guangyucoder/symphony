@@ -34,6 +34,7 @@ defmodule SymphonyElixir.IssueExec do
     "plan_version" => 0,
     "verify_error" => nil,
     "verify_attempt" => 0,
+    "verify_fix_count" => 0,
     "updated_at" => nil
   }
 
@@ -157,7 +158,8 @@ defmodule SymphonyElixir.IssueExec do
       "last_verified_sha" => nil,
       "doc_fix_required" => false,
       "verify_error" => nil,
-      "verify_attempt" => 0
+      "verify_attempt" => 0,
+      "verify_fix_count" => 0
     })
   end
 

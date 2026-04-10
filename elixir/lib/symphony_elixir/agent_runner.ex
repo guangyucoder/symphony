@@ -61,7 +61,8 @@ defmodule SymphonyElixir.AgentRunner do
               "rework_fix_applied" => false,
               "last_verified_sha" => nil,
               "verify_error" => nil,
-              "verify_attempt" => 0
+              "verify_attempt" => 0,
+              "verify_fix_count" => 0
             })
           end
 
@@ -103,7 +104,8 @@ defmodule SymphonyElixir.AgentRunner do
           IssueExec.update(workspace, %{
             "current_unit" => nil,
             "verify_error" => nil,
-            "verify_attempt" => 0
+            "verify_attempt" => 0,
+            "verify_fix_count" => 0
           })
 
         _ ->
