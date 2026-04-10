@@ -227,15 +227,15 @@ defmodule SymphonyElixir.DispatchResolver do
   defp pre_verify_doc_check_rule(_), do: nil
 
   # Only dispatch doc_fix once — skip if we're already past the doc_fix point.
-  # After doc_fix/verify/handoff accepted, don't re-dispatch doc_fix.
+  # After doc_fix/verify/handoff/verify-fix accepted, don't re-dispatch doc_fix.
   defp maybe_dispatch_doc_fix(dispatch, exec) do
     last = exec["last_accepted_unit"]
 
-    if is_map(last) and last["kind"] in ["doc_fix", "verify", "handoff"] do
-      nil
-    else
-      dispatch
-    end
+    skip? = is_map(last) and
+      (last["kind"] in ["doc_fix", "verify", "handoff"] or
+       (is_binary(last["subtask_id"]) and String.starts_with?(last["subtask_id"], "verify-fix-")))
+
+    if skip?, do: nil, else: dispatch
   end
 
   # Verify fix: if verify_error is set, dispatch implement_subtask to fix the code

@@ -74,8 +74,7 @@ defmodule SymphonyElixir.AgentRunner do
               k when k in ["verify", "doc_fix"] -> true
               "implement_subtask" ->
                 is_binary(current["subtask_id"]) and
-                (String.starts_with?(current["subtask_id"], "rework-") or
-                 String.starts_with?(current["subtask_id"], "verify-fix-"))
+                String.starts_with?(current["subtask_id"], "rework-")
               _ -> false
             end
 

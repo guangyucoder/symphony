@@ -132,8 +132,9 @@ defmodule SymphonyElixir.Closeout do
             "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff.")
         end
 
-        # Clear verify_error and current_unit so escalation path is clean
-        IssueExec.update(workspace, %{"verify_error" => nil, "current_unit" => nil})
+        # Clear verify_error but keep current_unit set so replay_current_unit_rule
+        # increments the attempt and triggers circuit_breaker → escalation.
+        IssueExec.update(workspace, %{"verify_error" => nil})
         {:fail, "Verification exhausted #{attempt} attempts: #{truncate(output, 512)}"}
 
       {:fail, output} ->
