@@ -140,7 +140,7 @@ defmodule SymphonyElixir.Closeout do
         # Set verify_error so DispatchResolver dispatches verify-fix
         # instead of blindly retrying verify against the same broken code.
         # Clear current_unit so replay_current_unit_rule does NOT fire.
-        truncated_error = truncate(output, 2048)
+        truncated_error = truncate(output, 1500)
         IssueExec.set_verify_error(workspace, truncated_error)
         IssueExec.update(workspace, %{"current_unit" => nil})
         Ledger.append(workspace, :verify_failed_will_fix, %{

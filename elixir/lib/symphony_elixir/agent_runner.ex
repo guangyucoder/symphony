@@ -101,7 +101,11 @@ defmodule SymphonyElixir.AgentRunner do
       case IssueExec.read(workspace) do
         {:ok, %{"current_unit" => %{"kind" => kind}}} when kind != "merge" and not is_nil(kind) ->
           Logger.info("unit_lite: clearing stale #{kind} current_unit on Merging entry")
-          IssueExec.update(workspace, %{"current_unit" => nil})
+          IssueExec.update(workspace, %{
+            "current_unit" => nil,
+            "verify_error" => nil,
+            "verify_attempt" => 0
+          })
 
         _ ->
           :ok
