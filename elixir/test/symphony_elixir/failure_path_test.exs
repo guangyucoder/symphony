@@ -340,6 +340,27 @@ defmodule SymphonyElixir.FailurePathTest do
   end
 
   # ──────────────────────────────────────────────────────────────────
+  # Invariant 5b: fresh_rework must not include "verify"
+  #
+  # Finding: "verify" in fresh_rework detection caused infinite rework
+  # loop. verify completes within a rework cycle (rework_fix → doc_fix
+  # → verify), so treating it as a fresh entry resets rework_fix_applied
+  # and re-dispatches rework_fix forever.
+  # Invariant: fresh_rework only matches "handoff" and "merge".
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "fresh_rework detection excludes verify" do
+    test "agent_runner fresh_rework check does not include verify" do
+      source = File.read!(Path.join(__DIR__, "../../lib/symphony_elixir/agent_runner.ex"))
+      # Must match handoff/merge only — NOT verify
+      assert source =~ ~s(last["kind"] in ["handoff", "merge"]),
+        "fresh_rework must only match handoff/merge, not verify (causes infinite rework loop)"
+      refute source =~ ~s(last["kind"] in ["handoff", "verify", "merge"]),
+        "verify must NOT be in fresh_rework detection — it's a normal step within rework cycle"
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
   # Invariant 6: retry path must not double-dispatch running issues
   #
   # Finding: continuation retry bypassed running check, causing two

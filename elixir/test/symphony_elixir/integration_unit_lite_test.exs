@@ -549,4 +549,95 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       assert exec["plan_version"] >= 1
     end
   end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Scenario N: rework cycle with agent_runner cleanup simulation
+  #
+  # Finding: Scenario G tested DispatchResolver only, bypassing the
+  # agent_runner fresh_rework cleanup that runs before every dispatch.
+  # The cleanup was resetting rework_fix_applied after verify, causing
+  # an infinite rework loop. This test simulates the full cycle including
+  # the cleanup logic at each dispatch boundary.
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "Scenario N: rework cycle does not loop (with agent_runner cleanup)" do
+    test "rework_fix → doc_fix → verify → handoff (no re-dispatch of rework_fix)", %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.bump_plan_version(ws)
+
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Implement feature
+      """
+
+      # Simulate: previous cycle completed handoff, supervisor moved to Rework
+      IssueExec.update(ws, %{
+        "last_accepted_unit" => %{"kind" => "handoff"},
+        "last_verified_sha" => "old_sha",
+        "rework_fix_applied" => false
+      })
+
+      rework_issue = %{state: "Rework", identifier: "ENT-42", title: "Fix review"}
+
+      # --- Dispatch 1: simulate agent_runner rework cleanup, then resolve ---
+      # This is what agent_runner.ex:44-61 does before every dispatch in Rework.
+      simulate_rework_cleanup(ws)
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "rework-1"}} =
+               resolve(ws, rework_issue, workpad)
+
+      # Simulate rework-1 completion (closeout sets rework_fix_applied)
+      IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "rework-1"})
+      IssueExec.accept_unit(ws)
+      IssueExec.update(ws, %{"rework_fix_applied" => true, "last_verified_sha" => nil})
+
+      # --- Dispatch 2: cleanup + resolve → doc_fix ---
+      simulate_rework_cleanup(ws)
+      assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad)
+
+      IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
+      IssueExec.accept_unit(ws)
+      IssueExec.clear_doc_fix_required(ws)
+
+      # --- Dispatch 3: cleanup + resolve → verify ---
+      simulate_rework_cleanup(ws)
+      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad)
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      IssueExec.set_verified_sha(ws, "abc123")
+      IssueExec.accept_unit(ws)
+
+      # --- Dispatch 4: cleanup + resolve → handoff (NOT rework-1 again!) ---
+      simulate_rework_cleanup(ws)
+
+      result = resolve(ws, rework_issue, workpad)
+      assert {:dispatch, %Unit{kind: :handoff}} = result,
+        "After verify in rework cycle, should dispatch handoff — not loop back to rework_fix"
+    end
+  end
+
+  # Simulates the rework cleanup logic from agent_runner.ex:44-61.
+  # Must be called before each resolve() in Rework tests to match
+  # production behavior.
+  defp simulate_rework_cleanup(workspace) do
+    case IssueExec.read(workspace) do
+      {:ok, exec} ->
+        current = exec["current_unit"]
+        last = exec["last_accepted_unit"]
+
+        fresh_rework? = is_nil(current) and
+                        is_map(last) and last["kind"] in ["handoff", "merge"]
+
+        if fresh_rework? do
+          IssueExec.update(workspace, %{
+            "rework_fix_applied" => false,
+            "last_verified_sha" => nil
+          })
+        end
+
+      _ -> :ok
+    end
+  end
 end
