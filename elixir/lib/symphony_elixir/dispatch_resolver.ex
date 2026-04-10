@@ -51,6 +51,7 @@ defmodule SymphonyElixir.DispatchResolver do
 
   defp rules(:merging), do: [
     &replay_current_unit_rule/1,
+    &verify_fix_rule/1,
     &merge_rule/1,
     &merge_done_rule/1
   ]

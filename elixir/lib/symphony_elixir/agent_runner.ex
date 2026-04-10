@@ -302,24 +302,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   # Programmatic merge — no Codex session, no token burn.
   # Checks CI, merges PR, updates Linear. All shell commands.
+  # Does NOT call start_unit until we know we're actually merging.
   defp execute_merge_programmatic(workspace, issue, unit, codex_update_recipient) do
-    IssueExec.start_unit(workspace, Unit.to_map(unit))
-    Ledger.unit_started(workspace, Unit.to_map(unit))
-
-    send_codex_update(codex_update_recipient, issue, %{
-      event: :unit_dispatched,
-      timestamp: DateTime.utc_now(),
-      unit_kind: "merge",
-      unit_display_name: "merge:programmatic",
-      reasoning_effort: "low"
-    })
-
     result = do_programmatic_merge(workspace, issue)
 
     unit_map = Unit.to_map(unit)
 
     case result do
       :ok ->
+        # Only record unit start/accept for actual merges
+        IssueExec.start_unit(workspace, unit_map)
+        Ledger.unit_started(workspace, unit_map)
         IssueExec.update(workspace, %{"phase" => "done"})
         IssueExec.accept_unit(workspace)
         Ledger.unit_accepted(workspace, unit_map, %{"merge" => "programmatic"})
@@ -339,23 +332,16 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:skip, reason} ->
-        Logger.info("unit_lite: merge skipped (#{reason}) for #{issue_context(issue)}")
-        # Don't record as started/failed — just skip silently, retry on next poll
-        IssueExec.update(workspace, %{"current_unit" => nil})
+        # CI pending/unknown — silently skip, no ledger noise, retry on next poll
+        Logger.debug("unit_lite: merge skipped (#{reason}) for #{issue_context(issue)}")
         :ok
 
       {:error, reason} ->
-        Logger.warning("unit_lite: programmatic merge failed for #{issue_context(issue)}: #{reason}")
+        # Actual merge failure — record for debugging
+        IssueExec.start_unit(workspace, unit_map)
+        Ledger.unit_started(workspace, unit_map)
         Ledger.unit_failed(workspace, unit_map, reason)
-
-        send_codex_update(codex_update_recipient, issue, %{
-          event: :unit_completed,
-          timestamp: DateTime.utc_now(),
-          unit_kind: "merge",
-          unit_display_name: "merge:programmatic",
-          closeout_result: {:retry, reason}
-        })
-
+        Logger.warning("unit_lite: programmatic merge failed for #{issue_context(issue)}: #{reason}")
         :ok
     end
   end
