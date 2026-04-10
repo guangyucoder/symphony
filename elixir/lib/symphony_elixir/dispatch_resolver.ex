@@ -63,6 +63,7 @@ defmodule SymphonyElixir.DispatchResolver do
     &doc_fix_rule/1,
     &implement_subtask_rule/1,
     &pre_verify_doc_check_rule/1,
+    &verify_fix_rule/1,
     &verify_rule/1,
     &handoff_rule/1,
     &done_rule/1
@@ -76,6 +77,7 @@ defmodule SymphonyElixir.DispatchResolver do
     &doc_fix_rule/1,
     &implement_subtask_rule/1,
     &pre_verify_doc_check_rule/1,
+    &verify_fix_rule/1,
     &verify_rule/1,
     &handoff_rule/1
   ]
@@ -92,13 +94,17 @@ defmodule SymphonyElixir.DispatchResolver do
   }
   @max_unit_attempts 3
 
-  defp replay_current_unit_rule(%{exec: %{"current_unit" => unit}}) when not is_nil(unit) do
+  defp replay_current_unit_rule(%{exec: %{"current_unit" => unit} = exec}) when not is_nil(unit) do
     kind_str = unit["kind"]
     attempt = (unit["attempt"] || 1) + 1
 
     cond do
       kind_str not in @valid_unit_kinds ->
         # Corrupted exec file — clear current_unit and let normal rules take over
+        nil
+
+      # Skip replay for verify when verify_error is set — let verify_fix_rule handle it
+      kind_str == "verify" and is_binary(exec["verify_error"]) ->
         nil
 
       attempt > @max_unit_attempts ->
@@ -231,6 +237,17 @@ defmodule SymphonyElixir.DispatchResolver do
       dispatch
     end
   end
+
+  # Verify fix: if verify_error is set, dispatch implement_subtask to fix the code
+  # rather than blindly retrying verify against the same broken code.
+  defp verify_fix_rule(%{exec: %{"verify_error" => error}}) when is_binary(error) do
+    prompt_error = if String.length(error) > 1500,
+      do: String.slice(error, 0, 1500) <> "\n... (truncated)",
+      else: error
+    {:dispatch, Unit.implement_subtask("verify-fix-1", prompt_error)}
+  end
+
+  defp verify_fix_rule(_), do: nil
 
   # Verify: all subtasks done but last_verified_sha != HEAD.
   # Max retry is enforced in Closeout (fails after 3 attempts → circuit breaker escalates).

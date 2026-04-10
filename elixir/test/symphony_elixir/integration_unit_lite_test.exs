@@ -262,8 +262,8 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  describe "Scenario F: verify exhaustion escalates (no force-accept)" do
-    test "verify fails 3 times → fail → circuit breaker on next dispatch", %{workspace: ws} do
+  describe "Scenario F: verify failure dispatches verify-fix (not blind retry)" do
+    test "verify fails → sets verify_error → verify-fix dispatched", %{workspace: ws} do
       # Need a git repo for Verifier.current_head
       System.cmd("git", ["init"], cd: ws)
       File.write!(Path.join(ws, "test.txt"), "hello")
@@ -272,6 +272,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       IssueExec.mark_bootstrapped(ws)
       IssueExec.set_verified_sha(ws, nil)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
       workpad_all_done = """
       ## Codex Workpad
@@ -280,29 +281,21 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [x] [plan-1] Done
       """
 
-      # Simulate 3 verify failures with increasing attempt count
-      for attempt <- 1..3 do
-        unit_map = %{"kind" => "verify", "attempt" => attempt}
-        IssueExec.start_unit(ws, unit_map)
+      # Verify fails (non-exhausted, attempt 1)
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:retry, _} = result
 
-        result = Closeout.run(ws, unit_map, @issue,
-          verify_commands: ["false"])
-
-        if attempt < 3 do
-          assert {:retry, _reason} = result
-        else
-          # Attempt 3: must FAIL (not force-accept)
-          assert {:fail, reason} = result
-          assert reason =~ "exhausted"
-        end
-      end
-
-      # verified_sha must NOT be set — handoff must be blocked
+      # verify_error set, current_unit cleared, verify_attempt=1
       {:ok, exec} = IssueExec.read(ws)
+      assert is_binary(exec["verify_error"])
+      assert exec["current_unit"] == nil
+      assert exec["verify_attempt"] == 1
+
+      # verified_sha NOT set
       assert exec["last_verified_sha"] == nil
 
-      # current_unit is still set (verify, attempt=3) from the failed closeout.
-      # Next dispatch: replay_current_unit_rule increments to attempt 4 > max → circuit breaker.
+      # Next dispatch: verify_fix_rule fires (NOT replay verify)
       {:ok, head_sha} = case System.cmd("git", ["rev-parse", "HEAD"], cd: ws) do
         {sha, 0} -> {:ok, String.trim(sha)}
         _ -> {:ok, "abc"}
@@ -314,7 +307,8 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         workpad_text: workpad_all_done,
         git_head: head_sha
       }
-      assert {:stop, :circuit_breaker} = DispatchResolver.resolve(ctx)
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               DispatchResolver.resolve(ctx)
     end
   end
 
@@ -633,11 +627,133 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         if fresh_rework? do
           IssueExec.update(workspace, %{
             "rework_fix_applied" => false,
-            "last_verified_sha" => nil
+            "last_verified_sha" => nil,
+            "verify_error" => nil,
+            "verify_attempt" => 0
           })
         end
 
       _ -> :ok
     end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Scenario O: verify fails → verify-fix → re-verify passes
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "Scenario O: verify-fix dispatches on verification failure" do
+    test "verify fails → verify-fix → verify passes → handoff", %{workspace: ws} do
+      System.cmd("git", ["init"], cd: ws)
+      File.write!(Path.join(ws, "test.txt"), "hello")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cd: ws)
+
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
+
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Done
+      """
+
+      # Step 1: verify dispatched
+      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, @issue, workpad)
+
+      # Simulate verify failure (non-exhausted)
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:retry, _} = result
+
+      # verify_error set, current_unit cleared
+      {:ok, exec} = IssueExec.read(ws)
+      assert is_binary(exec["verify_error"])
+      assert exec["current_unit"] == nil
+      assert exec["verify_attempt"] == 1
+
+      # Step 2: dispatch → verify-fix (NOT verify replay)
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               resolve(ws, @issue, workpad)
+
+      # Simulate verify-fix accepted
+      IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"})
+      Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}, @issue)
+      IssueExec.accept_unit(ws)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
+
+      # verify_error cleared
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_error"] == nil
+
+      # Step 3: verify again (passes this time)
+      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, @issue, workpad)
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["true"])
+      assert :accepted = result
+      IssueExec.accept_unit(ws)
+      # Align verified_sha with the hardcoded git_head used by resolve/3
+      IssueExec.set_verified_sha(ws, "abc123")
+
+      # Step 4: handoff
+      assert {:dispatch, %Unit{kind: :handoff}} = resolve(ws, @issue, workpad)
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Scenario P: verify-fix cycle exhausts after max attempts
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "Scenario P: verify-fix cycle exhausts and escalates" do
+    test "verify-fix x2 then verify exhausts at attempt 3", %{workspace: ws} do
+      System.cmd("git", ["init"], cd: ws)
+      File.write!(Path.join(ws, "test.txt"), "hello")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cd: ws)
+
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
+
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Done
+      """
+
+      # Cycle 1: verify fails → fix
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_attempt"] == 1
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               resolve(ws, @issue, workpad)
+      simulate_verify_fix_done(ws)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
+
+      # Cycle 2: verify fails → fix
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_attempt"] == 2
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               resolve(ws, @issue, workpad)
+      simulate_verify_fix_done(ws)
+      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
+
+      # Cycle 3: verify fails → exhausted (attempt 3 >= max 3)
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      assert {:fail, reason} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert reason =~ "exhausted"
+    end
+  end
+
+  defp simulate_verify_fix_done(ws) do
+    IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"})
+    Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}, @issue)
+    IssueExec.accept_unit(ws)
   end
 end

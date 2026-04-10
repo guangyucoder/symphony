@@ -59,7 +59,9 @@ defmodule SymphonyElixir.AgentRunner do
           if fresh_rework? do
             IssueExec.update(workspace, %{
               "rework_fix_applied" => false,
-              "last_verified_sha" => nil
+              "last_verified_sha" => nil,
+              "verify_error" => nil,
+              "verify_attempt" => 0
             })
           end
 
@@ -70,8 +72,11 @@ defmodule SymphonyElixir.AgentRunner do
           rework_cycle_unit? = current != nil and
             case current["kind"] do
               k when k in ["verify", "doc_fix"] -> true
-              _ -> is_binary(current["subtask_id"]) and
-                   String.starts_with?(current["subtask_id"], "rework-")
+              "implement_subtask" ->
+                is_binary(current["subtask_id"]) and
+                (String.starts_with?(current["subtask_id"], "rework-") or
+                 String.starts_with?(current["subtask_id"], "verify-fix-"))
+              _ -> false
             end
 
           stale? = current != nil and not rework_cycle_unit?

@@ -32,6 +32,8 @@ defmodule SymphonyElixir.IssueExec do
     "rework_fix_applied" => false,
     "bootstrapped" => false,
     "plan_version" => 0,
+    "verify_error" => nil,
+    "verify_attempt" => 0,
     "updated_at" => nil
   }
 
@@ -133,6 +135,18 @@ defmodule SymphonyElixir.IssueExec do
     end
   end
 
+  @doc "Set the verify error (verification failed, needs code fix)."
+  @spec set_verify_error(Path.t(), String.t()) :: :ok | {:error, term()}
+  def set_verify_error(workspace, error) when is_binary(error) do
+    update(workspace, %{"verify_error" => error})
+  end
+
+  @doc "Clear the verify error (fix applied, ready to re-verify)."
+  @spec clear_verify_error(Path.t()) :: :ok | {:error, term()}
+  def clear_verify_error(workspace) do
+    update(workspace, %{"verify_error" => nil})
+  end
+
   @doc "Reset for rework: clear subtask progress, keep bootstrapped."
   @spec reset_for_rework(Path.t()) :: :ok | {:error, term()}
   def reset_for_rework(workspace) do
@@ -141,7 +155,9 @@ defmodule SymphonyElixir.IssueExec do
       "current_unit" => nil,
       "last_accepted_unit" => nil,
       "last_verified_sha" => nil,
-      "doc_fix_required" => false
+      "doc_fix_required" => false,
+      "verify_error" => nil,
+      "verify_attempt" => 0
     })
   end
 

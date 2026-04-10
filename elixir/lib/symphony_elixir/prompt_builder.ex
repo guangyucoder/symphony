@@ -72,6 +72,28 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _, subtask_text: error_text}) do
+    """
+    ## Instructions — Verify Fix
+    Verification failed after implementation. The orchestrator's test suite reported errors.
+    Your job: fix the code so tests pass. Do NOT skip, disable, or weaken tests.
+
+    ### Verification Error Output
+    ```
+    #{error_text || "(no error output captured)"}
+    ```
+
+    ### Steps
+    1. Read the error output above carefully.
+    2. Identify the root cause (failing test assertion, compilation error, type error, etc.).
+    3. Fix the **source code** (not the tests) unless the test expectation is provably wrong.
+    4. Commit your fix with a descriptive message referencing the verification failure.
+
+    Do NOT run the full test suite — the orchestrator re-runs verification automatically after this session.
+    Do NOT do handoff, verify, or create a PR — the orchestrator handles the rest.
+    """
+  end
+
   defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}) do
     """
     ## Instructions — Rework Fix

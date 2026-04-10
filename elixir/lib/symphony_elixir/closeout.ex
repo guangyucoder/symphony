@@ -78,6 +78,11 @@ defmodule SymphonyElixir.Closeout do
       IssueExec.update(workspace, %{"rework_fix_applied" => true})
     end
 
+    # 1c. Clear verify_error for verify-fix-* subtasks so verify re-dispatches
+    if is_binary(subtask_id) and String.starts_with?(subtask_id, "verify-fix-") do
+      IssueExec.clear_verify_error(workspace)
+    end
+
     # 2. Doc impact check deferred — runs once before verify, not after every subtask.
     # This avoids N×doc_fix sessions for N subtasks (was burning ~1.5M tokens each).
     :accepted
@@ -90,8 +95,14 @@ defmodule SymphonyElixir.Closeout do
 
   @max_verify_attempts 3
 
-  defp do_closeout("verify", workspace, unit, issue, opts) do
-    attempt = unit["attempt"] || 1
+  defp do_closeout("verify", workspace, _unit, issue, opts) do
+    # Use persistent attempt counter that survives verify-fix cycles.
+    # The unit's "attempt" field tracks crash-replays; this tracks
+    # verification runs across fix cycles.
+    {:ok, exec} = IssueExec.read(workspace)
+    attempt = (exec["verify_attempt"] || 0) + 1
+    IssueExec.update(workspace, %{"verify_attempt" => attempt})
+
     verify_opts = if cmds = Keyword.get(opts, :verify_commands), do: [commands: cmds], else: []
 
     case Verifier.run(workspace, verify_opts) do
@@ -103,29 +114,40 @@ defmodule SymphonyElixir.Closeout do
           Ledger.verify_passed(workspace, head)
         end
 
+        # Reset counters on success for future re-verification
+        IssueExec.update(workspace, %{"verify_attempt" => 0, "verify_error" => nil})
         :accepted
 
       {:fail, output} when attempt >= @max_verify_attempts ->
-        # Escalate — do NOT force-accept unverified code.
-        # The dispatch resolver's circuit breaker will escalate to
-        # Human Input Needed on the next dispatch cycle.
+        # Escalate — exhausted all attempts including verify-fix cycles.
         Logger.warning("Closeout: verify exhausted #{attempt} attempts, failing")
         Ledger.append(workspace, :verify_exhausted, %{
           "attempt" => attempt,
           "last_error" => truncate(output, 512)
         })
 
-        # Post comment so human sees why verification failed
         issue_id = issue_id(issue)
         if is_binary(issue_id) do
           Adapter.create_comment(issue_id,
             "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff.")
         end
 
+        # Clear verify_error and current_unit so escalation path is clean
+        IssueExec.update(workspace, %{"verify_error" => nil, "current_unit" => nil})
         {:fail, "Verification exhausted #{attempt} attempts: #{truncate(output, 512)}"}
 
       {:fail, output} ->
-        {:retry, "Verification failed: #{truncate(output, 1024)}"}
+        # Set verify_error so DispatchResolver dispatches verify-fix
+        # instead of blindly retrying verify against the same broken code.
+        # Clear current_unit so replay_current_unit_rule does NOT fire.
+        truncated_error = truncate(output, 2048)
+        IssueExec.set_verify_error(workspace, truncated_error)
+        IssueExec.update(workspace, %{"current_unit" => nil})
+        Ledger.append(workspace, :verify_failed_will_fix, %{
+          "attempt" => attempt,
+          "error" => truncate(output, 512)
+        })
+        {:retry, "Verification failed (verify-fix will be dispatched): #{truncate(output, 1024)}"}
     end
   end
 

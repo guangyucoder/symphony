@@ -54,16 +54,18 @@ defmodule SymphonyElixir.FailurePathTest do
   end
 
   # ──────────────────────────────────────────────────────────────────
-  # Invariant 2: verify exhaustion escalates, never force-accepts
+  # Invariant 2: verify failure sets verify_error for fix dispatch;
+  #              verify exhaustion escalates after max attempts.
   #
   # Finding: unverified code silently reached handoff/PR via force-accept.
-  # Fix: verify at max attempts returns {:fail, ...} so the circuit
-  #      breaker escalates to Human Input Needed.
-  # Invariant: (a) attempts 1-2 retry, (b) attempt 3 fails (not accepts),
-  #            (c) verified_sha is NOT set, (d) ledger records exhaustion.
+  # Fix: non-exhausted failures set verify_error (dispatch verify-fix);
+  #      exhaustion returns {:fail, ...} for escalation.
+  # Invariant: (a) non-exhausted failures set verify_error and clear
+  #            current_unit, (b) exhaustion fails (not accepts),
+  #            (c) verified_sha is NOT set, (d) ledger records events.
   # ──────────────────────────────────────────────────────────────────
 
-  describe "verify exhaustion escalates to human" do
+  describe "verify failure and exhaustion" do
     setup do
       workspace = Path.join(System.tmp_dir!(), "fail_test_#{System.unique_integer([:positive])}")
       File.mkdir_p!(Path.join(workspace, ".symphony"))
@@ -82,38 +84,72 @@ defmodule SymphonyElixir.FailurePathTest do
 
     @issue %{id: "test-issue-id", identifier: "TEST-1", title: "Test", state: "In Progress"}
 
-    test "attempts 1 and 2 return :retry on failure", %{workspace: ws} do
-      for attempt <- [1, 2] do
-        unit = %{"kind" => "verify", "attempt" => attempt}
-        IssueExec.start_unit(ws, unit)
-        result = Closeout.run(ws, unit, @issue, verify_commands: ["false"])
-        assert {:retry, _} = result, "attempt #{attempt} should retry"
-      end
+    test "non-exhausted failure sets verify_error and clears current_unit", %{workspace: ws} do
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
+      assert {:retry, _} = result
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert is_binary(exec["verify_error"]), "must set verify_error for verify-fix dispatch"
+      assert exec["current_unit"] == nil, "must clear current_unit so verify_fix_rule fires"
+      assert exec["verify_attempt"] == 1
     end
 
-    test "attempt 3 fails (does not force-accept)", %{workspace: ws} do
-      unit = %{"kind" => "verify", "attempt" => 3}
-      IssueExec.start_unit(ws, unit)
-      result = Closeout.run(ws, unit, @issue, verify_commands: ["false"])
+    test "exhaustion at attempt 3 fails (does not accept)", %{workspace: ws} do
+      # Simulate 2 prior verify attempts by setting verify_attempt
+      IssueExec.update(ws, %{"verify_attempt" => 2})
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
 
       assert {:fail, reason} = result
       assert reason =~ "exhausted"
     end
 
-    test "attempt 3 does NOT set verified_sha", %{workspace: ws} do
-      unit = %{"kind" => "verify", "attempt" => 3}
-      IssueExec.start_unit(ws, unit)
-      Closeout.run(ws, unit, @issue, verify_commands: ["false"])
+    test "exhaustion does NOT set verified_sha", %{workspace: ws} do
+      IssueExec.update(ws, %{"verify_attempt" => 2})
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["last_verified_sha"] == nil,
         "failed verify must NOT set verified_sha — handoff must be blocked"
     end
 
-    test "exhaustion is recorded in ledger", %{workspace: ws} do
-      unit = %{"kind" => "verify", "attempt" => 3}
+    test "verify_error is cleared by verify-fix closeout", %{workspace: ws} do
+      IssueExec.set_verify_error(ws, "some test failure")
+
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}
       IssueExec.start_unit(ws, unit)
-      Closeout.run(ws, unit, @issue, verify_commands: ["false"])
+      Closeout.run(ws, unit, @issue)
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_error"] == nil, "verify-fix must clear verify_error"
+    end
+
+    test "verify_error triggers verify_fix_rule dispatch" do
+      exec = %{
+        "mode" => "unit_lite", "phase" => "verifying",
+        "current_unit" => nil, "last_accepted_unit" => %{"kind" => "doc_fix"},
+        "bootstrapped" => true, "plan_version" => 1,
+        "last_verified_sha" => nil, "doc_fix_required" => false,
+        "rework_fix_applied" => false,
+        "verify_error" => "test/foo_test.exs:12 assertion failed",
+        "verify_attempt" => 1
+      }
+      workpad = "## Codex Workpad\n\n### Plan\n- [x] [plan-1] Done\n"
+      ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: workpad, git_head: "abc"}
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               DispatchResolver.resolve(ctx)
+    end
+
+    test "exhaustion is recorded in ledger", %{workspace: ws} do
+      IssueExec.update(ws, %{"verify_attempt" => 2})
+
+      IssueExec.start_unit(ws, %{"kind" => "verify"})
+      Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
 
       {:ok, entries} = SymphonyElixir.Ledger.read(ws)
       events = Enum.map(entries, & &1["event"])
