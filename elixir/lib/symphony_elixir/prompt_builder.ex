@@ -76,7 +76,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
     ## Instructions — Verify Fix
     Verification failed after implementation. The orchestrator's test suite reported errors.
-    Your job: fix the code so tests pass. Do NOT skip, disable, or weaken tests.
+    Your job: fix the code so the failing tests pass.
 
     ### Verification Error Output
     ```
@@ -84,13 +84,15 @@ defmodule SymphonyElixir.PromptBuilder do
     ```
 
     ### Steps
-    1. Read the error output above carefully.
-    2. Identify the root cause (failing test assertion, compilation error, type error, etc.).
-    3. Fix the **source code** (not the tests) unless the test expectation is provably wrong.
-    4. Commit your fix with a descriptive message referencing the verification failure.
+    1. Read the error output above. Identify the failing test file and assertion.
+    2. Read the failing test to understand what it expects.
+    3. Read the source code under test. Find the root cause.
+    4. Fix the **source code** (not the tests) unless the test expectation is provably wrong.
+    5. **Run the failing test to verify your fix.** Iterate until it passes.
+    6. Commit only after the test passes.
 
-    Do NOT run the full test suite — the orchestrator re-runs verification automatically after this session.
-    Do NOT do handoff, verify, or create a PR — the orchestrator handles the rest.
+    Do NOT skip, disable, or weaken tests.
+    Do NOT do handoff or create a PR — the orchestrator handles the rest.
     """
   end
 
