@@ -46,6 +46,45 @@ defmodule SymphonyElixir.Verifier do
     end
   end
 
+  @pr_check_timeout_ms 15_000
+
+  @doc """
+  Check whether the PR for the current branch has been merged on the remote.
+  Returns `:merged`, `{:not_merged, reason}`, or `:unknown`.
+  """
+  @spec check_pr_merged(Path.t()) :: :merged | {:not_merged, String.t()} | :unknown
+  def check_pr_merged(workspace) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd("gh", ["pr", "view", "--json", "state", "--jq", ".state"],
+            cd: workspace, stderr_to_stdout: true)
+        rescue
+          _ -> {"gh not available", 127}
+        end
+      end)
+
+    case Task.yield(task, @pr_check_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} ->
+        case String.trim(output) do
+          "MERGED" -> :merged
+          state -> {:not_merged, "PR state: #{state}"}
+        end
+
+      {:ok, {output, _exit_code}} ->
+        if String.contains?(output, "no pull requests found") do
+          {:not_merged, "no PR found for current branch"}
+        else
+          Logger.warning("Verifier: gh pr view failed: #{String.slice(output, 0, 200)}")
+          :unknown
+        end
+
+      nil ->
+        Logger.warning("Verifier: gh pr view timed out")
+        :unknown
+    end
+  end
+
   # --- Private ---
 
   defp run_commands(commands, workspace, timeout_ms) do

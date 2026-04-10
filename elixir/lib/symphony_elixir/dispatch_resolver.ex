@@ -50,11 +50,13 @@ defmodule SymphonyElixir.DispatchResolver do
   # --- Rule tables ---
 
   defp rules(:merging), do: [
+    &replay_current_unit_rule/1,
     &merge_rule/1,
     &merge_done_rule/1
   ]
 
   defp rules(:rework), do: [
+    &replay_current_unit_rule/1,
     &rework_fix_rule/1,
     &rework_reset_rule/1,
     &plan_rule/1,
@@ -231,7 +233,7 @@ defmodule SymphonyElixir.DispatchResolver do
   end
 
   # Verify: all subtasks done but last_verified_sha != HEAD.
-  # Max retry is enforced in Closeout (force-accepts after 3 failures).
+  # Max retry is enforced in Closeout (fails after 3 attempts → circuit breaker escalates).
   defp verify_rule(%{workpad_text: workpad_text, exec: exec, git_head: git_head}) do
     all_done = WorkpadParser.all_done?(workpad_text)
     verified = exec["last_verified_sha"]

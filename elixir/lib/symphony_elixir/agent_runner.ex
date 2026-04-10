@@ -80,6 +80,21 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
+    # 1c. Clear stale non-merge current_unit when entering Merging state.
+    # If a handoff/verify unit was in-flight when the issue was manually moved
+    # to Merging, replaying it would be wrong (e.g., handoff could move the
+    # ticket back to Human Review). Only merge units should replay in Merging.
+    if issue_state == "merging" do
+      case IssueExec.read(workspace) do
+        {:ok, %{"current_unit" => %{"kind" => kind}}} when kind != "merge" and not is_nil(kind) ->
+          Logger.info("unit_lite: clearing stale #{kind} current_unit on Merging entry")
+          IssueExec.update(workspace, %{"current_unit" => nil})
+
+        _ ->
+          :ok
+      end
+    end
+
     # 2. Read workpad text — from opts or fetch from Linear
     workpad_text =
       case Keyword.get(opts, :workpad_text) do

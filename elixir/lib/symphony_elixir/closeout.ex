@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Closeout do
   - `doc_fix`: clear doc_fix_required flag
   - `verify`: run full verification, set last_verified_sha
   - `handoff`: check last_verified_sha == HEAD
-  - `merge`: no special closeout
+  - `merge`: check PR actually merged on remote before marking done
   """
 
   require Logger
@@ -106,29 +106,23 @@ defmodule SymphonyElixir.Closeout do
         :accepted
 
       {:fail, output} when attempt >= @max_verify_attempts ->
-        # Force-accept after max attempts to prevent infinite loops
-        # (e.g., environment issues like missing test runners).
-        # Set verified_sha so handoff can proceed.
-        head = Verifier.current_head(workspace)
-
-        if head do
-          IssueExec.set_verified_sha(workspace, head)
-        end
-
-        Logger.warning("Closeout: verify force-accepted after #{attempt} attempts")
-        Ledger.append(workspace, :verify_force_accepted, %{
+        # Escalate — do NOT force-accept unverified code.
+        # The dispatch resolver's circuit breaker will escalate to
+        # Human Input Needed on the next dispatch cycle.
+        Logger.warning("Closeout: verify exhausted #{attempt} attempts, failing")
+        Ledger.append(workspace, :verify_exhausted, %{
           "attempt" => attempt,
           "last_error" => truncate(output, 512)
         })
 
-        # Alert human that verification was bypassed
+        # Post comment so human sees why verification failed
         issue_id = issue_id(issue)
         if is_binary(issue_id) do
           Adapter.create_comment(issue_id,
-            "**Verification bypassed**: force-accepted after #{attempt} failed attempts.\nLast error: #{truncate(output, 256)}\n\nCode proceeding to handoff without passing validation.")
+            "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff.")
         end
 
-        :accepted
+        {:fail, "Verification exhausted #{attempt} attempts: #{truncate(output, 512)}"}
 
       {:fail, output} ->
         {:retry, "Verification failed: #{truncate(output, 1024)}"}
@@ -151,9 +145,26 @@ defmodule SymphonyElixir.Closeout do
     end
   end
 
-  defp do_closeout("merge", workspace, _unit, _issue, _opts) do
-    IssueExec.update(workspace, %{"phase" => "done"})
-    :accepted
+  defp do_closeout("merge", workspace, _unit, _issue, opts) do
+    checker = Keyword.get(opts, :merge_checker, &Verifier.check_pr_merged/1)
+
+    case checker.(workspace) do
+      :merged ->
+        IssueExec.update(workspace, %{"phase" => "done"})
+        :accepted
+
+      {:not_merged, reason} ->
+        Logger.warning("Closeout: merge not confirmed: #{reason}")
+        {:retry, "PR not merged: #{reason}"}
+
+      :unknown ->
+        # Cannot determine PR state (e.g., gh CLI not available).
+        # Accept to avoid blocking, but log a warning and record in ledger.
+        Logger.warning("Closeout: cannot verify PR merge status, accepting")
+        Ledger.append(workspace, :merge_status_unknown, %{})
+        IssueExec.update(workspace, %{"phase" => "done"})
+        :accepted
+    end
   end
 
   defp do_closeout(kind, _workspace, _unit, _issue, _opts) do
@@ -162,7 +173,6 @@ defmodule SymphonyElixir.Closeout do
   end
 
   # --- Helpers ---
-
 
   defp truncate(text, max) when is_binary(text) do
     if String.length(text) <= max, do: text, else: String.slice(text, 0, max) <> "..."

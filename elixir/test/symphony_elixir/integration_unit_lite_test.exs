@@ -262,8 +262,8 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  describe "Scenario F: verify force-accept after max retries" do
-    test "verify fails 3 times → force-accepted → handoff proceeds", %{workspace: ws} do
+  describe "Scenario F: verify exhaustion escalates (no force-accept)" do
+    test "verify fails 3 times → fail → circuit breaker on next dispatch", %{workspace: ws} do
       # Need a git repo for Verifier.current_head
       System.cmd("git", ["init"], cd: ws)
       File.write!(Path.join(ws, "test.txt"), "hello")
@@ -280,9 +280,6 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [x] [plan-1] Done
       """
 
-      # Configure a command that always fails
-      Application.put_env(:symphony_elixir, :test_verify_commands, ["false"])
-
       # Simulate 3 verify failures with increasing attempt count
       for attempt <- 1..3 do
         unit_map = %{"kind" => "verify", "attempt" => attempt}
@@ -294,24 +291,30 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         if attempt < 3 do
           assert {:retry, _reason} = result
         else
-          # Should force-accept on attempt 3
-          assert :accepted = result
-          IssueExec.accept_unit(ws)
+          # Attempt 3: must FAIL (not force-accept)
+          assert {:fail, reason} = result
+          assert reason =~ "exhausted"
         end
       end
 
-      # After force-accept, last_verified_sha should be set
+      # verified_sha must NOT be set — handoff must be blocked
       {:ok, exec} = IssueExec.read(ws)
-      assert exec["last_verified_sha"] != nil
+      assert exec["last_verified_sha"] == nil
 
-      # Handoff should now succeed (use the actual verified SHA as git_head)
+      # current_unit is still set (verify, attempt=3) from the failed closeout.
+      # Next dispatch: replay_current_unit_rule increments to attempt 4 > max → circuit breaker.
+      {:ok, head_sha} = case System.cmd("git", ["rev-parse", "HEAD"], cd: ws) do
+        {sha, 0} -> {:ok, String.trim(sha)}
+        _ -> {:ok, "abc"}
+      end
+
       ctx = %{
         issue: %{state: @issue.state},
         exec: exec,
         workpad_text: workpad_all_done,
-        git_head: exec["last_verified_sha"]
+        git_head: head_sha
       }
-      assert {:dispatch, %Unit{kind: :handoff}} = DispatchResolver.resolve(ctx)
+      assert {:stop, :circuit_breaker} = DispatchResolver.resolve(ctx)
     end
   end
 
@@ -485,13 +488,12 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  describe "Scenario L: merge accepted but phase not updated (pre-fix)" do
-    test "merge closeout sets phase to done", %{workspace: ws} do
+  describe "Scenario L: merge closeout checks PR state" do
+    test "merge sets phase to done when PR is merged", %{workspace: ws} do
       IssueExec.update(ws, %{"phase" => "merging"})
 
-      # Before fix: merge closeout didn't set phase → merge_rule would fire again
-      # After fix: merge closeout sets phase to "done"
-      assert :accepted = simulate_unit_complete(ws, %{"kind" => "merge"}, @issue)
+      merged_checker = fn _ws -> :merged end
+      assert :accepted = simulate_unit_complete(ws, %{"kind" => "merge"}, @issue, merge_checker: merged_checker)
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["phase"] == "done"
@@ -500,6 +502,27 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       merging_issue = %{state: "Merging", identifier: "ENT-42", title: "Merge"}
       result = resolve(ws, merging_issue)
       assert {:stop, :merge_complete} = result
+    end
+
+    test "merge retries when PR is still open", %{workspace: ws} do
+      IssueExec.update(ws, %{"phase" => "merging"})
+
+      open_checker = fn _ws -> {:not_merged, "PR state: OPEN"} end
+      unit_map = %{"kind" => "merge"}
+      IssueExec.start_unit(ws, unit_map)
+      result = Closeout.run(ws, unit_map, @issue, merge_checker: open_checker)
+
+      assert {:retry, reason} = result
+      assert reason =~ "not merged"
+
+      # phase should NOT be "done"
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] != "done"
+
+      # current_unit still set → replay_current_unit_rule fires on next dispatch
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: %{state: "Merging"}, exec: exec, workpad_text: nil, git_head: "abc"}
+      assert {:dispatch, %Unit{kind: :merge, attempt: 2}} = DispatchResolver.resolve(ctx)
     end
   end
 

@@ -54,13 +54,16 @@ defmodule SymphonyElixir.FailurePathTest do
   end
 
   # ──────────────────────────────────────────────────────────────────
-  # Invariant 2: verify force-accept is explicit, not silent
+  # Invariant 2: verify exhaustion escalates, never force-accepts
   #
-  # Finding: unverified code silently reached handoff/PR.
-  # Invariant: force-accept must (a) set verified_sha, (b) record in ledger.
+  # Finding: unverified code silently reached handoff/PR via force-accept.
+  # Fix: verify at max attempts returns {:fail, ...} so the circuit
+  #      breaker escalates to Human Input Needed.
+  # Invariant: (a) attempts 1-2 retry, (b) attempt 3 fails (not accepts),
+  #            (c) verified_sha is NOT set, (d) ledger records exhaustion.
   # ──────────────────────────────────────────────────────────────────
 
-  describe "verify force-accept is explicit" do
+  describe "verify exhaustion escalates to human" do
     setup do
       workspace = Path.join(System.tmp_dir!(), "fail_test_#{System.unique_integer([:positive])}")
       File.mkdir_p!(Path.join(workspace, ".symphony"))
@@ -88,27 +91,34 @@ defmodule SymphonyElixir.FailurePathTest do
       end
     end
 
-    test "attempt 3 force-accepts and sets verified_sha", %{workspace: ws} do
+    test "attempt 3 fails (does not force-accept)", %{workspace: ws} do
       unit = %{"kind" => "verify", "attempt" => 3}
       IssueExec.start_unit(ws, unit)
       result = Closeout.run(ws, unit, @issue, verify_commands: ["false"])
 
-      assert :accepted = result
-
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["last_verified_sha"] != nil,
-        "force-accept must set verified_sha so handoff can proceed"
+      assert {:fail, reason} = result
+      assert reason =~ "exhausted"
     end
 
-    test "force-accept is recorded in ledger", %{workspace: ws} do
+    test "attempt 3 does NOT set verified_sha", %{workspace: ws} do
+      unit = %{"kind" => "verify", "attempt" => 3}
+      IssueExec.start_unit(ws, unit)
+      Closeout.run(ws, unit, @issue, verify_commands: ["false"])
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["last_verified_sha"] == nil,
+        "failed verify must NOT set verified_sha — handoff must be blocked"
+    end
+
+    test "exhaustion is recorded in ledger", %{workspace: ws} do
       unit = %{"kind" => "verify", "attempt" => 3}
       IssueExec.start_unit(ws, unit)
       Closeout.run(ws, unit, @issue, verify_commands: ["false"])
 
       {:ok, entries} = SymphonyElixir.Ledger.read(ws)
       events = Enum.map(entries, & &1["event"])
-      assert "verify_force_accepted" in events,
-        "force-accept must leave an audit trail in the ledger"
+      assert "verify_exhausted" in events,
+        "verify exhaustion must leave an audit trail in the ledger"
     end
   end
 

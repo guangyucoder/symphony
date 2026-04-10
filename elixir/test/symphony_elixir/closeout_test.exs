@@ -79,8 +79,29 @@ defmodule SymphonyElixir.CloseoutTest do
   end
 
   describe "merge closeout" do
-    test "always accepts", %{workspace: ws} do
-      assert :accepted = Closeout.run(ws, %{"kind" => "merge"}, @issue)
+    test "accepts when PR is merged", %{workspace: ws} do
+      checker = fn _workspace -> :merged end
+      assert :accepted = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: checker)
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] == "done"
+    end
+
+    test "retries when PR is not merged", %{workspace: ws} do
+      checker = fn _workspace -> {:not_merged, "PR state: OPEN"} end
+      assert {:retry, reason} = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: checker)
+      assert reason =~ "not merged"
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] != "done"
+    end
+
+    test "accepts with warning when PR status unknown", %{workspace: ws} do
+      checker = fn _workspace -> :unknown end
+      assert :accepted = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: checker)
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] == "done"
     end
   end
 
