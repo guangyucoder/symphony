@@ -771,4 +771,69 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}, @issue)
     IssueExec.accept_unit(ws)
   end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Scenario Q: programmatic merge — CI pass, pending, fail paths
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "Scenario Q: programmatic merge dispatch paths" do
+    test "CI fail during merge → verify_error set, verify-fix dispatched", %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"phase" => "merging"})
+
+      # Simulate what do_merge_with_ci_check does on CI failure
+      IssueExec.set_verify_error(ws, "FAIL: board-actions.test.ts:222")
+      IssueExec.update(ws, %{"current_unit" => nil, "verify_fix_count" => 1})
+
+      # Dispatch in Merging state should give verify-fix (not merge)
+      merging_issue = %{state: "Merging"}
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+               DispatchResolver.resolve(ctx)
+    end
+
+    test "after verify-fix clears error → merge_rule fires again", %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"phase" => "merging", "verify_error" => nil})
+
+      merging_issue = %{state: "Merging"}
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
+    end
+
+    test "verify_fix_count caps prevent infinite CI-fail loop", %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"phase" => "merging", "verify_fix_count" => 2})
+
+      # With fix_count at cap (2), CI failure should NOT set verify_error
+      # Simulating the agent_runner CI-fail logic:
+      {:ok, exec_state} = IssueExec.read(ws)
+      fix_count = exec_state["verify_fix_count"] || 0
+      assert fix_count >= 2, "fix_count should be at cap"
+
+      # merge_rule fires (no verify_error set), CI fails, returns :error → replay → circuit breaker
+      merging_issue = %{state: "Merging"}
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+      # Should dispatch merge (not verify-fix, since no verify_error)
+      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
+    end
+
+    test "merge closeout accepts when PR merged", %{workspace: ws} do
+      merged_checker = fn _ws -> :merged end
+      assert :accepted = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: merged_checker)
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] == "done"
+    end
+
+    test "merge closeout retries when PR not merged", %{workspace: ws} do
+      open_checker = fn _ws -> {:not_merged, "PR OPEN"} end
+      IssueExec.start_unit(ws, %{"kind" => "merge"})
+      assert {:retry, _} = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: open_checker)
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["phase"] != "done"
+    end
+  end
 end

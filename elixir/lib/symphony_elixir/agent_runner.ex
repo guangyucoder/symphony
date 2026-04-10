@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Workspace}
+  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, Workspace}
 
   @max_escalate_attempts 3
 
@@ -135,7 +135,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     case DispatchResolver.resolve(ctx) do
       {:dispatch, %Unit{kind: :merge} = unit} ->
-        execute_merge_programmatic(workspace, issue, unit, codex_update_recipient)
+        execute_merge_programmatic(workspace, issue, unit, codex_update_recipient, opts)
 
       {:dispatch, unit} ->
         Logger.info("unit_lite: dispatching #{unit.display_name} (effort=#{unit.reasoning_effort}) for #{issue_context(issue)}")
@@ -303,8 +303,8 @@ defmodule SymphonyElixir.AgentRunner do
   # Programmatic merge — no Codex session, no token burn.
   # Checks CI, merges PR, updates Linear. All shell commands.
   # Does NOT call start_unit until we know we're actually merging.
-  defp execute_merge_programmatic(workspace, issue, unit, codex_update_recipient) do
-    result = do_programmatic_merge(workspace, issue)
+  defp execute_merge_programmatic(workspace, issue, unit, codex_update_recipient, opts) do
+    result = do_programmatic_merge(workspace, issue, opts)
 
     unit_map = Unit.to_map(unit)
 
@@ -346,28 +346,30 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_programmatic_merge(workspace, issue) do
-    alias SymphonyElixir.Verifier
+  defp do_programmatic_merge(workspace, issue, opts) do
+    pr_checker = Keyword.get(opts, :pr_checker, &Verifier.check_pr_merged/1)
 
     # 0. Check if already merged (idempotency)
-    case Verifier.check_pr_merged(workspace) do
+    case pr_checker.(workspace) do
       :merged ->
         move_issue_to_done(issue)
         :ok
 
       _ ->
-        do_merge_with_ci_check(workspace, issue)
+        do_merge_with_ci_check(workspace, issue, opts)
     end
   end
 
-  defp do_merge_with_ci_check(workspace, issue) do
-    alias SymphonyElixir.Verifier
+  defp do_merge_with_ci_check(workspace, issue, opts) do
+    ci_checker = Keyword.get(opts, :ci_checker, &Verifier.check_ci_status/1)
+    pr_merger = Keyword.get(opts, :pr_merger, &Verifier.merge_pr/1)
+    ci_output_getter = Keyword.get(opts, :ci_output_getter, &get_ci_failure_output/1)
 
     # 1. Check CI
-    case Verifier.check_ci_status(workspace) do
+    case ci_checker.(workspace) do
       :pass ->
         # 2. Merge PR
-        case Verifier.merge_pr(workspace) do
+        case pr_merger.(workspace) do
           :ok ->
             # 3. Move Linear to Done
             move_issue_to_done(issue)
@@ -381,11 +383,22 @@ defmodule SymphonyElixir.AgentRunner do
         {:skip, "CI pending"}
 
       {:fail, _reason} ->
-        # CI test failure — get full output for verify-fix context
-        ci_output = get_ci_failure_output(workspace)
-        IssueExec.set_verify_error(workspace, ci_output)
-        IssueExec.update(workspace, %{"current_unit" => nil})
-        {:skip, "CI failed — verify-fix will be dispatched"}
+        # CI test failure — dispatch verify-fix if within cycle cap
+        {:ok, exec_state} = IssueExec.read(workspace)
+        fix_count = exec_state["verify_fix_count"] || 0
+
+        if fix_count < 2 do
+          ci_output = ci_output_getter.(workspace)
+          IssueExec.set_verify_error(workspace, ci_output)
+          IssueExec.update(workspace, %{"current_unit" => nil, "verify_fix_count" => fix_count + 1})
+          Ledger.append(workspace, :ci_failed_will_fix, %{
+            "fix_cycle" => fix_count + 1,
+            "error" => String.slice(ci_output, 0, 512)
+          })
+          {:skip, "CI failed — verify-fix ##{fix_count + 1} will be dispatched"}
+        else
+          {:error, "CI failed after #{fix_count} fix cycles — escalating"}
+        end
 
       :unknown ->
         {:skip, "CI status unknown"}

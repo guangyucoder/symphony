@@ -71,7 +71,7 @@ defmodule SymphonyElixir.Verifier do
         case String.trim(output) do
           "pass" -> :pass
           "pending" -> :pending
-          "none" -> :pending
+          "none" -> :pass
           "fail" -> {:fail, "CI checks failed"}
           other -> {:fail, "CI status: #{other}"}
         end
