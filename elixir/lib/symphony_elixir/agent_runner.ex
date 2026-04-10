@@ -363,6 +363,20 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_programmatic_merge(workspace, issue) do
     alias SymphonyElixir.Verifier
 
+    # 0. Check if already merged (idempotency)
+    case Verifier.check_pr_merged(workspace) do
+      :merged ->
+        move_issue_to_done(issue)
+        :ok
+
+      _ ->
+        do_merge_with_ci_check(workspace, issue)
+    end
+  end
+
+  defp do_merge_with_ci_check(workspace, issue) do
+    alias SymphonyElixir.Verifier
+
     # 1. Check CI
     case Verifier.check_ci_status(workspace) do
       :pass ->
@@ -380,11 +394,32 @@ defmodule SymphonyElixir.AgentRunner do
       :pending ->
         {:skip, "CI pending"}
 
-      {:fail, reason} ->
-        {:error, "CI failed: #{reason}"}
+      {:fail, _reason} ->
+        # CI test failure — get full output for verify-fix context
+        ci_output = get_ci_failure_output(workspace)
+        IssueExec.set_verify_error(workspace, ci_output)
+        IssueExec.update(workspace, %{"current_unit" => nil})
+        {:skip, "CI failed — verify-fix will be dispatched"}
 
       :unknown ->
         {:skip, "CI status unknown"}
+    end
+  end
+
+  defp get_ci_failure_output(workspace) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd("gh", ["pr", "checks"],
+            cd: workspace, stderr_to_stdout: true)
+        rescue
+          _ -> {"(could not retrieve CI output)", 127}
+        end
+      end)
+
+    case Task.yield(task, 15_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, _}} -> String.slice(output, 0, 1500)
+      _ -> "(CI output unavailable)"
     end
   end
 

@@ -59,10 +59,10 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       assert prompt =~ "Do NOT write new functional code"
     end
 
-    test "merge prompt goes straight to land" do
+    test "merge prompt is a safety-net fallback (merge is programmatic)" do
       prompt = PromptBuilder.build_unit_prompt(@issue, Unit.merge())
       assert prompt =~ "Merge"
-      assert prompt =~ "land"
+      assert prompt =~ "gh pr merge"
       assert prompt =~ "Done"
     end
 

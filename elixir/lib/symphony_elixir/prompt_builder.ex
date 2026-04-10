@@ -163,14 +163,14 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  # Merge: goal-oriented, low-effort unit
+  # Merge is handled programmatically (no Codex session).
+  # This clause exists only as a safety net if merge is somehow dispatched
+  # through the old code path.
   defp unit_instructions(%Unit{kind: :merge}) do
     """
     ## Instructions — Merge
-    This ticket is approved. Land it.
-    - Run the `land` skill immediately.
-    - Wait for CI if checks are pending.
-    - After successful merge, move to `Done`.
+    Merge the PR with `gh pr merge --squash --delete-branch` and move issue to `Done`.
+    Do NOT wait for CI — just merge and exit.
     """
   end
 
