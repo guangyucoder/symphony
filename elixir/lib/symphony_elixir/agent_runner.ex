@@ -406,18 +406,58 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp get_ci_failure_output(workspace) do
+    # Try to get actual failure details from the failed CI job log,
+    # not just the pass/fail summary from `gh pr checks`.
     task =
       Task.async(fn ->
         try do
-          System.cmd("gh", ["pr", "checks"],
+          # 1. Find the failed run ID
+          {run_json, 0} = System.cmd("gh", ["pr", "checks", "--json", "link,state,name",
+            "--jq", "[.[] | select(.state == \"FAILURE\")] | first | .link"],
             cd: workspace, stderr_to_stdout: true)
+
+          run_url = String.trim(run_json)
+
+          if run_url != "" and String.contains?(run_url, "/jobs/") do
+            # Extract job ID from URL like .../jobs/70825851812
+            job_id = run_url |> String.split("/jobs/") |> List.last() |> String.trim()
+
+            # 2. Get the job log and extract failure details
+            {log, _} = System.cmd("gh", ["api",
+              "repos/{owner}/{repo}/actions/jobs/#{job_id}/logs"],
+              cd: workspace, stderr_to_stdout: true)
+
+            # Extract the useful part: failed test names + error messages
+            lines = String.split(log, "\n")
+            failure_lines = lines
+              |> Enum.filter(fn l ->
+                String.contains?(l, "failed") or String.contains?(l, "×") or
+                String.contains?(l, "Error:") or String.contains?(l, "✘") or
+                String.contains?(l, "e2e/") or String.contains?(l, "FAIL")
+              end)
+              |> Enum.map(&String.replace(&1, ~r/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*/, ""))
+              |> Enum.uniq()
+
+            if failure_lines != [] do
+              Enum.join(failure_lines, "\n")
+            else
+              # Fallback: last 40 lines of log
+              lines |> Enum.take(-40) |> Enum.join("\n")
+            end
+          else
+            # Fallback to pr checks summary
+            {output, _} = System.cmd("gh", ["pr", "checks"],
+              cd: workspace, stderr_to_stdout: true)
+            output
+          end
         rescue
-          _ -> {"(could not retrieve CI output)", 127}
+          _ -> "(could not retrieve CI output)"
         end
       end)
 
-    case Task.yield(task, 15_000) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, _}} -> String.slice(output, 0, 1500)
+    case Task.yield(task, 30_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, _exit}} when is_binary(output) -> String.slice(output, 0, 1500)
+      {:ok, output} when is_binary(output) -> String.slice(output, 0, 1500)
       _ -> "(CI output unavailable)"
     end
   end

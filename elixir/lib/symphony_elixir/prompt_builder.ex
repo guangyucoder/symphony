@@ -84,14 +84,16 @@ defmodule SymphonyElixir.PromptBuilder do
     ```
 
     ### Steps
-    1. Read the error output above. Identify the failing test file and assertion.
+    1. Read the error output above. Identify the failing test file(s) and assertion(s).
     2. Read the failing test to understand what it expects.
-    3. Read the source code under test. Find the root cause.
-    4. Fix the **source code** (not the tests) unless the test expectation is provably wrong.
+    3. Read the source code under test. Determine root cause.
+    4. Fix whichever side is wrong:
+       - If the **code** has a bug → fix the code.
+       - If the **test expectations** are stale (e.g., UI text/flow changed intentionally) → update the tests.
     5. **Run the failing test to verify your fix.** Iterate until it passes.
     6. Commit only after the test passes.
 
-    Do NOT skip, disable, or weaken tests.
+    Do NOT skip, disable, or delete tests — fix or update them.
     Do NOT do handoff or create a PR — the orchestrator handles the rest.
     """
   end
