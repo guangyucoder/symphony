@@ -75,11 +75,11 @@ Config ← (read by all modules, writes nothing)
 ```
 
 Rules:
-- `Orchestrator` is the only module that spawns Tasks and monitors processes
+- `Orchestrator` is the only module that spawns long-lived Tasks and monitors processes
 - `AgentRunner` never reads Linear state directly — Orchestrator passes issue data
 - `DispatchResolver` is pure: input → output, no side effects
 - `Closeout` may write to `IssueExec` and `Ledger` but never spawns processes
-- `Verifier` runs shell commands but never writes to Codex or Linear
+- `Verifier` runs shell commands via short-lived Tasks (with timeout + shutdown) but never writes to Codex or Linear
 
 ## Key Files
 
