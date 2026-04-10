@@ -145,7 +145,7 @@ defmodule SymphonyElixir.Closeout do
     end
   end
 
-  defp do_closeout("merge", workspace, _unit, _issue, opts) do
+  defp do_closeout("merge", workspace, _unit, issue, opts) do
     checker = Keyword.get(opts, :merge_checker, &Verifier.check_pr_merged/1)
 
     case checker.(workspace) do
@@ -159,9 +159,16 @@ defmodule SymphonyElixir.Closeout do
 
       :unknown ->
         # Cannot determine PR state (e.g., gh CLI not available).
-        # Accept to avoid blocking, but log a warning and record in ledger.
+        # Accept to avoid blocking, but log, record in ledger, and alert human.
         Logger.warning("Closeout: cannot verify PR merge status, accepting")
         Ledger.append(workspace, :merge_status_unknown, %{})
+
+        issue_id = issue_id(issue)
+        if is_binary(issue_id) do
+          Adapter.create_comment(issue_id,
+            "**Merge status unknown**: could not verify PR merge state (gh CLI unavailable or timed out).\nAccepting merge — please verify manually that the PR was merged.")
+        end
+
         IssueExec.update(workspace, %{"phase" => "done"})
         :accepted
     end
