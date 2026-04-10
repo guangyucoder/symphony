@@ -65,11 +65,16 @@ defmodule SymphonyElixir.AgentRunner do
 
           # 2. Stale current_unit from previous cycle (e.g., handoff was
           #    in-flight). Clear it so DispatchResolver sees clean state.
-          #    Do NOT clear rework_fix_applied here — verify/doc_fix during
-          #    rework are part of the current cycle, not stale.
-          stale? = current != nil and
-                   not (is_binary(current["subtask_id"]) and
-                        String.starts_with?(current["subtask_id"], "rework-"))
+          #    Do NOT clear verify/doc_fix/rework-* — these are part of the
+          #    current rework cycle and need replay for circuit breaker.
+          rework_cycle_unit? = current != nil and
+            case current["kind"] do
+              k when k in ["verify", "doc_fix"] -> true
+              _ -> is_binary(current["subtask_id"]) and
+                   String.starts_with?(current["subtask_id"], "rework-")
+            end
+
+          stale? = current != nil and not rework_cycle_unit?
 
           if stale? do
             IssueExec.update(workspace, %{
