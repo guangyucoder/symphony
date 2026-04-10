@@ -138,6 +138,22 @@ merging, rework).
 - **Don't use `run_unit_lite` in legacy mode** — check `Config.unit_lite?()` first
 - **Don't grow monolithic prompts** — each unit prompt should be < 2000 chars
 - **Don't skip tests** — `mix compile --warnings-as-errors && mix test` before every commit
+- **Don't forget to rebuild the escript after code changes** — `mix escript.build`. The `bin/symphony` binary is a frozen snapshot; `mix compile` alone does NOT update it. A running Symphony process uses the escript it was started with, not the latest `.beam` files.
+
+## Deployment
+
+After any code change to Symphony:
+
+```bash
+cd elixir
+mix compile --warnings-as-errors && mix test   # verify
+mix escript.build                                # rebuild binary
+# Then restart Symphony (start-symphony.sh kills old process automatically)
+```
+
+**Common pitfall**: editing code, running `mix test` (passes), restarting Symphony
+via `start-symphony.sh`, but forgetting `mix escript.build`. The new process loads
+the OLD escript — your fix is not running. Always rebuild before restart.
 
 ## Configuration
 
