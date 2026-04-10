@@ -47,11 +47,14 @@ defmodule SymphonyElixir.AgentRunner do
           current = exec_check["current_unit"]
           last = exec_check["last_accepted_unit"]
 
-          # 1. Fresh rework entry: last_accepted is handoff/verify/merge from
+          # 1. Fresh rework entry: last_accepted is handoff/merge from the
           #    previous cycle, current_unit is nil (clean exit). Clear
           #    rework_fix_applied so the fix rule fires for this new cycle.
+          #    NOTE: "verify" is NOT included — verify can complete within a
+          #    rework cycle (rework_fix → doc_fix → verify), and treating it
+          #    as fresh entry causes an infinite rework loop.
           fresh_rework? = is_nil(current) and
-                          is_map(last) and last["kind"] in ["handoff", "verify", "merge"]
+                          is_map(last) and last["kind"] in ["handoff", "merge"]
 
           if fresh_rework? do
             IssueExec.update(workspace, %{
