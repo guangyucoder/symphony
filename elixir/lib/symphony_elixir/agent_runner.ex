@@ -405,9 +405,16 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
-    # Clear current_unit so when a human moves the ticket back to active,
-    # dispatch starts fresh instead of hitting the circuit breaker again.
-    IssueExec.update(workspace, %{"current_unit" => nil})
+    # Reset exec state so when a human moves the ticket back to active,
+    # dispatch starts fresh — rework_fix_rule fires, verify counters are clean,
+    # and circuit breaker is cleared.
+    IssueExec.update(workspace, %{
+      "current_unit" => nil,
+      "rework_fix_applied" => false,
+      "verify_error" => nil,
+      "verify_attempt" => 0,
+      "verify_fix_count" => 0
+    })
     Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
     :ok
   end
