@@ -134,6 +134,9 @@ defmodule SymphonyElixir.AgentRunner do
     }
 
     case DispatchResolver.resolve(ctx) do
+      {:dispatch, %Unit{kind: :merge} = unit} ->
+        execute_merge_programmatic(workspace, issue, unit, codex_update_recipient)
+
       {:dispatch, unit} ->
         Logger.info("unit_lite: dispatching #{unit.display_name} (effort=#{unit.reasoning_effort}) for #{issue_context(issue)}")
         execute_unit(workspace, issue, unit, codex_update_recipient, opts)
@@ -294,6 +297,109 @@ defmodule SymphonyElixir.AgentRunner do
       end
     after
       Workspace.run_after_run_hook(workspace, issue)
+    end
+  end
+
+  # Programmatic merge — no Codex session, no token burn.
+  # Checks CI, merges PR, updates Linear. All shell commands.
+  defp execute_merge_programmatic(workspace, issue, unit, codex_update_recipient) do
+    IssueExec.start_unit(workspace, Unit.to_map(unit))
+    Ledger.unit_started(workspace, Unit.to_map(unit))
+
+    send_codex_update(codex_update_recipient, issue, %{
+      event: :unit_dispatched,
+      timestamp: DateTime.utc_now(),
+      unit_kind: "merge",
+      unit_display_name: "merge:programmatic",
+      reasoning_effort: "low"
+    })
+
+    result = do_programmatic_merge(workspace, issue)
+
+    unit_map = Unit.to_map(unit)
+
+    case result do
+      :ok ->
+        IssueExec.update(workspace, %{"phase" => "done"})
+        IssueExec.accept_unit(workspace)
+        Ledger.unit_accepted(workspace, unit_map, %{"merge" => "programmatic"})
+        Ledger.unit_tokens(workspace, unit_map, %{input_tokens: 0, output_tokens: 0, total_tokens: 0})
+
+        send_codex_update(codex_update_recipient, issue, %{
+          event: :unit_completed,
+          timestamp: DateTime.utc_now(),
+          unit_kind: "merge",
+          unit_display_name: "merge:programmatic",
+          reasoning_effort: "low",
+          unit_tokens: %{input_tokens: 0, output_tokens: 0, total_tokens: 0},
+          closeout_result: :accepted
+        })
+
+        Logger.info("unit_lite: programmatic merge completed for #{issue_context(issue)}")
+        :ok
+
+      {:skip, reason} ->
+        Logger.info("unit_lite: merge skipped (#{reason}) for #{issue_context(issue)}")
+        # Don't record as started/failed — just skip silently, retry on next poll
+        IssueExec.update(workspace, %{"current_unit" => nil})
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("unit_lite: programmatic merge failed for #{issue_context(issue)}: #{reason}")
+        Ledger.unit_failed(workspace, unit_map, reason)
+
+        send_codex_update(codex_update_recipient, issue, %{
+          event: :unit_completed,
+          timestamp: DateTime.utc_now(),
+          unit_kind: "merge",
+          unit_display_name: "merge:programmatic",
+          closeout_result: {:retry, reason}
+        })
+
+        :ok
+    end
+  end
+
+  defp do_programmatic_merge(workspace, issue) do
+    alias SymphonyElixir.Verifier
+
+    # 1. Check CI
+    case Verifier.check_ci_status(workspace) do
+      :pass ->
+        # 2. Merge PR
+        case Verifier.merge_pr(workspace) do
+          :ok ->
+            # 3. Move Linear to Done
+            move_issue_to_done(issue)
+            :ok
+
+          {:error, output} ->
+            {:error, "PR merge failed: #{output}"}
+        end
+
+      :pending ->
+        {:skip, "CI pending"}
+
+      {:fail, reason} ->
+        {:error, "CI failed: #{reason}"}
+
+      :unknown ->
+        {:skip, "CI status unknown"}
+    end
+  end
+
+  defp move_issue_to_done(issue) do
+    issue_id = case issue do
+      %Issue{id: id} -> id
+      %{id: id} -> id
+      _ -> nil
+    end
+
+    if is_binary(issue_id) do
+      case Adapter.update_issue_state(issue_id, "Done") do
+        :ok -> Logger.info("unit_lite: moved issue to Done")
+        {:error, err} -> Logger.warning("unit_lite: failed to move to Done: #{inspect(err)}")
+      end
     end
   end
 

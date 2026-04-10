@@ -47,6 +47,61 @@ defmodule SymphonyElixir.Verifier do
   end
 
   @pr_check_timeout_ms 15_000
+  @merge_timeout_ms 60_000
+
+  @doc """
+  Check CI status for the current branch's PR.
+  Returns `:pass`, `:pending`, `{:fail, summary}`, or `:unknown`.
+  """
+  @spec check_ci_status(Path.t()) :: :pass | :pending | {:fail, String.t()} | :unknown
+  def check_ci_status(workspace) do
+    task =
+      Task.async(fn ->
+        try do
+          jq = "[.[] | .state] | if length == 0 then \"none\" elif all(. == \"SUCCESS\" or . == \"SKIPPED\") then \"pass\" elif any(. == \"FAILURE\") then \"fail\" else \"pending\" end"
+          System.cmd("gh", ["pr", "checks", "--json", "state", "--jq", jq],
+            cd: workspace, stderr_to_stdout: true)
+        rescue
+          _ -> {"gh not available", 127}
+        end
+      end)
+
+    case Task.yield(task, @pr_check_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} ->
+        case String.trim(output) do
+          "pass" -> :pass
+          "pending" -> :pending
+          "none" -> :pending
+          "fail" -> {:fail, "CI checks failed"}
+          other -> {:fail, "CI status: #{other}"}
+        end
+
+      {:ok, {_output, _}} -> :unknown
+      nil -> :unknown
+    end
+  end
+
+  @doc """
+  Merge the PR for the current branch. Returns :ok or {:error, output}.
+  """
+  @spec merge_pr(Path.t()) :: :ok | {:error, String.t()}
+  def merge_pr(workspace) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd("gh", ["pr", "merge", "--squash", "--delete-branch"],
+            cd: workspace, stderr_to_stdout: true)
+        rescue
+          _ -> {"gh not available", 127}
+        end
+      end)
+
+    case Task.yield(task, @merge_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, _}} -> {:error, String.trim(output)}
+      nil -> {:error, "merge timed out"}
+    end
+  end
 
   @doc """
   Check whether the PR for the current branch has been merged on the remote.
