@@ -105,7 +105,11 @@ defmodule SymphonyElixir.AgentRunner do
             "current_unit" => nil,
             "verify_error" => nil,
             "verify_attempt" => 0,
-            "verify_fix_count" => 0
+            "verify_fix_count" => 0,
+            "merge_conflict" => false,
+            "merge_sync_count" => 0,
+            "mergeability_unknown_count" => 0,
+            "merge_needs_verify" => false
           })
 
         _ ->
@@ -176,6 +180,11 @@ defmodule SymphonyElixir.AgentRunner do
     # Run before_run hook
     Workspace.run_before_run_hook(workspace, issue)
 
+    # For rework-* subtasks: snapshot HEAD (for closeout zero-commit guard)
+    # and fetch all Linear comments (for prompt injection). Orchestrator-owned
+    # ingestion — do not rely on the agent to fetch review context itself.
+    opts = enrich_opts_for_rework(workspace, issue, unit, opts)
+
     # Build prompt
     prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
 
@@ -212,7 +221,13 @@ defmodule SymphonyElixir.AgentRunner do
               # Run closeout — this is where verification, doc-impact, and
               # acceptance checks actually happen. Without this, all protection
               # mechanisms are dead code.
-              closeout_opts = Keyword.take(opts, [:workpad_text])
+              closeout_opts =
+                Keyword.take(opts, [
+                  :workpad_text,
+                  :dispatch_head,
+                  :linear_fetch_ok,
+                  :rework_has_review_context
+                ])
               unit_map = Unit.to_map(unit)
 
               unit_token_stats = read_token_counter(token_counter)
@@ -360,23 +375,39 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  @max_merge_sync_cycles 2
+  @max_mergeability_unknown 10
+
   defp do_merge_with_ci_check(workspace, issue, opts) do
     ci_checker = Keyword.get(opts, :ci_checker, &Verifier.check_ci_status/1)
     pr_merger = Keyword.get(opts, :pr_merger, &Verifier.merge_pr/1)
     ci_output_getter = Keyword.get(opts, :ci_output_getter, &get_ci_failure_output/1)
+    mergeability_checker = Keyword.get(opts, :mergeability_checker, &Verifier.check_pr_mergeability/1)
 
     # 1. Check CI
     case ci_checker.(workspace) do
       :pass ->
-        # 2. Merge PR
-        case pr_merger.(workspace) do
-          :ok ->
-            # 3. Move Linear to Done
-            move_issue_to_done(issue)
-            :ok
+        # 1.5 Check mergeability before attempting merge
+        case mergeability_checker.(workspace) do
+          :mergeable ->
+            # Reset unknown counter on success
+            IssueExec.update(workspace, %{"mergeability_unknown_count" => 0})
 
-          {:error, output} ->
-            {:error, "PR merge failed: #{output}"}
+            # 2. Merge PR
+            case pr_merger.(workspace) do
+              :ok ->
+                move_issue_to_done(issue)
+                :ok
+
+              {:error, output} ->
+                {:error, "PR merge failed: #{output}"}
+            end
+
+          :conflicting ->
+            handle_merge_conflict(workspace)
+
+          :unknown ->
+            handle_mergeability_unknown(workspace)
         end
 
       :pending ->
@@ -402,6 +433,37 @@ defmodule SymphonyElixir.AgentRunner do
 
       :unknown ->
         {:skip, "CI status unknown"}
+    end
+  end
+
+  defp handle_merge_conflict(workspace) do
+    {:ok, exec_state} = IssueExec.read(workspace)
+    sync_count = exec_state["merge_sync_count"] || 0
+
+    if sync_count < @max_merge_sync_cycles do
+      IssueExec.update(workspace, %{
+        "merge_conflict" => true,
+        "current_unit" => nil,
+        "merge_sync_count" => sync_count + 1
+      })
+      Ledger.append(workspace, :merge_conflict_will_sync, %{
+        "sync_cycle" => sync_count + 1
+      })
+      {:skip, "PR has conflicts — merge-sync ##{sync_count + 1} will be dispatched"}
+    else
+      {:error, "PR has conflicts after #{sync_count} sync cycles — escalating"}
+    end
+  end
+
+  defp handle_mergeability_unknown(workspace) do
+    {:ok, exec_state} = IssueExec.read(workspace)
+    count = (exec_state["mergeability_unknown_count"] || 0) + 1
+    IssueExec.update(workspace, %{"mergeability_unknown_count" => count})
+
+    if count >= @max_mergeability_unknown do
+      {:error, "PR mergeability unknown for #{count} consecutive checks — escalating"}
+    else
+      {:skip, "PR mergeability unknown — waiting for GitHub (#{count}/#{@max_mergeability_unknown})"}
     end
   end
 
@@ -593,7 +655,10 @@ defmodule SymphonyElixir.AgentRunner do
       "rework_fix_applied" => false,
       "verify_error" => nil,
       "verify_attempt" => 0,
-      "verify_fix_count" => 0
+      "verify_fix_count" => 0,
+      "merge_conflict" => false,
+      "merge_sync_count" => 0,
+      "mergeability_unknown_count" => 0
     })
     Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
     :ok
@@ -933,6 +998,78 @@ defmodule SymphonyElixir.AgentRunner do
         nil
     end
   end
+
+  # For rework-* subtasks, snapshot the git HEAD at dispatch time and fetch
+  # all Linear comments on the ticket so the prompt can inject them verbatim.
+  # Non-rework units pass through unchanged.
+  #
+  # Two separate boolean flags are passed through to closeout:
+  #   `:linear_fetch_ok`            — the Linear API call itself succeeded
+  #   `:rework_has_review_context`  — after excluding the Symphony-owned
+  #                                    workpad, at least one review comment
+  #                                    remains for the agent to read
+  # Both must be true for closeout to accept rework. If either is false, the
+  # agent ran (or would run) effectively blind, so we return {:retry, ...}
+  # and let the circuit breaker eventually escalate. The two flags are split
+  # so retry reasons in the ledger stay diagnostically useful.
+  defp enrich_opts_for_rework(workspace, issue, %Unit{subtask_id: "rework-" <> _}, opts) do
+    dispatch_head = current_git_head(workspace)
+
+    {comments, fetch_ok} =
+      case extract_issue_id(issue) do
+        id when is_binary(id) ->
+          case Adapter.fetch_issue_comments(id) do
+            {:ok, list} ->
+              {list, true}
+
+            {:error, reason} ->
+              Logger.warning(
+                "unit_lite: failed to fetch Linear comments for rework #{issue_context(issue)}: #{inspect(reason)}"
+              )
+
+              {[], false}
+          end
+
+        _ ->
+          Logger.warning(
+            "unit_lite: cannot extract issue id for rework #{issue_context(issue)}; skipping comment fetch"
+          )
+
+          {[], false}
+      end
+
+    has_review_context = fetch_ok and Enum.any?(comments, &review_comment?/1)
+
+    opts
+    |> Keyword.put(:dispatch_head, dispatch_head)
+    |> Keyword.put(:linear_comments, comments)
+    |> Keyword.put(:linear_fetch_ok, fetch_ok)
+    |> Keyword.put(:rework_has_review_context, has_review_context)
+  end
+
+  defp enrich_opts_for_rework(_workspace, _issue, _unit, opts), do: opts
+
+  # A "review comment" is any Linear comment that is not Symphony's own
+  # Codex Workpad artifact. Keeping the predicate here (instead of only in
+  # PromptBuilder) ensures closeout has the same view of "does the agent have
+  # review context?" — a ticket whose only comment is the workpad must fail
+  # closed in closeout even though the fetch itself succeeded.
+  defp review_comment?(comment) when is_map(comment) do
+    body = comment["body"] || ""
+    body != "" and not workpad_comment_body?(body)
+  end
+
+  defp review_comment?(_), do: false
+
+  defp workpad_comment_body?(body) when is_binary(body) do
+    String.contains?(body, "## Codex Workpad") and String.contains?(body, "### Plan")
+  end
+
+  defp workpad_comment_body?(_), do: false
+
+  defp extract_issue_id(%{id: id}) when is_binary(id), do: id
+  defp extract_issue_id(%{"id" => id}) when is_binary(id), do: id
+  defp extract_issue_id(_), do: nil
 
   defp build_dispatch_id(%Issue{id: issue_id, identifier: identifier}, opts) do
     dispatch_token = System.unique_integer([:positive, :monotonic])

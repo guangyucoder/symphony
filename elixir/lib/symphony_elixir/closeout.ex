@@ -59,35 +59,14 @@ defmodule SymphonyElixir.Closeout do
     :accepted
   end
 
-  defp do_closeout("implement_subtask", workspace, unit, issue, _opts) do
+  defp do_closeout("implement_subtask", workspace, unit, issue, opts) do
     subtask_id = unit["subtask_id"]
 
-    # 1. Mark subtask done on Linear workpad (orchestrator-owned, no agent compliance needed)
-    if subtask_id && issue_id(issue) do
-      case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
-        :ok ->
-          Logger.info("Closeout: marked #{subtask_id} done on Linear workpad")
-
-        {:error, reason} ->
-          Logger.warning("Closeout: failed to mark #{subtask_id} on workpad: #{inspect(reason)}")
-      end
-    end
-
-    # 1b. Set rework_fix_applied flag for rework-* subtasks
     if is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") do
-      IssueExec.update(workspace, %{"rework_fix_applied" => true})
+      handle_rework_closeout(workspace, subtask_id, issue, opts)
+    else
+      accept_implement_subtask(workspace, subtask_id, issue)
     end
-
-    # 1c. Clear verify_error and reset verify_attempt for verify-fix-* subtasks.
-    # Resetting the attempt gives verify a fresh shot after the fix — the
-    # circuit breaker on verify-fix crashes (via replay) prevents infinite loops.
-    if is_binary(subtask_id) and String.starts_with?(subtask_id, "verify-fix-") do
-      IssueExec.update(workspace, %{"verify_error" => nil, "verify_attempt" => 0})
-    end
-
-    # 2. Doc impact check deferred — runs once before verify, not after every subtask.
-    # This avoids N×doc_fix sessions for N subtasks (was burning ~1.5M tokens each).
-    :accepted
   end
 
   defp do_closeout("doc_fix", workspace, _unit, _issue, _opts) do
@@ -118,7 +97,12 @@ defmodule SymphonyElixir.Closeout do
         end
 
         # Reset all verify counters on success
-        IssueExec.update(workspace, %{"verify_attempt" => 0, "verify_error" => nil, "verify_fix_count" => 0})
+        IssueExec.update(workspace, %{
+          "verify_attempt" => 0,
+          "verify_error" => nil,
+          "verify_fix_count" => 0,
+          "merge_needs_verify" => false
+        })
         :accepted
 
       {:fail, output} when attempt >= @max_verify_attempts ->
@@ -187,7 +171,12 @@ defmodule SymphonyElixir.Closeout do
 
     case checker.(workspace) do
       :merged ->
-        IssueExec.update(workspace, %{"phase" => "done"})
+        IssueExec.update(workspace, %{
+          "phase" => "done",
+          "merge_conflict" => false,
+          "merge_sync_count" => 0,
+          "mergeability_unknown_count" => 0
+        })
         :accepted
 
       {:not_merged, reason} ->
@@ -217,6 +206,112 @@ defmodule SymphonyElixir.Closeout do
   end
 
   # --- Helpers ---
+
+  # Rework acceptance requires THREE structural conditions. All three are
+  # orchestrator-observable (no agent self-report) and fail closed to {:retry, _}
+  # so the existing replay_current_unit_rule + @max_unit_attempts circuit
+  # breaker handle eventual escalation.
+  #
+  #   1. Linear API fetch succeeded at dispatch time. Otherwise the agent ran
+  #      with no <ticket_comments> block at all.
+  #   2. At least one review comment (i.e., a comment other than Symphony's
+  #      own Codex Workpad) was present in the fetched set. Otherwise filtering
+  #      leaves the agent effectively blind even though the fetch succeeded.
+  #   3. git HEAD advanced since dispatch (agent produced at least one commit).
+  #
+  # Both (1) and (2) are computed upstream in agent_runner.enrich_opts_for_rework
+  # and passed through the closeout opts. They are split into two flags so the
+  # ledger's retry reason stays diagnostically useful.
+  defp handle_rework_closeout(workspace, subtask_id, issue, opts) do
+    cond do
+      Keyword.get(opts, :linear_fetch_ok, true) == false ->
+        Logger.warning(
+          "Closeout: rework #{subtask_id} dispatched without fresh Linear comments — will retry"
+        )
+
+        {:retry, "rework #{subtask_id}: linear comment fetch failed at dispatch"}
+
+      Keyword.get(opts, :rework_has_review_context, true) == false ->
+        Logger.warning(
+          "Closeout: rework #{subtask_id} had no review context (only workpad or empty) — will retry"
+        )
+
+        {:retry, "rework #{subtask_id}: no review context in Linear comments"}
+
+      true ->
+        case rework_head_state(workspace, opts) do
+          :unchanged ->
+            Logger.warning(
+              "Closeout: rework #{subtask_id} produced no commit (head unchanged since dispatch)"
+            )
+
+            {:retry, "rework #{subtask_id}: produced no commit"}
+
+          :cannot_verify ->
+            Logger.warning(
+              "Closeout: rework #{subtask_id} cannot verify HEAD state (git lookup returned nil)"
+            )
+
+            {:retry, "rework #{subtask_id}: cannot verify HEAD state"}
+
+          :advanced ->
+            accept_implement_subtask(workspace, subtask_id, issue)
+        end
+    end
+  end
+
+  defp accept_implement_subtask(workspace, subtask_id, issue) do
+    # 1. Mark subtask done on Linear workpad (orchestrator-owned, no agent compliance needed)
+    if subtask_id && issue_id(issue) do
+      case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
+        :ok ->
+          Logger.info("Closeout: marked #{subtask_id} done on Linear workpad")
+
+        {:error, reason} ->
+          Logger.warning("Closeout: failed to mark #{subtask_id} on workpad: #{inspect(reason)}")
+      end
+    end
+
+    # 1b. Set rework_fix_applied flag for rework-* subtasks
+    if is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") do
+      IssueExec.update(workspace, %{"rework_fix_applied" => true})
+    end
+
+    # 1c. Clear verify_error and reset verify_attempt for verify-fix-* subtasks.
+    # Resetting the attempt gives verify a fresh shot after the fix — the
+    # circuit breaker on verify-fix crashes (via replay) prevents infinite loops.
+    if is_binary(subtask_id) and String.starts_with?(subtask_id, "verify-fix-") do
+      IssueExec.update(workspace, %{"verify_error" => nil, "verify_attempt" => 0})
+    end
+
+    # 1d. Clear merge_conflict for merge-sync-* subtasks.
+    # Set merge_needs_verify so the orchestrator re-verifies the merge commit
+    # before programmatic merge retries.
+    if is_binary(subtask_id) and String.starts_with?(subtask_id, "merge-sync-") do
+      IssueExec.update(workspace, %{
+        "merge_conflict" => false,
+        "merge_needs_verify" => true
+      })
+    end
+
+    # 2. Doc impact check deferred — runs once before verify, not after every subtask.
+    # This avoids N×doc_fix sessions for N subtasks (was burning ~1.5M tokens each).
+    :accepted
+  end
+
+  # Returns :advanced (HEAD moved since dispatch) | :unchanged (same sha)
+  # | :cannot_verify (either current HEAD or dispatch_head is missing).
+  # The caller uses :cannot_verify to fail-closed (retry) so transient git
+  # lookup failures cannot silently disable the zero-commit guard.
+  defp rework_head_state(workspace, opts) do
+    case {Verifier.current_head(workspace), Keyword.get(opts, :dispatch_head)} do
+      {head, dispatch} when is_binary(head) and is_binary(dispatch) ->
+        if head == dispatch, do: :unchanged, else: :advanced
+
+      _ ->
+        :cannot_verify
+    end
+  end
 
   defp truncate(text, max) when is_binary(text) do
     if String.length(text) <= max, do: text, else: String.slice(text, 0, max) <> "..."

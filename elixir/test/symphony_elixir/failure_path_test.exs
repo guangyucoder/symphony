@@ -246,8 +246,20 @@ defmodule SymphonyElixir.FailurePathTest do
       workspace = Path.join(System.tmp_dir!(), "rework_flag_#{System.unique_integer([:positive])}")
       File.mkdir_p!(Path.join(workspace, ".symphony"))
       IssueExec.init(workspace)
+
+      # Initialize a git repo in the workspace so Verifier.current_head/1 works.
+      # The rework closeout guard requires a comparable HEAD.
+      System.cmd("git", ["init", "-q"], cd: workspace)
+      System.cmd("git", ["config", "user.name", "Test"], cd: workspace)
+      System.cmd("git", ["config", "user.email", "t@t.com"], cd: workspace)
+      File.write!(Path.join(workspace, "README"), "init\n")
+      System.cmd("git", ["add", "."], cd: workspace)
+      System.cmd("git", ["commit", "-q", "-m", "init"], cd: workspace)
+      {dispatch_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+      dispatch_head = String.trim(dispatch_head)
+
       on_exit(fn -> File.rm_rf!(workspace) end)
-      %{workspace: workspace}
+      %{workspace: workspace, dispatch_head: dispatch_head}
     end
 
     test "flag starts false", %{workspace: ws} do
@@ -255,16 +267,136 @@ defmodule SymphonyElixir.FailurePathTest do
       assert exec["rework_fix_applied"] == false
     end
 
-    test "closeout sets flag on rework-* subtask acceptance", %{workspace: ws} do
+    test "closeout sets flag on rework-* acceptance when HEAD advanced and linear fetch succeeded",
+         %{workspace: ws, dispatch_head: dispatch_head} do
       IssueExec.mark_bootstrapped(ws)
       unit = %{"kind" => "implement_subtask", "subtask_id" => "rework-1"}
       IssueExec.start_unit(ws, unit)
 
-      # Closeout for rework subtask sets the flag
-      Closeout.run(ws, unit, %{id: "test", identifier: "T-1", title: "T", state: "Rework"})
+      # Simulate agent producing a commit (HEAD advances past dispatch_head).
+      File.write!(Path.join(ws, "fix.txt"), "fix\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "agent fix"], cd: ws)
 
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "Rework"},
+          dispatch_head: dispatch_head,
+          linear_fetch_ok: true
+        )
+
+      assert result == :accepted
       {:ok, exec} = IssueExec.read(ws)
       assert exec["rework_fix_applied"] == true
+    end
+
+    test "closeout returns {:retry, _} when HEAD unchanged since dispatch (zero-commit guard)",
+         %{workspace: ws, dispatch_head: dispatch_head} do
+      IssueExec.mark_bootstrapped(ws)
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "rework-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # Agent produced no commit — HEAD still at dispatch_head.
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "Rework"},
+          dispatch_head: dispatch_head,
+          linear_fetch_ok: true
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "produced no commit"
+
+      # rework_fix_applied must NOT be set — otherwise rework_fix_rule would
+      # short-circuit and the loop would advance past the no-op.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["rework_fix_applied"] == false
+    end
+
+    test "closeout returns {:retry, _} when dispatch_head missing (fail-closed)",
+         %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "rework-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # No :dispatch_head in opts — orchestrator cannot verify HEAD state.
+      # Guard must fail closed rather than silently accept.
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "Rework"},
+          linear_fetch_ok: true
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "cannot verify HEAD state"
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["rework_fix_applied"] == false
+    end
+
+    test "closeout returns {:retry, _} when linear fetch failed at dispatch",
+         %{workspace: ws, dispatch_head: dispatch_head} do
+      IssueExec.mark_bootstrapped(ws)
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "rework-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # Simulate agent committing — would normally accept, but :linear_fetch_ok
+      # is false so agent was dispatched blind. Must retry, not advance.
+      File.write!(Path.join(ws, "blind.txt"), "blind\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "blind commit"], cd: ws)
+
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "Rework"},
+          dispatch_head: dispatch_head,
+          linear_fetch_ok: false
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "linear comment fetch failed"
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["rework_fix_applied"] == false
+    end
+
+    test "closeout returns {:retry, _} when fetch ok but no review context (only workpad)",
+         %{workspace: ws, dispatch_head: dispatch_head} do
+      IssueExec.mark_bootstrapped(ws)
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "rework-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # Agent committed (HEAD advances), fetch succeeded, but every fetched
+      # comment was filtered out (e.g., only the Codex Workpad). Must retry,
+      # otherwise the blind-rework path re-opens — agent had no findings to
+      # act on but made a commit anyway.
+      File.write!(Path.join(ws, "blind.txt"), "blind\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "blind commit"], cd: ws)
+
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "Rework"},
+          dispatch_head: dispatch_head,
+          linear_fetch_ok: true,
+          rework_has_review_context: false
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "no review context"
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["rework_fix_applied"] == false
     end
 
     test "flag survives doc_fix acceptance", %{workspace: ws} do

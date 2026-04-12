@@ -15,14 +15,133 @@ defmodule SymphonyElixir.PromptBuilder do
   for its current unit.
   """
   @spec build_unit_prompt(map(), Unit.t(), keyword()) :: String.t()
-  def build_unit_prompt(issue, %Unit{} = unit, _opts \\ []) do
+  def build_unit_prompt(issue, %Unit{} = unit, opts \\ []) do
     [
       unit_header(issue, unit),
+      unit_context(unit, opts),
       unit_instructions(unit),
       unit_guardrails(unit)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n\n")
+  end
+
+  # Orchestrator-injected context for rework-* subtasks: Linear comments on
+  # the ticket, rendered verbatim inside a <ticket_comments> block. Agent
+  # identifies what's a review finding, distinguishes addressed from outstanding,
+  # and uses timestamps to reason about order. Orchestrator does not filter by
+  # author or anchor on any header, but it does:
+  #   - sanitize bodies so untrusted text cannot break out of the block tag
+  #   - exclude the Codex Workpad comment (Symphony's own artifact, not review)
+  #   - cap per-comment and total size so prompts stay bounded
+  defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _}, opts) do
+    case Keyword.get(opts, :linear_comments, []) do
+      [] ->
+        nil
+
+      comments when is_list(comments) ->
+        render_ticket_comments(comments)
+    end
+  end
+
+  defp unit_context(_unit, _opts), do: nil
+
+  # Size budgets: keep the ticket_comments block bounded so it doesn't blow the
+  # project's <2000-char unit-prompt convention on long-running tickets. On
+  # overflow, drop oldest comments first; within a kept comment, truncate the
+  # body tail.
+  @max_comment_body_chars 2048
+  @max_ticket_comments_bytes 10_240
+
+  defp render_ticket_comments(comments) do
+    sorted =
+      comments
+      |> Enum.reject(&workpad_comment?/1)
+      |> Enum.sort_by(&(&1["createdAt"] || ""))
+
+    # Render newest-to-oldest, keep while within budget, then reverse back to
+    # chronological order for the agent. Threads the running byte total through
+    # the accumulator so budget check is O(1) per comment instead of O(n).
+    {kept_reversed, _total, dropped?} =
+      sorted
+      |> Enum.reverse()
+      |> Enum.map(&render_single_comment/1)
+      |> Enum.reduce({[], 0, false}, fn rendered, {acc, total, dropped?} ->
+        size = byte_size(rendered)
+
+        if total + size > @max_ticket_comments_bytes do
+          {acc, total, true}
+        else
+          {[rendered | acc], total + size, dropped?}
+        end
+      end)
+
+    body = Enum.join(kept_reversed, "\n")
+    trunc_note = if dropped?, do: "<!-- older comments omitted to fit size budget -->\n", else: ""
+
+    """
+    <ticket_comments>
+    #{trunc_note}#{body}
+    </ticket_comments>
+    """
+  end
+
+  defp render_single_comment(comment) do
+    author = sanitize_attr(get_in(comment, ["user", "name"]) || "unknown")
+    created_at = sanitize_attr(comment["createdAt"] || "unknown")
+    body = comment["body"] || ""
+
+    """
+    <comment author="#{author}" created_at="#{created_at}">
+    #{sanitize_body(body)}
+    </comment>
+    """
+  end
+
+  # Defense-in-depth: prevent a Linear comment body from closing the wrapper
+  # tag and injecting top-level instructions. Replace (not drop) so the agent
+  # can still see that something was there — avoids silent content loss.
+  defp sanitize_body(body) when is_binary(body) do
+    # Use String.length / String.slice (grapheme-based) consistently to avoid
+    # the byte_size vs grapheme mismatch — truncating by byte count while
+    # checking by graphemes (or vice versa) lets UTF-8 multi-byte bodies drift
+    # past their nominal cap. The total-size cap upstream is still in bytes,
+    # which bounds overall prompt size regardless of individual-body drift.
+    truncated =
+      if String.length(body) > @max_comment_body_chars do
+        String.slice(body, 0, @max_comment_body_chars) <> "\n…(comment body truncated)"
+      else
+        body
+      end
+
+    truncated
+    |> String.replace("</ticket_comments>", "</ticket_comments_filtered>")
+    |> String.replace("<ticket_comments>", "<ticket_comments_filtered>")
+    |> String.replace("</comment>", "</comment_filtered>")
+    |> String.replace("<comment ", "<comment_filtered ")
+  end
+
+  defp sanitize_body(_), do: ""
+
+  defp sanitize_attr(value) when is_binary(value) do
+    value
+    |> String.replace("\"", "'")
+    |> String.replace("\n", " ")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
+
+  defp sanitize_attr(_), do: "unknown"
+
+  # The Codex Workpad is Symphony's own artifact (task checklist / env stamp),
+  # not review context. Require BOTH markers so a legitimate supervisor comment
+  # that happens to use a `### Plan` sub-header (e.g., "### Plan to fix") is
+  # not silently dropped. `Linear.Adapter.fetch_workpad_text/1` uses an OR
+  # heuristic because it's searching for the workpad; here we're excluding it,
+  # so the stricter AND check is correct.
+  defp workpad_comment?(comment) do
+    body = comment["body"] || ""
+    String.contains?(body, "## Codex Workpad") and String.contains?(body, "### Plan")
   end
 
   defp unit_header(issue, unit) do
@@ -98,12 +217,49 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _, subtask_text: _}) do
+    """
+    ## Instructions — Merge Sync (Conflict Resolution)
+    The PR branch has merge conflicts with `main`. Resolve them and push a clean
+    merge so the programmatic squash-merge can proceed.
+
+    ### Steps
+    1. Ensure working tree is clean (`git status`). Stash or commit if needed.
+    2. `git config rerere.enabled true && git config rerere.autoupdate true`
+    3. `git fetch origin`
+    4. `git pull --ff-only origin $(git branch --show-current)` (sync remote branch changes)
+    5. `git -c merge.conflictstyle=zdiff3 merge origin/main`
+    6. If conflicts:
+       - `git status` to list conflicted files.
+       - Read both sides' intent before editing. Prefer minimal, intention-preserving edits.
+       - For generated files: resolve source files first, then regenerate.
+       - `git add <file>` after each resolution.
+    7. `git merge --continue`
+    8. `git diff --check` (verify no conflict markers remain)
+    9. Run the project's validation suite (follow AGENTS.md).
+    10. `git push origin $(git branch --show-current)`
+
+    ### Safety
+    - Do NOT force-push or rewrite history.
+    - Do NOT create a new PR or modify the PR description.
+    - Do NOT skip, disable, or delete tests.
+    - Do NOT use `--ours`/`--theirs` unless one side clearly wins entirely.
+
+    The orchestrator will re-verify and retry the programmatic merge after you push.
+    """
+  end
+
   defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}) do
     """
     ## Instructions — Rework Fix
-    This ticket was sent back for rework. Review findings are on the PR.
+    This ticket was sent back for rework. All Linear comments on this ticket
+    are in the `<ticket_comments>` block above, sorted chronologically with
+    author and timestamp. They include supervisor review findings and any
+    other context posted on the ticket.
 
-    1. Run `gh pr view --comments` to read all review findings.
+    1. Identify the supervisor's review findings in `<ticket_comments>`. Use
+       timestamps to focus on what's outstanding vs already-addressed in prior
+       commits. Later comments generally supersede earlier ones.
     2. Implement **all** fixes for MEDIUM and above severity findings.
     3. Commit your changes with a descriptive message referencing the findings.
 
