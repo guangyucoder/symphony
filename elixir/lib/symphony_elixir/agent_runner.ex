@@ -7,8 +7,6 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, Workspace}
 
-  @max_escalate_attempts 3
-
   @doc """
   Unit-lite mode: resolve the next unit, run a single fresh Codex session for it,
   then exit. The orchestrator will re-dispatch for the next unit.
@@ -62,7 +60,11 @@ defmodule SymphonyElixir.AgentRunner do
               "last_verified_sha" => nil,
               "verify_error" => nil,
               "verify_attempt" => 0,
-              "verify_fix_count" => 0
+              "verify_fix_count" => 0,
+              "merge_conflict" => false,
+              "merge_sync_count" => 0,
+              "mergeability_unknown_count" => 0,
+              "merge_needs_verify" => false
             })
           end
 
@@ -124,6 +126,21 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
+    # 1d. Idempotency short-circuit for externally-merged PRs.
+    # merge_sync_rule / merge_verify_rule run before merge_rule in
+    # rules(:merging), so an externally-merged PR with merge_conflict or
+    # merge_needs_verify still set would otherwise keep dispatching
+    # conflict-resolution work until the cycle caps exhaust. This check
+    # fires only when those flags are set — the plain merge_rule path
+    # already has its own idempotency via do_programmatic_merge.
+    if issue_state == "merging" and short_circuit_if_merged(workspace, issue, opts) do
+      :ok
+    else
+      dispatch_next_unit(workspace, issue, codex_update_recipient, opts)
+    end
+  end
+
+  defp dispatch_next_unit(workspace, issue, codex_update_recipient, opts) do
     # 2. Read workpad text — from opts or fetch from Linear
     workpad_text =
       case Keyword.get(opts, :workpad_text) do
@@ -154,7 +171,7 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:stop, :circuit_breaker} ->
         Logger.error("unit_lite: circuit breaker tripped for #{issue_context(issue)}")
-        escalate_to_human(workspace, issue, "Circuit breaker: unit crashed #{@max_escalate_attempts}+ times consecutively")
+        escalate_to_human(workspace, issue, "Circuit breaker: unit crashed #{Config.max_unit_attempts()}+ times consecutively")
 
       {:stop, :no_matching_rule} ->
         Logger.warning("unit_lite: no matching rule for #{issue_context(issue)} — possible infrastructure issue (git_head=nil?)")
@@ -167,6 +184,47 @@ defmodule SymphonyElixir.AgentRunner do
       :skip ->
         Logger.info("unit_lite: skip for #{issue_context(issue)}")
         :ok
+    end
+  end
+
+  # If the PR was merged externally (or by a prior run) while merge_conflict
+  # or merge_needs_verify is still set, short-circuit to Done. Returns true
+  # when we took that path; false means the caller should continue dispatch.
+  defp short_circuit_if_merged(workspace, issue, opts) do
+    case IssueExec.read(workspace) do
+      {:ok, exec} ->
+        has_flag? = exec["merge_conflict"] == true or exec["merge_needs_verify"] == true
+
+        if has_flag? do
+          pr_checker = Keyword.get(opts, :pr_checker, &Verifier.check_pr_merged/1)
+
+          case pr_checker.(workspace) do
+            :merged ->
+              Logger.info(
+                "unit_lite: PR already merged on Merging entry for #{issue_context(issue)} — moving to Done"
+              )
+
+              IssueExec.update(workspace, %{
+                "phase" => "done",
+                "merge_conflict" => false,
+                "merge_sync_count" => 0,
+                "mergeability_unknown_count" => 0,
+                "merge_needs_verify" => false
+              })
+
+              move_issue_to_done(issue)
+              Ledger.append(workspace, :merge_short_circuited, %{"reason" => "pr_already_merged"})
+              true
+
+            _ ->
+              false
+          end
+        else
+          false
+        end
+
+      _ ->
+        false
     end
   end
 
