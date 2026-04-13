@@ -96,21 +96,28 @@ defmodule SymphonyElixir.AgentRunner do
     # 1c. Clear stale non-merge current_unit when entering Merging state.
     # If a handoff/verify unit was in-flight when the issue was manually moved
     # to Merging, replaying it would be wrong (e.g., handoff could move the
-    # ticket back to Human Review). Only merge units should replay in Merging.
+    # ticket back to Human Review). Only merge units, in-flight merge-sync-*
+    # subtasks, and verify runs covering merge-sync commits should replay.
     if issue_state == "merging" do
       case IssueExec.read(workspace) do
-        {:ok, %{"current_unit" => %{"kind" => kind}}} when kind != "merge" and not is_nil(kind) ->
-          Logger.info("unit_lite: clearing stale #{kind} current_unit on Merging entry")
-          IssueExec.update(workspace, %{
-            "current_unit" => nil,
-            "verify_error" => nil,
-            "verify_attempt" => 0,
-            "verify_fix_count" => 0,
-            "merge_conflict" => false,
-            "merge_sync_count" => 0,
-            "mergeability_unknown_count" => 0,
-            "merge_needs_verify" => false
-          })
+        {:ok, exec_check} when is_map(exec_check) ->
+          current = exec_check["current_unit"]
+          merge_cycle? = merge_cycle_unit?(current, exec_check)
+
+          if is_map(current) and not is_nil(current["kind"]) and current["kind"] != "merge"
+              and not merge_cycle? do
+            Logger.info("unit_lite: clearing stale #{current["kind"]} current_unit on Merging entry")
+            IssueExec.update(workspace, %{
+              "current_unit" => nil,
+              "verify_error" => nil,
+              "verify_attempt" => 0,
+              "verify_fix_count" => 0,
+              "merge_conflict" => false,
+              "merge_sync_count" => 0,
+              "mergeability_unknown_count" => 0,
+              "merge_needs_verify" => false
+            })
+          end
 
         _ ->
           :ok
@@ -352,12 +359,14 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        # Actual merge failure — record for debugging
+        # Actual merge failure — record, then escalate so the ticket moves to
+        # Human Input Needed and the exec state resets. Otherwise the error
+        # surface is only a log line and the ticket stays in Merging forever.
         IssueExec.start_unit(workspace, unit_map)
         Ledger.unit_started(workspace, unit_map)
         Ledger.unit_failed(workspace, unit_map, reason)
         Logger.warning("unit_lite: programmatic merge failed for #{issue_context(issue)}: #{reason}")
-        :ok
+        escalate_to_human(workspace, issue, "Programmatic merge failed: #{reason}")
     end
   end
 
@@ -404,6 +413,9 @@ defmodule SymphonyElixir.AgentRunner do
             end
 
           :conflicting ->
+            # Reset unknown counter — a confirmed :conflicting answer means
+            # GitHub's mergeability computation completed.
+            IssueExec.update(workspace, %{"mergeability_unknown_count" => 0})
             handle_merge_conflict(workspace)
 
           :unknown ->
@@ -417,8 +429,9 @@ defmodule SymphonyElixir.AgentRunner do
         # CI test failure — dispatch verify-fix if within cycle cap
         {:ok, exec_state} = IssueExec.read(workspace)
         fix_count = exec_state["verify_fix_count"] || 0
+        max_fix_cycles = Config.max_verify_fix_cycles()
 
-        if fix_count < 2 do
+        if fix_count < max_fix_cycles do
           ci_output = ci_output_getter.(workspace)
           IssueExec.set_verify_error(workspace, ci_output)
           IssueExec.update(workspace, %{"current_unit" => nil, "verify_fix_count" => fix_count + 1})
@@ -658,11 +671,21 @@ defmodule SymphonyElixir.AgentRunner do
       "verify_fix_count" => 0,
       "merge_conflict" => false,
       "merge_sync_count" => 0,
-      "mergeability_unknown_count" => 0
+      "mergeability_unknown_count" => 0,
+      "merge_needs_verify" => false
     })
     Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
     :ok
   end
+
+  # A unit counts as a merge-cycle unit (shouldn't be wiped on Merging entry) if
+  # it's either a merge-sync-* subtask, or a verify triggered by merge_needs_verify.
+  defp merge_cycle_unit?(%{"kind" => "implement_subtask", "subtask_id" => subtask_id}, _exec)
+       when is_binary(subtask_id),
+       do: String.starts_with?(subtask_id, "merge-sync-")
+
+  defp merge_cycle_unit?(%{"kind" => "verify"}, %{"merge_needs_verify" => true}), do: true
+  defp merge_cycle_unit?(_unit, _exec), do: false
 
   defp issue_to_dispatch_map(%Issue{} = issue) do
     %{state: issue.state || "Unknown"}

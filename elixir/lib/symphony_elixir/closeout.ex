@@ -15,7 +15,7 @@ defmodule SymphonyElixir.Closeout do
 
   require Logger
 
-  alias SymphonyElixir.{IssueExec, Ledger, Linear.Adapter, Verifier}
+  alias SymphonyElixir.{Config, IssueExec, Ledger, Linear.Adapter, Verifier}
 
   @type result :: :accepted | {:retry, String.t()} | {:fail, String.t()}
 
@@ -74,10 +74,10 @@ defmodule SymphonyElixir.Closeout do
     :accepted
   end
 
-  @max_verify_attempts 3
-  @max_verify_fix_cycles 2
-
   defp do_closeout("verify", workspace, _unit, issue, opts) do
+    max_verify_attempts = Config.max_verify_attempts()
+    max_verify_fix_cycles = Config.max_verify_fix_cycles()
+
     # Use persistent attempt counter that survives verify-fix cycles.
     # The unit's "attempt" field tracks crash-replays; this tracks
     # verification runs across fix cycles.
@@ -105,7 +105,7 @@ defmodule SymphonyElixir.Closeout do
         })
         :accepted
 
-      {:fail, output} when attempt >= @max_verify_attempts ->
+      {:fail, output} when attempt >= max_verify_attempts ->
         # Escalate — exhausted all attempts including verify-fix cycles.
         Logger.warning("Closeout: verify exhausted #{attempt} attempts, failing")
         Ledger.append(workspace, :verify_exhausted, %{
@@ -126,11 +126,11 @@ defmodule SymphonyElixir.Closeout do
 
       {:fail, output} ->
         # Dispatch verify-fix if we haven't exhausted fix cycles.
-        # After @max_verify_fix_cycles, fall back to plain retry → exhaust.
+        # After max_verify_fix_cycles, fall back to plain retry → exhaust.
         {:ok, exec_state} = IssueExec.read(workspace)
         fix_count = exec_state["verify_fix_count"] || 0
 
-        if fix_count < @max_verify_fix_cycles do
+        if fix_count < max_verify_fix_cycles do
           truncated_error = truncate(output, 1500)
           IssueExec.set_verify_error(workspace, truncated_error)
           IssueExec.update(workspace, %{
@@ -175,7 +175,8 @@ defmodule SymphonyElixir.Closeout do
           "phase" => "done",
           "merge_conflict" => false,
           "merge_sync_count" => 0,
-          "mergeability_unknown_count" => 0
+          "mergeability_unknown_count" => 0,
+          "merge_needs_verify" => false
         })
         :accepted
 

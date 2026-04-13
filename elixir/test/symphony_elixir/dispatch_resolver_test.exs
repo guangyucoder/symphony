@@ -147,6 +147,59 @@ defmodule SymphonyElixir.DispatchResolverTest do
       }))
       assert {:dispatch, %Unit{kind: :merge}} = result
     end
+
+    test "dispatches merge-sync implement_subtask when merge_conflict is set" do
+      exec = Map.put(@default_exec, "merge_conflict", true)
+      result = DispatchResolver.resolve(ctx(%{
+        issue: %{state: "Merging"},
+        exec: exec
+      }))
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-1"}} = result
+    end
+
+    test "does not dispatch merge-sync when merge_conflict is false" do
+      # Baseline: plain merge dispatch, merge_sync_rule should not fire.
+      result = DispatchResolver.resolve(ctx(%{
+        issue: %{state: "Merging"},
+        exec: @default_exec
+      }))
+      refute match?({:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _}}, result)
+    end
+
+    test "dispatches verify when merge_needs_verify is set (post merge-sync)" do
+      exec = Map.put(@default_exec, "merge_needs_verify", true)
+      result = DispatchResolver.resolve(ctx(%{
+        issue: %{state: "Merging"},
+        exec: exec
+      }))
+      assert {:dispatch, %Unit{kind: :verify}} = result
+    end
+
+    test "merge_sync wins over merge_verify when both flags are set" do
+      # Defensive: if the state somehow has both flags (e.g., crash between
+      # writes), resolve the conflict first before re-verifying.
+      exec = @default_exec
+             |> Map.put("merge_conflict", true)
+             |> Map.put("merge_needs_verify", true)
+      result = DispatchResolver.resolve(ctx(%{
+        issue: %{state: "Merging"},
+        exec: exec
+      }))
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-1"}} = result
+    end
+
+    test "verify_fix wins over merge_sync when verify_error is set" do
+      # After merge-sync lands, if verify_error is still live from an earlier
+      # failure, fix the code first.
+      exec = @default_exec
+             |> Map.put("merge_conflict", true)
+             |> Map.put("verify_error", "boom")
+      result = DispatchResolver.resolve(ctx(%{
+        issue: %{state: "Merging"},
+        exec: exec
+      }))
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} = result
+    end
   end
 
   describe "rework flow" do

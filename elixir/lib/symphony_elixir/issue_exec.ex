@@ -35,6 +35,10 @@ defmodule SymphonyElixir.IssueExec do
     "verify_error" => nil,
     "verify_attempt" => 0,
     "verify_fix_count" => 0,
+    "merge_conflict" => false,
+    "merge_sync_count" => 0,
+    "mergeability_unknown_count" => 0,
+    "merge_needs_verify" => false,
     "updated_at" => nil
   }
 
@@ -159,7 +163,11 @@ defmodule SymphonyElixir.IssueExec do
       "doc_fix_required" => false,
       "verify_error" => nil,
       "verify_attempt" => 0,
-      "verify_fix_count" => 0
+      "verify_fix_count" => 0,
+      "merge_conflict" => false,
+      "merge_sync_count" => 0,
+      "mergeability_unknown_count" => 0,
+      "merge_needs_verify" => false
     })
   end
 

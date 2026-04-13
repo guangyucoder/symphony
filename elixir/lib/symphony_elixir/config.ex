@@ -28,6 +28,9 @@ defmodule SymphonyElixir.Config do
   @default_max_concurrent_agents 10
   @default_agent_max_turns 20
   @default_max_retry_backoff_ms 300_000
+  @default_max_unit_attempts 3
+  @default_max_verify_attempts 3
+  @default_max_verify_fix_cycles 2
   @default_codex_command "codex app-server"
   @default_codex_turn_timeout_ms 3_600_000
   @default_codex_read_timeout_ms 5_000
@@ -101,6 +104,10 @@ defmodule SymphonyElixir.Config do
                                  execution_mode: [
                                    type: {:in, ["legacy", "unit_lite"]},
                                    default: "legacy"
+                                 ],
+                                 max_unit_attempts: [
+                                   type: :pos_integer,
+                                   default: @default_max_unit_attempts
                                  ]
                                ]
                              ],
@@ -119,6 +126,14 @@ defmodule SymphonyElixir.Config do
                                  timeout_ms: [
                                    type: :pos_integer,
                                    default: 300_000
+                                 ],
+                                 max_verify_attempts: [
+                                   type: :pos_integer,
+                                   default: @default_max_verify_attempts
+                                 ],
+                                 max_verify_fix_cycles: [
+                                   type: :pos_integer,
+                                   default: @default_max_verify_fix_cycles
                                  ]
                                ]
                              ],
@@ -306,6 +321,23 @@ defmodule SymphonyElixir.Config do
   @spec verification_timeout_ms() :: pos_integer()
   def verification_timeout_ms do
     get_in(validated_workflow_options(), [:verification, :timeout_ms]) || 300_000
+  end
+
+  @spec max_unit_attempts() :: pos_integer()
+  def max_unit_attempts do
+    get_in(validated_workflow_options(), [:agent, :max_unit_attempts]) || @default_max_unit_attempts
+  end
+
+  @spec max_verify_attempts() :: pos_integer()
+  def max_verify_attempts do
+    get_in(validated_workflow_options(), [:verification, :max_verify_attempts]) ||
+      @default_max_verify_attempts
+  end
+
+  @spec max_verify_fix_cycles() :: pos_integer()
+  def max_verify_fix_cycles do
+    get_in(validated_workflow_options(), [:verification, :max_verify_fix_cycles]) ||
+      @default_max_verify_fix_cycles
   end
 
   @spec doc_impact_command() :: String.t() | nil
@@ -558,6 +590,7 @@ defmodule SymphonyElixir.Config do
       state_limits_value(Map.get(section, "max_concurrent_agents_by_state"))
     )
     |> put_if_present(:execution_mode, scalar_string_value(Map.get(section, "execution_mode")))
+    |> put_if_present(:max_unit_attempts, positive_integer_value(Map.get(section, "max_unit_attempts")))
   end
 
   defp extract_codex_options(section) do
@@ -596,6 +629,8 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:baseline_commands, csv_value(Map.get(section, "baseline_commands")))
     |> put_if_present(:full_commands, csv_value(Map.get(section, "full_commands")))
     |> put_if_present(:timeout_ms, positive_integer_value(Map.get(section, "timeout_ms")))
+    |> put_if_present(:max_verify_attempts, positive_integer_value(Map.get(section, "max_verify_attempts")))
+    |> put_if_present(:max_verify_fix_cycles, positive_integer_value(Map.get(section, "max_verify_fix_cycles")))
   end
 
   defp extract_docs_options(section) do

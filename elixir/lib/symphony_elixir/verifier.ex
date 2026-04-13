@@ -104,6 +104,44 @@ defmodule SymphonyElixir.Verifier do
   end
 
   @doc """
+  Check whether the PR for the current branch can be merged without conflicts.
+  Returns `:mergeable`, `:conflicting`, or `:unknown`.
+
+  GitHub computes mergeability asynchronously after a push; during that window
+  `gh pr view` can report `UNKNOWN` for 10–60s. Callers should treat `:unknown`
+  as transient and retry rather than escalate immediately.
+  """
+  @spec check_pr_mergeability(Path.t()) :: :mergeable | :conflicting | :unknown
+  def check_pr_mergeability(workspace) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd("gh", ["pr", "view", "--json", "mergeable", "--jq", ".mergeable"],
+            cd: workspace, stderr_to_stdout: true)
+        rescue
+          _ -> {"gh not available", 127}
+        end
+      end)
+
+    case Task.yield(task, @pr_check_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} ->
+        case String.trim(output) do
+          "MERGEABLE" -> :mergeable
+          "CONFLICTING" -> :conflicting
+          _ -> :unknown
+        end
+
+      {:ok, {output, _exit_code}} ->
+        Logger.warning("Verifier: gh pr view (mergeable) failed: #{String.slice(output, 0, 200)}")
+        :unknown
+
+      nil ->
+        Logger.warning("Verifier: gh pr view (mergeable) timed out")
+        :unknown
+    end
+  end
+
+  @doc """
   Check whether the PR for the current branch has been merged on the remote.
   Returns `:merged`, `{:not_merged, reason}`, or `:unknown`.
   """

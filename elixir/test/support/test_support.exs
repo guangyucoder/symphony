@@ -105,6 +105,7 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          max_unit_attempts: nil,
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -117,6 +118,8 @@ defmodule SymphonyElixir.TestSupport do
           verification_baseline_commands: nil,
           verification_full_commands: nil,
           verification_timeout_ms: nil,
+          verification_max_verify_attempts: nil,
+          verification_max_verify_fix_cycles: nil,
           doc_impact_command: nil,
           hook_after_create: nil,
           hook_before_run: nil,
@@ -146,6 +149,7 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    max_unit_attempts = Keyword.get(config, :max_unit_attempts)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -158,6 +162,8 @@ defmodule SymphonyElixir.TestSupport do
     verification_baseline_commands = Keyword.get(config, :verification_baseline_commands)
     verification_full_commands = Keyword.get(config, :verification_full_commands)
     verification_timeout_ms = Keyword.get(config, :verification_timeout_ms)
+    verification_max_verify_attempts = Keyword.get(config, :verification_max_verify_attempts)
+    verification_max_verify_fix_cycles = Keyword.get(config, :verification_max_verify_fix_cycles)
     doc_impact_command = Keyword.get(config, :doc_impact_command)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
@@ -191,8 +197,15 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        max_unit_attempts_yaml(max_unit_attempts),
         execution_mode_yaml(execution_mode),
-        verification_yaml(verification_baseline_commands, verification_full_commands, verification_timeout_ms),
+        verification_yaml(
+          verification_baseline_commands,
+          verification_full_commands,
+          verification_timeout_ms,
+          verification_max_verify_attempts,
+          verification_max_verify_fix_cycles
+        ),
         docs_yaml(doc_impact_command),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -276,13 +289,18 @@ defmodule SymphonyElixir.TestSupport do
   defp execution_mode_yaml(nil), do: nil
   defp execution_mode_yaml(mode), do: "  execution_mode: #{yaml_value(mode)}"
 
-  defp verification_yaml(nil, nil, nil), do: nil
+  defp max_unit_attempts_yaml(nil), do: nil
+  defp max_unit_attempts_yaml(value), do: "  max_unit_attempts: #{yaml_value(value)}"
 
-  defp verification_yaml(baseline, full, timeout) do
+  defp verification_yaml(nil, nil, nil, nil, nil), do: nil
+
+  defp verification_yaml(baseline, full, timeout, max_attempts, max_fix_cycles) do
     lines = ["verification:"]
     lines = if baseline, do: lines ++ ["  baseline_commands: #{yaml_value(baseline)}"], else: lines
     lines = if full, do: lines ++ ["  full_commands: #{yaml_value(full)}"], else: lines
     lines = if timeout, do: lines ++ ["  timeout_ms: #{yaml_value(timeout)}"], else: lines
+    lines = if max_attempts, do: lines ++ ["  max_verify_attempts: #{yaml_value(max_attempts)}"], else: lines
+    lines = if max_fix_cycles, do: lines ++ ["  max_verify_fix_cycles: #{yaml_value(max_fix_cycles)}"], else: lines
     Enum.join(lines, "\n")
   end
 

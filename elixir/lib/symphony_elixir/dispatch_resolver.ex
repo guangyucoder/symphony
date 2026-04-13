@@ -52,6 +52,8 @@ defmodule SymphonyElixir.DispatchResolver do
   defp rules(:merging), do: [
     &replay_current_unit_rule/1,
     &verify_fix_rule/1,
+    &merge_sync_rule/1,
+    &merge_verify_rule/1,
     &merge_rule/1,
     &merge_done_rule/1
   ]
@@ -86,14 +88,13 @@ defmodule SymphonyElixir.DispatchResolver do
   # --- Rule implementations ---
 
   # If current_unit exists and was not accepted, replay it (crash recovery).
-  # Circuit breaker: after @max_unit_attempts consecutive crashes, stop and
-  # escalate to human instead of burning tokens forever.
+  # Circuit breaker: after Config.max_unit_attempts() consecutive crashes, stop
+  # and escalate to human instead of burning tokens forever.
   @valid_unit_kinds ~w(bootstrap plan implement_subtask doc_fix verify handoff merge)
   @kind_atoms %{
     "bootstrap" => :bootstrap, "plan" => :plan, "implement_subtask" => :implement_subtask,
     "doc_fix" => :doc_fix, "verify" => :verify, "handoff" => :handoff, "merge" => :merge
   }
-  @max_unit_attempts 3
 
   defp replay_current_unit_rule(%{exec: %{"current_unit" => unit} = exec}) when not is_nil(unit) do
     kind_str = unit["kind"]
@@ -108,7 +109,7 @@ defmodule SymphonyElixir.DispatchResolver do
       kind_str == "verify" and is_binary(exec["verify_error"]) ->
         nil
 
-      attempt > @max_unit_attempts ->
+      attempt > SymphonyElixir.Config.max_unit_attempts() ->
         # Circuit breaker: too many consecutive crashes on this unit
         {:stop, :circuit_breaker}
 
@@ -134,6 +135,25 @@ defmodule SymphonyElixir.DispatchResolver do
   end
 
   defp replay_current_unit_rule(_), do: nil
+
+  # Merging flow: dispatch merge-sync when the PR has conflicts against main.
+  # agent_runner.handle_merge_conflict sets merge_conflict=true and clears
+  # current_unit when gh reports CONFLICTING mergeability; this rule then
+  # dispatches an implement_subtask so the agent resolves it in-workspace.
+  defp merge_sync_rule(%{exec: %{"merge_conflict" => true}}) do
+    {:dispatch, Unit.implement_subtask("merge-sync-1", "Resolve merge conflicts against origin/main, then push.")}
+  end
+
+  defp merge_sync_rule(_), do: nil
+
+  # After merge-sync closeout, merge_needs_verify=true signals that the merge
+  # commit should be re-verified (full test suite) before the orchestrator
+  # retries the programmatic merge.
+  defp merge_verify_rule(%{exec: %{"merge_needs_verify" => true}}) do
+    {:dispatch, Unit.verify()}
+  end
+
+  defp merge_verify_rule(_), do: nil
 
   # Merging flow: dispatch merge
   defp merge_rule(%{exec: exec}) do

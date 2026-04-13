@@ -805,6 +805,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.server_port() == nil
     assert Config.server_host() == "123"
 
+    # Tunable retry defaults fall through when unset.
+    assert Config.max_unit_attempts() == 3
+    assert Config.max_verify_attempts() == 3
+    assert Config.max_verify_fix_cycles() == 2
+
+    # Overrides round-trip through WORKFLOW.md.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_unit_attempts: 5,
+      verification_max_verify_attempts: 1,
+      verification_max_verify_fix_cycles: 1
+    )
+
+    assert Config.max_unit_attempts() == 5
+    assert Config.max_verify_attempts() == 1
+    assert Config.max_verify_fix_cycles() == 1
+
     write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: "")
 
     assert Config.codex_approval_policy() == %{
