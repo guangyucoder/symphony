@@ -44,7 +44,81 @@ defmodule SymphonyElixir.PromptBuilder do
     end
   end
 
+  # Specialized implement_subtask kinds that carry their own context:
+  #   - rework-*      : handled above; Linear comments are injected verbatim
+  #   - verify-fix-*  : error output is injected by `unit_instructions`
+  #   - merge-sync-*  : conflict state lives in the working tree
+  # No workpad injection for these — their prompts are already focused.
+  defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _}, _opts), do: nil
+  defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _}, _opts), do: nil
+
+  # Regular implement_subtask: inject the current Codex Workpad comment so the
+  # agent sees sibling subtasks' status, prior continuation notes, and the
+  # overall plan shape without having to make a Linear API call at turn start.
+  # This is the structured-note-taking pattern: one agent writes a continuation
+  # note under `### Notes`, the next reads it from the prompt.
+  defp unit_context(%Unit{kind: :implement_subtask}, opts) do
+    render_workpad_context(Keyword.get(opts, :workpad_text))
+  end
+
   defp unit_context(_unit, _opts), do: nil
+
+  # Cap in BYTES (not graphemes — CJK content would ~3× a grapheme cap and
+  # blow the prompt budget). Real-world workpads on this project sit at
+  # 2–5 KB; the cap is generous enough that it almost never fires, and
+  # when it does the agent still has the ticket description and its own
+  # subtask text, and can fall back to Linear for anything else.
+  @max_workpad_bytes 12_288
+
+  defp render_workpad_context(text) when is_binary(text) do
+    trimmed = String.trim(text)
+
+    if trimmed == "" do
+      nil
+    else
+      rendered =
+        if byte_size(trimmed) > @max_workpad_bytes do
+          head = take_head_bytes(trimmed, @max_workpad_bytes)
+          "#{head}\n…(workpad truncated to fit prompt budget — fetch the full `## Codex Workpad` comment from Linear if you need content past this point)"
+        else
+          trimmed
+        end
+
+      """
+      <workpad>
+      #{sanitize_workpad_body(rendered)}
+      </workpad>
+      """
+    end
+  end
+
+  defp render_workpad_context(_), do: nil
+
+  # Cut a binary prefix at byte_cap and strip any trailing partial UTF-8
+  # code point so the result is always a valid string. O(byte_cap) upper
+  # bound on the trim walk; in practice at most a 3-byte continuation run.
+  defp take_head_bytes(text, byte_cap) when byte_size(text) <= byte_cap, do: text
+  defp take_head_bytes(text, byte_cap) do
+    text |> binary_part(0, byte_cap) |> trim_invalid_utf8_tail()
+  end
+
+  defp trim_invalid_utf8_tail(<<>>), do: <<>>
+  defp trim_invalid_utf8_tail(bin) do
+    if String.valid?(bin) do
+      bin
+    else
+      trim_invalid_utf8_tail(binary_part(bin, 0, byte_size(bin) - 1))
+    end
+  end
+
+  # The workpad is Symphony's own artifact, but humans and agents edit it over
+  # time and it may contain user-pasted content in Notes. Defense-in-depth:
+  # neutralize any literal `</workpad>` so the block can't be closed early.
+  defp sanitize_workpad_body(body) do
+    body
+    |> String.replace("</workpad>", "</workpad_filtered>")
+    |> String.replace("<workpad>", "<workpad_filtered>")
+  end
 
   # Size budgets: keep the ticket_comments block bounded so it doesn't blow the
   # project's <2000-char unit-prompt convention on long-running tickets. On
@@ -144,10 +218,29 @@ defmodule SymphonyElixir.PromptBuilder do
     String.contains?(body, "## Codex Workpad") and String.contains?(body, "### Plan")
   end
 
+  # Description caps are per-unit-kind. Only plan and implement_subtask
+  # materially benefit from the full ticket spec (Goal/Why/Scope/Constraints/
+  # Done When/Proof Required). Procedural units (bootstrap, doc_fix, verify,
+  # handoff, merge) are orchestrator-driven and mostly need identifier +
+  # title — giving them the full spec regresses the unit-lite narrow-prompt
+  # contract and multiplies token burn across every dispatch. Caps are in
+  # BYTES so CJK content can't silently inflate past the budget.
+  @max_description_bytes_full 15_000
+  @max_description_bytes_procedural 1_024
+
   defp unit_header(issue, unit) do
     raw_desc = Map.get(issue, :description) || Map.get(issue, "description")
+    cap = description_cap_for(unit)
+
     desc = if is_binary(raw_desc) && String.trim(raw_desc) != "" do
-      "\n\nDescription:\n#{String.slice(raw_desc, 0, 3000)}"
+      truncated =
+        if byte_size(raw_desc) > cap do
+          take_head_bytes(raw_desc, cap) <> "\n…(description truncated to fit prompt budget)"
+        else
+          raw_desc
+        end
+
+      "\n\nDescription:\n#{truncated}"
     else
       ""
     end
@@ -159,6 +252,10 @@ defmodule SymphonyElixir.PromptBuilder do
     #{desc}
     """
   end
+
+  defp description_cap_for(%Unit{kind: :plan}), do: @max_description_bytes_full
+  defp description_cap_for(%Unit{kind: :implement_subtask}), do: @max_description_bytes_full
+  defp description_cap_for(_unit), do: @max_description_bytes_procedural
 
   # Bootstrap: goal-oriented, no step-by-step needed for low-effort unit
   defp unit_instructions(%Unit{kind: :bootstrap}) do
@@ -178,14 +275,31 @@ defmodule SymphonyElixir.PromptBuilder do
     ## Instructions — Plan
     1. Read the full issue description and any existing comments/PR feedback.
     2. Search the codebase for existing related code.
-    3. Write a checklist in the workpad under `### Plan` with explicit IDs:
+    3. Write a checklist in the workpad under `### Plan`. Each subtask MUST use
+       the structured three-line form so the implementer knows exactly what to
+       touch and how success is judged:
        ```
        ### Plan
-       - [ ] [plan-1] First subtask
-       - [ ] [plan-2] Second subtask
+       - [ ] [plan-1] <short imperative title>
+         - touch: <files/paths this subtask will edit, comma-separated>
+         - accept: <how to verify — test command, visible behavior, or artifact>
+       - [ ] [plan-2] <short imperative title>
+         - touch: ...
+         - accept: ...
        ```
-    4. Each item must be small enough to implement in one session.
-    5. Self-check: verify each item is independently implementable and testable.
+    4. Also scaffold a `### Notes` section — downstream subtasks append their
+       continuation summaries here, and subsequent subtasks read them as context:
+       ```
+       ### Notes
+       - branch: feature/<issue-id>-<slug>
+       - key decision: <top-level rationale the whole plan hangs on>
+       ```
+       Leave a blank line under Notes; do NOT pre-fill `#### [plan-N] continuation`
+       entries — each implementer writes their own.
+    5. Each item must be small enough to implement in one session.
+    6. Self-check: verify each item is independently implementable and testable,
+       and that `touch` + `accept` together are specific enough that a fresh
+       agent reading only that entry could act.
 
     Do NOT implement — a separate session handles each subtask. Your job is only the plan.
     """
@@ -273,11 +387,32 @@ defmodule SymphonyElixir.PromptBuilder do
     ## Instructions — Implement Subtask
     You are implementing **one subtask only**: `#{id}`#{if text, do: " — #{text}", else: ""}
 
-    1. Implement this subtask only.
-    2. Commit your changes with a descriptive message.
-    3. **CRITICAL: Update the Linear workpad checklist** — change `- [ ] [#{id}]` to `- [x] [#{id}]` in the `## Codex Workpad` comment. If you do not mark it done, this subtask will be re-dispatched.
+    The current Codex Workpad (if any) is in the `<workpad>` block above. Before
+    starting, read it:
+    - Look at the `[#{id}]` entry under `### Plan`. If the plan author added
+      `touch:` and `accept:` sub-lines, scope your work to those paths and aim
+      at that accept criterion; otherwise follow the subtask title above.
+    - Read any prior continuation notes under `### Notes` (entries named
+      `#### [plan-N] continuation`) so you know what earlier subtasks changed
+      and which gotchas they flagged. Do not re-do exploration that a prior
+      continuation note already answered.
 
-    Do NOT touch other subtasks or do handoff — the orchestrator dispatches one subtask at a time to prevent drift.
+    1. Implement this subtask only, scoped to the `touch` paths when present
+       and aimed at satisfying the `accept` criterion (or the subtask title
+       when the plan entry is flat).
+    2. Commit your changes with a descriptive message that references `#{id}`.
+    3. **Append a continuation note** under `### Notes` in the workpad, as a
+       new sub-block named `#### [#{id}] continuation`, keeping it under ~200
+       tokens:
+       - `files touched:` comma-separated paths actually edited this session
+       - `key decision:` one sentence on what you chose and why
+       - `watch out:` anything the next subtask needs to know, or `none`
+       Do not rewrite or delete prior continuation notes — append only.
+    4. **CRITICAL: Update the Linear workpad checklist** — change `- [ ] [#{id}]` to `- [x] [#{id}]` in the `## Codex Workpad` comment. If you do not mark it done, this subtask will be re-dispatched.
+
+    Do NOT touch other subtasks. Do NOT run the terminal `handoff` unit's
+    work (creating a PR, posting `## Results`, transitioning to Human Review)
+    — the orchestrator dispatches one unit at a time to prevent drift.
     """
   end
 

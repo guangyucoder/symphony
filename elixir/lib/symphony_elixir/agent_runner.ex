@@ -148,6 +148,15 @@ defmodule SymphonyElixir.AgentRunner do
         _ -> fetch_workpad_from_linear(issue)
       end
 
+    # Forward workpad_text into opts so PromptBuilder's implement_subtask
+    # context injection sees the same value we resolved here. Without this,
+    # PromptBuilder would only see workpad_text when the caller already put
+    # it in opts — and the local fetch above would be wasted. Closeout's
+    # Keyword.take forwards this through too, so any future closeout check
+    # that wants the workpad text can read it without refetching; currently
+    # Closeout does not read it.
+    opts = Keyword.put(opts, :workpad_text, workpad_text)
+
     # 3. Get git HEAD
     git_head = current_git_head(workspace)
 
