@@ -38,18 +38,23 @@ defmodule SymphonyElixir.CloseoutTest do
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["bootstrapped"] == true
+      assert exec["baseline_verify_failed"] == false
+      assert exec["baseline_verify_output"] == nil
       assert ledger_events(ws) |> Enum.member?("baseline_verified")
     end
 
-    test "retries when baseline verification fails and leaves bootstrap pending", %{workspace: ws} do
+    test "accepts bootstrap even when baseline fails, but records the failure for downstream units",
+         %{workspace: ws} do
       write_workflow_file!(Workflow.workflow_file_path(), verification_baseline_commands: ["false"])
 
-      assert {:retry, "bootstrap baseline verification failed"} =
-               Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
+      assert :accepted = Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["bootstrapped"] == false
+      assert exec["baseline_verify_failed"] == true
+      assert is_binary(exec["baseline_verify_output"])
       assert ledger_events(ws) |> Enum.member?("baseline_verify_failed")
+      assert ledger_events(ws) |> Enum.member?("baseline_accepted_despite_failure")
     end
   end
 

@@ -4,7 +4,9 @@ defmodule SymphonyElixir.Closeout do
   exits normally. Determines whether the unit is accepted or needs retry.
 
   Closeout behavior per unit kind:
-  - `bootstrap`: check workspace ready, run baseline verify, mark bootstrapped on pass
+  - `bootstrap`: check workspace ready, run baseline verify, mark bootstrapped on pass;
+    on baseline failure, still accept but record baseline_verify_failed flag + output
+    for downstream visibility
   - `plan`: check workpad has parseable checklist, bump plan_version
   - `implement_subtask`: check subtask marked done, doc-impact check
   - `doc_fix`: clear doc_fix_required flag
@@ -34,14 +36,18 @@ defmodule SymphonyElixir.Closeout do
     # Run baseline verification if commands are configured
     case Verifier.run_baseline(workspace) do
       :pass ->
+        IssueExec.clear_baseline_verify_failure(workspace)
         IssueExec.mark_bootstrapped(workspace)
         Ledger.append(workspace, :baseline_verified, %{})
         :accepted
 
       {:fail, output} ->
+        truncated_output = truncate(output, 2048)
         Logger.warning("Closeout: baseline verification failed")
-        Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncate(output, 2048)})
-        {:retry, "bootstrap baseline verification failed"}
+        IssueExec.set_baseline_verify_failure(workspace, truncated_output)
+        Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncated_output})
+        Ledger.append(workspace, :baseline_accepted_despite_failure, %{"output" => truncated_output})
+        :accepted
     end
   end
 
