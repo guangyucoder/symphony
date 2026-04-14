@@ -75,6 +75,19 @@ defmodule SymphonyElixir.Workspace do
   ALL uncommitted changes are destroyed on every dispatch; this is observable via
   the `:workspace_wip_discarded` ledger event. Agents must commit before yielding.
 
+  Before the reset destroys them, discarded changes are archived under
+  `.symphony/discarded_wip/<iso-timestamp>*`:
+
+  - `<ts>.patch` — `git diff --binary HEAD` output (tracked-file edits).
+    Recover with `git apply <path>` from the workspace root.
+  - `<ts>.untracked.txt` — porcelain listing of untracked entries (for audit).
+  - `<ts>.untracked/` — mirrored tree of brand-new untracked regular files
+    that `git diff` cannot represent. Recover with `cp -r <path>/* <workspace>/`.
+    Absent when there were no untracked regular files.
+
+  The archive survives the reset because `.symphony/` is excluded from
+  `git clean -fd`.
+
   KNOWN LIMITATION: `.env.sh` is preserved for local bootstrap compatibility and
   is NOT refreshed per dispatch.
   """
@@ -515,16 +528,30 @@ defmodule SymphonyElixir.Workspace do
     dir = Path.join([workspace, ".symphony", "discarded_wip"])
     patch_rel = Path.join([".symphony", "discarded_wip", "#{timestamp}.patch"])
     untracked_rel = Path.join([".symphony", "discarded_wip", "#{timestamp}.untracked.txt"])
+    untracked_content_rel = Path.join([".symphony", "discarded_wip", "#{timestamp}.untracked"])
     patch_abs = Path.join(workspace, patch_rel)
     untracked_abs = Path.join(workspace, untracked_rel)
+    untracked_content_abs = Path.join(workspace, untracked_content_rel)
 
-    with :ok <- File.mkdir_p(dir),
-         {:ok, diff_output} <- run_git_command(workspace, ["diff", "--binary", "HEAD"]),
+    # Capture git state BEFORE creating any stash directories so the
+    # porcelain output doesn't accidentally include the artifacts we're
+    # about to write. File.mkdir_p comes after the capture for the same
+    # reason.
+    with {:ok, diff_output} <- run_git_command(workspace, ["diff", "--binary", "HEAD"]),
          {:ok, porcelain_output} <-
            run_git_command(workspace, ["status", "--porcelain=v1", "--untracked-files=all"]),
+         :ok <- File.mkdir_p(dir),
          :ok <- File.write(patch_abs, diff_output),
-         :ok <- File.write(untracked_abs, porcelain_output) do
-      %{"patch_path" => patch_rel, "untracked_list_path" => untracked_rel}
+         :ok <- File.write(untracked_abs, porcelain_output),
+         {:ok, untracked_saved} <-
+           copy_untracked_contents(workspace, porcelain_output, untracked_content_abs) do
+      paths = %{"patch_path" => patch_rel, "untracked_list_path" => untracked_rel}
+
+      if untracked_saved > 0 do
+        Map.put(paths, "untracked_content_path", untracked_content_rel)
+      else
+        paths
+      end
     else
       error ->
         Logger.warning("Workspace prepare could not stash discarded WIP #{issue_log_context(issue_context)} workspace=#{workspace} error=#{inspect(error)}")
@@ -534,6 +561,67 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp stash_discarded_wip(_workspace, _discarded, _issue_context), do: %{}
+
+  # Mirror untracked files' contents into `.symphony/discarded_wip/<ts>.untracked/`
+  # so a brand-new file (never `git add`'d, hence absent from `git diff`) isn't
+  # permanently lost when `git clean -fd` runs in the next reset step.
+  # Returns {:ok, count_copied}. On any per-file error, skip that file and
+  # keep going — partial recovery is better than none.
+  defp copy_untracked_contents(workspace, porcelain_output, dest_root) do
+    untracked_rel_paths =
+      porcelain_output
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.starts_with?(&1, "?? "))
+      |> Enum.map(&String.slice(&1, 3..-1//1))
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    case untracked_rel_paths do
+      [] ->
+        {:ok, 0}
+
+      _ ->
+        with :ok <- File.mkdir_p(dest_root) do
+          saved =
+            Enum.reduce(untracked_rel_paths, 0, fn rel, acc ->
+              if safe_relative_path?(rel) do
+                src = Path.join(workspace, rel)
+                dest = Path.join(dest_root, rel)
+
+                case File.stat(src) do
+                  {:ok, %File.Stat{type: :regular}} ->
+                    case File.mkdir_p(Path.dirname(dest)) do
+                      :ok ->
+                        case File.cp(src, dest) do
+                          :ok -> acc + 1
+                          _ -> acc
+                        end
+
+                      _ ->
+                        acc
+                    end
+
+                  _ ->
+                    acc
+                end
+              else
+                acc
+              end
+            end)
+
+          {:ok, saved}
+        end
+    end
+  end
+
+  # Untracked paths come from `git status --porcelain` — they should never
+  # contain `..` or absolute paths, but defend against filesystem escape.
+  defp safe_relative_path?(path) when is_binary(path) do
+    segments = Path.split(path)
+    not (String.starts_with?(path, "/") or Enum.any?(segments, &(&1 == "..")))
+  end
+
+  defp safe_relative_path?(_), do: false
 
   defp porcelain_path(line) when is_binary(line) and byte_size(line) > 3 do
     line

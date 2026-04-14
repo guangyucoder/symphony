@@ -101,15 +101,33 @@ defmodule SymphonyElixir.Closeout do
   end
 
   defp do_closeout("doc_fix", workspace, _unit, _issue, opts) do
+    # doc_fix differs from other mutation-bearing units: DispatchResolver
+    # dispatches it unconditionally before verify, and the prompt asks the
+    # agent to "update any docs that no longer match" — an empty outcome
+    # is legitimate when docs are already accurate. A strict HEAD-advance
+    # guard would retry every no-op until the circuit breaker fires, which
+    # is the same failure mode the bootstrap soft-accept fix eliminated.
+    #
+    # Instead: differentiate "forgot to commit" (dirty tree, HEAD unchanged
+    # → data-loss risk, retry) from "nothing to do" (clean tree, HEAD
+    # unchanged → acceptable no-op).
     case commit_advancement_state(workspace, opts) do
       :advanced ->
         IssueExec.clear_doc_fix_required(workspace)
         :accepted
 
       :unchanged ->
-        Logger.warning("Closeout: doc_fix produced no commit (HEAD unchanged since dispatch) — doc edits may be sitting as uncommitted WIP")
+        case Verifier.dirty_working_tree?(workspace) do
+          true ->
+            Logger.warning("Closeout: doc_fix HEAD unchanged but tree is dirty — edits likely uncommitted WIP")
 
-        {:retry, "doc_fix: produced no commit (edits likely uncommitted WIP)"}
+            {:retry, "doc_fix: produced no commit but tree is dirty (edits likely uncommitted WIP)"}
+
+          false ->
+            Logger.info("Closeout: doc_fix accepted as no-op (clean tree, no doc updates needed)")
+            IssueExec.clear_doc_fix_required(workspace)
+            :accepted
+        end
 
       :cannot_verify ->
         Logger.warning("Closeout: doc_fix cannot verify HEAD state (git lookup returned nil)")

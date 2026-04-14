@@ -368,6 +368,59 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end
   end
 
+  test "legacy run/3: before_run failure short-circuits dispatch and does NOT fire after_run" do
+    # Parallel regression guard for unit-lite's with_dispatch_hooks short-
+    # circuit, applied to the legacy run/3 entry point. Per SPEC.md §16.5,
+    # before_run failure is fatal and after_run must only fire when the
+    # dispatch actually started. PR #5 fixed the unit-lite path; this test
+    # pins the same contract for legacy.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-legacy-before-run-fail-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      after_run_counter = Path.join(test_root, "after_run.count")
+
+      init_git_repo!(template_repo, %{"tracked.txt" => "tracked\n"})
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        # execution_mode omitted → legacy run/3 path
+        hook_after_create: "git clone #{template_repo} .",
+        hook_before_run: "exit 1",
+        hook_after_run: "echo call >> \"#{after_run_counter}\""
+      )
+
+      issue = %Issue{
+        id: "issue-legacy-before-run-fail",
+        identifier: "MT-legacy-before-run-fail",
+        title: "Legacy hook failure short-circuit",
+        description: "before_run exits non-zero; after_run must NOT fire in legacy mode either.",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-legacy-before-run-fail",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/before_run hook failed/, fn ->
+        AgentRunner.run(issue, nil,
+          max_turns: 1,
+          issue_state_fetcher: fn [_issue_id] ->
+            {:ok, [%Issue{issue | state: "Done"}]}
+          end
+        )
+      end
+
+      refute File.exists?(after_run_counter),
+             "legacy run/3 fired after_run despite before_run failure — must match unit-lite semantics"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "legacy run does not prepare an existing workspace before before_run" do
     test_root =
       Path.join(
@@ -584,5 +637,105 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       refute Keyword.has_key?(opts, :current_subtask)
     end
+  end
+
+  # ---------- build_unit_prompt_for_dispatch — end-to-end seam ----------
+  #
+  # The helper-only tests above would pass even if the CALL to
+  # `maybe_attach_current_subtask_contract` were deleted from
+  # `execute_unit`. These seam tests pin the whole enrichment→render
+  # chain so a future merge conflict that drops an enrichment step
+  # breaks the test.
+
+  describe "build_unit_prompt_for_dispatch/4 (full pipeline seam)" do
+    @seam_workpad """
+    ## Codex Workpad
+
+    ### Plan
+    - [ ] [plan-1] Wire the border detector
+      - touch: apps/web/lib/border.ts
+      - accept: pnpm --dir apps/web test:unit -- border
+    """
+
+    test "plan-N unit produces prompt with contract block (regression guard for --ours wiring loss)" do
+      workspace = seam_workspace!()
+      on_exit(fn -> File.rm_rf(Path.dirname(workspace)) end)
+
+      unit = %SymphonyElixir.Unit{
+        kind: :implement_subtask,
+        subtask_id: "plan-1",
+        subtask_text: "Wire the border detector",
+        display_name: "implement plan-1"
+      }
+
+      issue = %SymphonyElixir.Linear.Issue{identifier: "ENT-1", title: "wire border"}
+
+      {prompt, enriched_opts} =
+        SymphonyElixir.AgentRunner.build_unit_prompt_for_dispatch(
+          workspace,
+          issue,
+          unit,
+          workpad_text: @seam_workpad
+        )
+
+      # The whole point: prompt must carry the contract. If someone deletes
+      # the maybe_attach_current_subtask_contract step from the seam, this
+      # fails.
+      assert prompt =~ "<subtask_contract>"
+      assert prompt =~ "touch: apps/web/lib/border.ts"
+      assert prompt =~ "accept: pnpm --dir apps/web test:unit -- border"
+
+      # Seam must return enriched opts so downstream Closeout sees
+      # :current_subtask (and :dispatch_head when applicable).
+      assert Keyword.has_key?(enriched_opts, :current_subtask)
+    end
+
+    test "rework-* unit does NOT get contract block, even with a matching workpad" do
+      workspace = seam_workspace!()
+      on_exit(fn -> File.rm_rf(Path.dirname(workspace)) end)
+
+      # Workpad includes an entry that would match "rework-1" if the skip
+      # were bypassed. If regular_implement_subtask_id? ever inverts, this
+      # test fails.
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [ ] [rework-1] Bogus rework plan entry
+        - touch: should/not/leak.ts
+        - accept: should not appear in prompt
+      """
+
+      unit = %SymphonyElixir.Unit{
+        kind: :implement_subtask,
+        subtask_id: "rework-1",
+        subtask_text: "rework sample",
+        display_name: "rework-1"
+      }
+
+      issue = %SymphonyElixir.Linear.Issue{identifier: "ENT-2", title: "rework"}
+
+      {prompt, _opts} =
+        SymphonyElixir.AgentRunner.build_unit_prompt_for_dispatch(
+          workspace,
+          issue,
+          unit,
+          workpad_text: workpad
+        )
+
+      refute prompt =~ "<subtask_contract>"
+      refute prompt =~ "should/not/leak.ts"
+    end
+  end
+
+  defp seam_workspace! do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-seam-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(Path.join(root, "workspace"))
+    Path.join(root, "workspace")
   end
 end
