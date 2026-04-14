@@ -999,6 +999,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       # Untracked list mentions the scratch file.
       untracked_contents = File.read!(untracked_abs)
       assert untracked_contents =~ "scratch.txt"
+
+      # Regression guard for Codex P2: untracked file CONTENT (not just path)
+      # must survive the reset. `git diff --binary HEAD` does not capture
+      # brand-new files that were never `git add`'d — only path lists do.
+      # The stash must mirror file contents under <ts>.untracked/ so
+      # `cp -r` recovery works.
+      untracked_content_rel = discarded_event["payload"]["untracked_content_path"]
+
+      assert is_binary(untracked_content_rel),
+             "discarded WIP ledger must carry untracked_content_path for new-file recovery"
+
+      untracked_content_abs = Path.join(workspace, untracked_content_rel)
+      scratch_stashed = Path.join(untracked_content_abs, "scratch.txt")
+
+      assert File.exists?(scratch_stashed),
+             "untracked file content not mirrored at #{scratch_stashed}"
+
+      assert File.read!(scratch_stashed) == "dirty scratch\n",
+             "untracked file content mismatch — brand-new file would be lost on next `git clean -fd`"
     after
       File.rm_rf(test_root)
     end

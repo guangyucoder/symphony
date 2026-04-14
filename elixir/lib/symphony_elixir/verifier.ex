@@ -55,6 +55,20 @@ defmodule SymphonyElixir.Verifier do
     end
   end
 
+  @doc """
+  Return true if the working tree has any uncommitted changes or untracked
+  files. Used by closeout to distinguish legitimate no-op units from
+  "agent forgot to commit". On git failure, returns true (fail-closed —
+  treat as dirty so the dispatch retries rather than accepts).
+  """
+  @spec dirty_working_tree?(Path.t()) :: boolean()
+  def dirty_working_tree?(workspace) do
+    case run_git(workspace, ["status", "--porcelain=v1", "--untracked-files=all"], 5_000) do
+      {:ok, out} -> String.trim(out) != ""
+      _ -> true
+    end
+  end
+
   @doc "Return `git diff HEAD --stat` output, or nil on failure. Diagnostic only."
   @spec git_diff_stat(Path.t()) :: String.t() | nil
   def git_diff_stat(workspace) do
@@ -77,8 +91,7 @@ defmodule SymphonyElixir.Verifier do
       Task.async(fn ->
         try do
           jq = "[.[] | .state] | if length == 0 then \"none\" elif all(. == \"SUCCESS\" or . == \"SKIPPED\") then \"pass\" elif any(. == \"FAILURE\") then \"fail\" else \"pending\" end"
-          System.cmd("gh", ["pr", "checks", "--json", "state", "--jq", jq],
-            cd: workspace, stderr_to_stdout: true)
+          System.cmd("gh", ["pr", "checks", "--json", "state", "--jq", jq], cd: workspace, stderr_to_stdout: true)
         rescue
           _ -> {"gh not available", 127}
         end
@@ -94,8 +107,11 @@ defmodule SymphonyElixir.Verifier do
           other -> {:fail, "CI status: #{other}"}
         end
 
-      {:ok, {_output, _}} -> :unknown
-      nil -> :unknown
+      {:ok, {_output, _}} ->
+        :unknown
+
+      nil ->
+        :unknown
     end
   end
 
@@ -107,8 +123,7 @@ defmodule SymphonyElixir.Verifier do
     task =
       Task.async(fn ->
         try do
-          System.cmd("gh", ["pr", "merge", "--squash", "--delete-branch"],
-            cd: workspace, stderr_to_stdout: true)
+          System.cmd("gh", ["pr", "merge", "--squash", "--delete-branch"], cd: workspace, stderr_to_stdout: true)
         rescue
           _ -> {"gh not available", 127}
         end
@@ -134,8 +149,7 @@ defmodule SymphonyElixir.Verifier do
     task =
       Task.async(fn ->
         try do
-          System.cmd("gh", ["pr", "view", "--json", "mergeable", "--jq", ".mergeable"],
-            cd: workspace, stderr_to_stdout: true)
+          System.cmd("gh", ["pr", "view", "--json", "mergeable", "--jq", ".mergeable"], cd: workspace, stderr_to_stdout: true)
         rescue
           _ -> {"gh not available", 127}
         end
@@ -168,8 +182,7 @@ defmodule SymphonyElixir.Verifier do
     task =
       Task.async(fn ->
         try do
-          System.cmd("gh", ["pr", "view", "--json", "state", "--jq", ".state"],
-            cd: workspace, stderr_to_stdout: true)
+          System.cmd("gh", ["pr", "view", "--json", "state", "--jq", ".state"], cd: workspace, stderr_to_stdout: true)
         rescue
           _ -> {"gh not available", 127}
         end
@@ -231,9 +244,10 @@ defmodule SymphonyElixir.Verifier do
   end
 
   defp run_git(workspace, args, timeout_ms) do
-    task = Task.async(fn ->
-      System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
-    end)
+    task =
+      Task.async(fn ->
+        System.cmd("git", args, cd: workspace, stderr_to_stdout: true)
+      end)
 
     case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, 0}} -> {:ok, output}

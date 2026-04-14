@@ -236,11 +236,13 @@ defmodule SymphonyElixir.AgentRunner do
     # zero-commit guard). For rework-* additionally fetch all Linear comments
     # (for prompt injection). Orchestrator-owned ingestion — do not rely on
     # the agent to fetch review context or self-report commit state.
-    opts = enrich_opts_for_commit_guarded_subtask(workspace, issue, unit, opts)
-    opts = maybe_attach_current_subtask_contract(unit, opts)
-
-    # Build prompt
-    prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
+    # Route through the public seam so tests can pin the full opts→prompt
+    # pipeline. If a future merge accidentally drops one of the enrichment
+    # steps (as happened with PR #4's --ours resolution that silently deleted
+    # the contract-attach step), the seam test fails. The seam also returns
+    # the enriched opts so downstream closeout still sees :dispatch_head and
+    # friends.
+    {prompt, opts} = build_unit_prompt_for_dispatch(workspace, issue, unit, opts)
 
     # Per-unit debug log
     {:ok, unit_log_path} = UnitLog.open(workspace, unit)
@@ -969,19 +971,32 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue_with_status(issue) do
       {:ok, workspace, _created?} ->
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue),
-               :ok <- run_codex_turns(workspace, issue, codex_update_recipient, opts) do
-            :ok
-          else
-            {:error, reason} ->
-              Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+        # Match the unit-lite hook contract (see with_dispatch_hooks/3): fire
+        # after_run only when before_run succeeded. Per SPEC.md §16.5,
+        # before_run failure is fatal — a cleanup hook that runs for an
+        # attempt that never started would be lying about dispatch state.
+        case Workspace.run_before_run_hook(workspace, issue) do
+          :ok ->
+            try do
+              case run_codex_turns(workspace, issue, codex_update_recipient, opts) do
+                :ok ->
+                  :ok
 
-              raise RuntimeError,
-                    "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue)
+                {:error, reason} ->
+                  Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+
+                  raise RuntimeError,
+                        "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+              end
+            after
+              Workspace.run_after_run_hook(workspace, issue)
+            end
+
+          {:error, reason} ->
+            Logger.error("Agent run before_run hook failed for #{issue_context(issue)}: #{inspect(reason)}")
+
+            raise RuntimeError,
+                  "Agent run before_run hook failed for #{issue_context(issue)}: #{inspect(reason)}"
         end
 
       {:error, reason} ->
@@ -1317,6 +1332,26 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp enrich_opts_for_commit_guarded_subtask(_workspace, _issue, _unit, opts), do: opts
+
+  # Public seam for the full opts→prompt pipeline used by execute_unit.
+  # Runs enrichment (dispatch_head / rework comments / subtask contract)
+  # and renders the prompt. Returns {prompt, enriched_opts} so execute_unit
+  # can pass the enriched opts through to Closeout.
+  #
+  # Tests assert this function produces a prompt containing <subtask_contract>
+  # for a plan-N unit. If a future merge silently drops an enrichment step
+  # inside this function, the test fails — which is the regression the
+  # old per-helper test could NOT catch (helper tested in isolation, not
+  # through the chain).
+  @doc false
+  @spec build_unit_prompt_for_dispatch(Path.t(), map(), Unit.t(), keyword()) ::
+          {String.t(), keyword()}
+  def build_unit_prompt_for_dispatch(workspace, issue, %Unit{} = unit, opts) do
+    opts = enrich_opts_for_commit_guarded_subtask(workspace, issue, unit, opts)
+    opts = maybe_attach_current_subtask_contract(unit, opts)
+    prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
+    {prompt, opts}
+  end
 
   # Parse the workpad once here (workpad_text is already fetched by the
   # caller before prompt build) and attach the active subtask's structured

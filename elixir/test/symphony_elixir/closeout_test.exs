@@ -164,18 +164,42 @@ defmodule SymphonyElixir.CloseoutTest do
       assert exec["doc_fix_required"] == false
     end
 
-    test "retries when HEAD unchanged — doc_fix forgot to commit", %{workspace: ws} do
+    test "retries when HEAD unchanged AND tree is dirty — doc_fix forgot to commit", %{workspace: ws} do
       IssueExec.mark_doc_fix_required(ws)
       dispatch_head = init_git_only!(ws)
+
+      # Dirty the tree: an unstaged edit simulates "agent edited docs but
+      # forgot to commit". This is the data-loss case that must retry.
+      File.write!(Path.join(ws, "seed.txt"), "edited but not committed\n")
 
       assert {:retry, reason} =
                Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
 
-      assert reason =~ "doc_fix: produced no commit"
+      assert reason =~ "doc_fix: produced no commit but tree is dirty"
 
       # doc_fix_required must still be set so the dispatcher re-dispatches.
       {:ok, exec} = IssueExec.read(ws)
       assert exec["doc_fix_required"] == true
+    end
+
+    test "accepts no-op doc_fix (HEAD unchanged, tree clean — docs already up to date)", %{workspace: ws} do
+      # Regression guard for the Codex P1 finding: pre_verify_doc_check_rule
+      # dispatches doc_fix unconditionally before verify. If docs are already
+      # up to date, the agent legitimately produces no commit. A strict
+      # HEAD-advance guard would loop until circuit breaker — same failure
+      # mode as the bootstrap soft-accept bug. Accept the no-op only when
+      # tree is clean; dirty tree still triggers retry (see test above).
+      IssueExec.mark_doc_fix_required(ws)
+      dispatch_head = init_git_only!(ws)
+
+      # No dirty edits. Working tree is clean after the seed commit.
+      assert :accepted =
+               Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
+
+      # doc_fix_required must be cleared so the dispatcher advances past
+      # the doc_fix rule on the next cycle.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["doc_fix_required"] == false
     end
   end
 
