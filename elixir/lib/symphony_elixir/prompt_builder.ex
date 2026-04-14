@@ -19,7 +19,7 @@ defmodule SymphonyElixir.PromptBuilder do
     [
       unit_header(issue, unit),
       unit_context(unit, opts),
-      unit_instructions(unit),
+      unit_instructions(unit, opts),
       unit_guardrails(unit)
     ]
     |> Enum.reject(&is_nil/1)
@@ -98,11 +98,13 @@ defmodule SymphonyElixir.PromptBuilder do
   # code point so the result is always a valid string. O(byte_cap) upper
   # bound on the trim walk; in practice at most a 3-byte continuation run.
   defp take_head_bytes(text, byte_cap) when byte_size(text) <= byte_cap, do: text
+
   defp take_head_bytes(text, byte_cap) do
     text |> binary_part(0, byte_cap) |> trim_invalid_utf8_tail()
   end
 
   defp trim_invalid_utf8_tail(<<>>), do: <<>>
+
   defp trim_invalid_utf8_tail(bin) do
     if String.valid?(bin) do
       bin
@@ -238,18 +240,19 @@ defmodule SymphonyElixir.PromptBuilder do
     raw_desc = Map.get(issue, :description) || Map.get(issue, "description")
     cap = description_cap_for(unit)
 
-    desc = if is_binary(raw_desc) && String.trim(raw_desc) != "" do
-      truncated =
-        if byte_size(raw_desc) > cap do
-          take_head_bytes(raw_desc, cap) <> "\n…(description truncated to fit prompt budget)"
-        else
-          raw_desc
-        end
+    desc =
+      if is_binary(raw_desc) && String.trim(raw_desc) != "" do
+        truncated =
+          if byte_size(raw_desc) > cap do
+            take_head_bytes(raw_desc, cap) <> "\n…(description truncated to fit prompt budget)"
+          else
+            raw_desc
+          end
 
-      "\n\nDescription:\n#{truncated}"
-    else
-      ""
-    end
+        "\n\nDescription:\n#{truncated}"
+      else
+        ""
+      end
 
     """
     You are working on Linear ticket `#{issue.identifier || "unknown"}`: #{issue.title || ""}
@@ -264,7 +267,7 @@ defmodule SymphonyElixir.PromptBuilder do
   defp description_cap_for(_unit), do: @max_description_bytes_procedural
 
   # Bootstrap: goal-oriented, no step-by-step needed for low-effort unit
-  defp unit_instructions(%Unit{kind: :bootstrap}) do
+  defp unit_instructions(%Unit{kind: :bootstrap}, _opts) do
     """
     ## Instructions — Bootstrap
     Set up the workspace for this ticket. Your goal:
@@ -276,7 +279,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :plan}) do
+  defp unit_instructions(%Unit{kind: :plan}, _opts) do
     """
     ## Instructions — Plan
     1. Read the full issue description and any existing comments/PR feedback.
@@ -311,7 +314,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _, subtask_text: error_text}) do
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _, subtask_text: error_text}, _opts) do
     """
     ## Instructions — Verify Fix
     Verification failed after implementation. The orchestrator's test suite reported errors.
@@ -337,7 +340,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _, subtask_text: _}) do
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _, subtask_text: _}, _opts) do
     """
     ## Instructions — Merge Sync (Conflict Resolution)
     The PR branch has merge conflicts with `main`. Resolve them and push a clean
@@ -369,7 +372,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}) do
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}, _opts) do
     """
     ## Instructions — Rework Fix
     This ticket was sent back for rework. Linear comments on this ticket
@@ -388,7 +391,20 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: id, subtask_text: text}) do
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: id, subtask_text: text}, opts) do
+    subtask_contract =
+      case render_subtask_contract(Keyword.get(opts, :current_subtask)) do
+        nil ->
+          ""
+
+        block ->
+          """
+
+          Structured contract for `[#{id}]`:
+          #{block}
+          """
+      end
+
     """
     ## Instructions — Implement Subtask
     You are implementing **one subtask only**: `#{id}`#{if text, do: " — #{text}", else: ""}
@@ -402,6 +418,7 @@ defmodule SymphonyElixir.PromptBuilder do
       `#### [plan-N] continuation`) so you know what earlier subtasks changed
       and which gotchas they flagged. Do not re-do exploration that a prior
       continuation note already answered.
+    #{subtask_contract}
 
     1. Implement this subtask only, scoped to the `touch` paths when present
        and aimed at satisfying the `accept` criterion (or the subtask title
@@ -422,7 +439,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :doc_fix}) do
+  defp unit_instructions(%Unit{kind: :doc_fix}, _opts) do
     """
     ## Instructions — Doc Fix
     Recent code changes may have made documentation stale.
@@ -434,7 +451,7 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(%Unit{kind: :verify}) do
+  defp unit_instructions(%Unit{kind: :verify}, _opts) do
     """
     ## Instructions — Verify
     The orchestrator runs validation commands automatically after this session.
@@ -449,7 +466,7 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   # Handoff: goal-oriented, low-effort unit
-  defp unit_instructions(%Unit{kind: :handoff}) do
+  defp unit_instructions(%Unit{kind: :handoff}, _opts) do
     """
     ## Instructions — Handoff
     Deliver the completed work for human review. Your goal:
@@ -465,7 +482,7 @@ defmodule SymphonyElixir.PromptBuilder do
   # Merge is handled programmatically (no Codex session).
   # This clause exists only as a safety net if merge is somehow dispatched
   # through the old code path.
-  defp unit_instructions(%Unit{kind: :merge}) do
+  defp unit_instructions(%Unit{kind: :merge}, _opts) do
     """
     ## Instructions — Merge
     Merge the PR with `gh pr merge --squash --delete-branch` and move issue to `Done`.
@@ -473,9 +490,47 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
-  defp unit_instructions(_unit) do
+  defp unit_instructions(_unit, _opts) do
     "Follow the instructions for this unit."
   end
+
+  defp render_subtask_contract(%{touch: touch, accept: accept}) do
+    lines =
+      [
+        render_touch_line(touch),
+        render_accept_line(accept)
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    case lines do
+      [] ->
+        nil
+
+      _ ->
+        """
+        <subtask_contract>
+        #{Enum.join(lines, "\n")}
+        </subtask_contract>
+        """
+    end
+  end
+
+  defp render_subtask_contract(_), do: nil
+
+  defp render_touch_line(touch) when is_list(touch) and touch != [] do
+    "touch: " <> Enum.join(touch, ", ")
+  end
+
+  defp render_touch_line(_), do: nil
+
+  defp render_accept_line(accept) when is_binary(accept) do
+    case String.trim(accept) do
+      "" -> nil
+      trimmed -> "accept: " <> trimmed
+    end
+  end
+
+  defp render_accept_line(_), do: nil
 
   # "Do NOT expand scope" was removed here: for plan-N subtasks it was
   # redundant with the Instructions ("Do NOT touch other subtasks"); for

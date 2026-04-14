@@ -72,11 +72,11 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       # ticket description and Codex Workpad are injected — that's not
       # monolithic, that's context engineering. AGENTS.md's "<2000" note
       # predates workpad injection; 3000 here is the bare-skeleton guard.
-      for unit <- [Unit.bootstrap(), Unit.plan(), Unit.implement_subtask("plan-1"),
-                   Unit.doc_fix(), Unit.verify(), Unit.handoff(), Unit.merge()] do
+      for unit <- [Unit.bootstrap(), Unit.plan(), Unit.implement_subtask("plan-1"), Unit.doc_fix(), Unit.verify(), Unit.handoff(), Unit.merge()] do
         prompt = PromptBuilder.build_unit_prompt(@issue, unit)
+
         assert String.length(prompt) < 3000,
-          "#{unit.display_name} prompt too long: #{String.length(prompt)} chars"
+               "#{unit.display_name} prompt too long: #{String.length(prompt)} chars"
       end
     end
   end
@@ -372,6 +372,54 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       assert prompt =~ "Workpad"
     end
 
+    test "injects a structured subtask contract block when current_subtask carries touch and accept" do
+      unit = Unit.implement_subtask("plan-2", "Wire save path")
+
+      current_subtask = %{
+        id: "plan-2",
+        text: "Wire save path",
+        done: false,
+        touch: ["apps/web/lib/save.ts", "apps/web/lib/save.test.ts"],
+        accept: "pnpm --dir apps/web test:unit"
+      }
+
+      prompt =
+        PromptBuilder.build_unit_prompt(
+          @issue,
+          unit,
+          workpad_text: @workpad_sample,
+          current_subtask: current_subtask
+        )
+
+      assert prompt =~ "<subtask_contract>\n"
+      assert prompt =~ "</subtask_contract>"
+      assert prompt =~ "touch: apps/web/lib/save.ts, apps/web/lib/save.test.ts"
+      assert prompt =~ "accept: pnpm --dir apps/web test:unit"
+    end
+
+    test "omits the structured subtask contract block when touch and accept are both missing" do
+      unit = Unit.implement_subtask("plan-2", "Wire save path")
+
+      current_subtask = %{
+        id: "plan-2",
+        text: "Wire save path",
+        done: false,
+        touch: [],
+        accept: nil
+      }
+
+      prompt =
+        PromptBuilder.build_unit_prompt(
+          @issue,
+          unit,
+          workpad_text: @workpad_sample,
+          current_subtask: current_subtask
+        )
+
+      refute prompt =~ "<subtask_contract>\n"
+      refute prompt =~ "</subtask_contract>"
+    end
+
     test "prompt requires writing a continuation note before marking done" do
       unit = Unit.implement_subtask("plan-2", "Wire save path")
       prompt = PromptBuilder.build_unit_prompt(@issue, unit)
@@ -466,9 +514,12 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
   describe "issue description truncation" do
     test "preserves Done When section on a realistic ~4KB ticket description" do
       description =
-        "## Goal\n" <> String.duplicate("goal detail.\n", 100) <>
-          "\n## Why\n" <> String.duplicate("why detail.\n", 50) <>
-          "\n## Scope\n" <> String.duplicate("scope detail.\n", 50) <>
+        "## Goal\n" <>
+          String.duplicate("goal detail.\n", 100) <>
+          "\n## Why\n" <>
+          String.duplicate("why detail.\n", 50) <>
+          "\n## Scope\n" <>
+          String.duplicate("scope detail.\n", 50) <>
           "\n## Done When\n- [ ] verification-proves-wiring-works\n" <>
           "\n## Proof Required\n- sample-transcript-attached"
 
