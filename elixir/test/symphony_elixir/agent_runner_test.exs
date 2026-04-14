@@ -275,4 +275,81 @@ defmodule SymphonyElixir.AgentRunnerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "unit_lite merge dispatch still runs before_run after after_create" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-unit-lite-hooks-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      before_run_counter = Path.join(test_root, "before_run.count")
+
+      init_git_repo!(template_repo, %{"tracked.txt" => "tracked\n"})
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "git clone #{template_repo} .",
+        hook_before_run: "test -f tracked.txt\necho call >> \"#{before_run_counter}\""
+      )
+
+      issue = %Issue{
+        id: "issue-unit-lite-hooks",
+        identifier: "MT-unit-lite-hooks",
+        title: "Verify unit-lite hook order",
+        description: "Ensure before_run still fires for merge dispatches.",
+        state: "Merging",
+        url: "https://example.org/issues/MT-unit-lite-hooks",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run_unit_lite(issue, nil,
+                 pr_checker: fn _workspace -> :open end,
+                 ci_checker: fn _workspace -> :pending end,
+                 workpad_text: "merge fast path"
+               )
+
+      assert count_lines(before_run_counter) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp init_git_repo!(repo, files) do
+    File.mkdir_p!(repo)
+
+    Enum.each(files, fn {path, contents} ->
+      full_path = Path.join(repo, path)
+      File.mkdir_p!(Path.dirname(full_path))
+      File.write!(full_path, contents)
+    end)
+
+    git!(repo, ["init", "-b", "main"])
+    git!(repo, ["config", "user.name", "Test User"])
+    git!(repo, ["config", "user.email", "test@example.com"])
+    git!(repo, ["add", "."])
+    git!(repo, ["commit", "-m", "initial"])
+    repo
+  end
+
+  defp git!(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+
+      {output, status} ->
+        flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
+  end
+
+  defp count_lines(path) do
+    case File.read(path) do
+      {:ok, contents} -> contents |> String.split("\n", trim: true) |> length()
+      {:error, :enoent} -> 0
+    end
+  end
 end

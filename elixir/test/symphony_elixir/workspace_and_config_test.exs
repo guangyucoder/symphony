@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.WorkspaceAndConfigTest do
   use SymphonyElixir.TestSupport
+  import ExUnit.CaptureLog
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -73,9 +74,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(Path.join(first_workspace, "deps"))
       File.mkdir_p!(Path.join(first_workspace, "_build"))
       File.mkdir_p!(Path.join(first_workspace, "tmp"))
+      File.mkdir_p!(Path.join([first_workspace, "apps", "web", ".next"]))
+      File.mkdir_p!(Path.join([first_workspace, "node_modules", ".cache"]))
       File.write!(Path.join([first_workspace, "deps", "cache.txt"]), "cached deps\n")
       File.write!(Path.join([first_workspace, "_build", "artifact.txt"]), "compiled artifact\n")
       File.write!(Path.join([first_workspace, "tmp", "scratch.txt"]), "remove me\n")
+      File.write!(Path.join([first_workspace, "apps", "web", ".next", "build.txt"]), "remove me too\n")
+      File.write!(Path.join([first_workspace, "node_modules", ".cache", "bundler.txt"]), "remove cache\n")
 
       assert {:ok, second_workspace} = Workspace.create_for_issue("MT-REUSE")
       assert second_workspace == first_workspace
@@ -87,6 +92,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "compiled artifact\n"
 
       refute File.exists?(Path.join([second_workspace, "tmp", "scratch.txt"]))
+      refute File.exists?(Path.join([second_workspace, "apps", "web", ".next", "build.txt"]))
+      refute File.exists?(Path.join([second_workspace, "node_modules", ".cache", "bundler.txt"]))
     after
       File.rm_rf(workspace_root)
     end
@@ -573,8 +580,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create:
-          "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
+        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
         hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
       )
 
@@ -677,6 +683,159 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
       refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch preserves .symphony state and .env.sh across repeated dispatches" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-preserve-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-PRESERVE")
+      symphony_state = Path.join([workspace, ".symphony", "state.json"])
+      env_snapshot = Path.join(workspace, ".env.sh")
+
+      File.mkdir_p!(Path.dirname(symphony_state))
+      File.write!(symphony_state, ~s({"status":"keep"}) <> "\n")
+      File.write!(env_snapshot, "export KEEP=1\n")
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
+      assert File.read!(symphony_state) == ~s({"status":"keep"}) <> "\n"
+      assert File.read!(env_snapshot) == "export KEEP=1\n"
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
+      assert File.read!(symphony_state) == ~s({"status":"keep"}) <> "\n"
+      assert File.read!(env_snapshot) == "export KEEP=1\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch removes untracked files at the repo root" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-untracked-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-UNTRACKED")
+      scratch_file = Path.join(workspace, "scratch.txt")
+
+      File.write!(scratch_file, "remove me\n")
+      assert File.exists?(scratch_file)
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-UNTRACKED")
+      refute File.exists?(scratch_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch resets tracked file edits back to HEAD" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-tracked-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-TRACKED")
+      tracked_file = Path.join(workspace, "tracked.txt")
+
+      File.write!(tracked_file, "dirty change\n")
+      assert File.read!(tracked_file) == "dirty change\n"
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-TRACKED")
+      assert File.read!(tracked_file) == "tracked\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch does not rerun after_create" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-after-create-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace: workspace, after_create_counter: after_create_counter} =
+        create_cloned_git_workspace!(test_root, "MT-PREP-HOOK")
+
+      assert count_lines(after_create_counter) == 1
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-HOOK")
+      assert count_lines(after_create_counter) == 1
+
+      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-HOOK")
+      assert count_lines(after_create_counter) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch tolerates repositories without origin" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-no-origin-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-NO-ORIGIN")
+      init_git_repo!(workspace, %{"tracked.txt" => "tracked\n"})
+
+      tracked_file = Path.join(workspace, "tracked.txt")
+      scratch_file = Path.join(workspace, "scratch.txt")
+
+      File.write!(tracked_file, "dirty\n")
+      File.write!(scratch_file, "remove me\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-NO-ORIGIN")
+        end)
+
+      assert log =~ "origin is missing"
+      assert File.read!(tracked_file) == "tracked\n"
+      refute File.exists?(scratch_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch skips non-git workspaces without crashing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-nongit-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-NONGIT")
+      File.mkdir_p!(Path.join(workspace, "tmp"))
+      File.write!(Path.join([workspace, "tmp", "scratch.txt"]), "remove me\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-NONGIT")
+        end)
+
+      assert log =~ "not a git repo"
+      refute File.exists?(Path.join([workspace, "tmp", "scratch.txt"]))
     after
       File.rm_rf(test_root)
     end
@@ -956,5 +1115,64 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
     assert Config.workflow_prompt() == workflow_prompt
+  end
+
+  defp create_cloned_git_workspace!(test_root, issue_identifier) do
+    template_repo = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    after_create_counter = Path.join(test_root, "after_create.count")
+
+    init_git_repo!(template_repo, %{
+      "README.md" => "hook clone\n",
+      "tracked.txt" => "tracked\n"
+    })
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_after_create: "git clone #{template_repo} .\necho call >> \"#{after_create_counter}\""
+    )
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue_identifier)
+
+    %{
+      workspace: workspace,
+      template_repo: template_repo,
+      workspace_root: workspace_root,
+      after_create_counter: after_create_counter
+    }
+  end
+
+  defp init_git_repo!(repo, files) do
+    File.mkdir_p!(repo)
+
+    Enum.each(files, fn {path, contents} ->
+      full_path = Path.join(repo, path)
+      File.mkdir_p!(Path.dirname(full_path))
+      File.write!(full_path, contents)
+    end)
+
+    git!(repo, ["init", "-b", "main"])
+    git!(repo, ["config", "user.name", "Test User"])
+    git!(repo, ["config", "user.email", "test@example.com"])
+    git!(repo, ["add", "."])
+    git!(repo, ["commit", "-m", "initial"])
+    repo
+  end
+
+  defp git!(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+
+      {output, status} ->
+        flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
+  end
+
+  defp count_lines(path) do
+    case File.read(path) do
+      {:ok, contents} -> contents |> String.split("\n", trim: true) |> length()
+      {:error, :enoent} -> 0
+    end
   end
 end

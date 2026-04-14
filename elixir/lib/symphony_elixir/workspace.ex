@@ -6,11 +6,33 @@ defmodule SymphonyElixir.Workspace do
   require Logger
   alias SymphonyElixir.Config
 
-  @excluded_entries MapSet.new([".elixir_ls", "tmp"])
+  @excluded_entries [
+    # Elixir transient state
+    ".elixir_ls",
+    "tmp",
+    # Next.js build artifacts
+    "apps/web/.next",
+    "apps/admin/.next",
+    # React Native native build caches
+    "mobile-app/ios/build",
+    "mobile-app/android/.gradle",
+    "mobile-app/android/build",
+    # JS package-manager caches
+    "node_modules/.cache"
+  ]
   @session_meta_file ".symphony_session.json"
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
+    case create_for_issue_with_status(issue_or_identifier) do
+      {:ok, workspace, _created?} -> {:ok, workspace}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec create_for_issue_with_status(map() | String.t() | nil) ::
+          {:ok, Path.t(), boolean()} | {:error, term()}
+  def create_for_issue_with_status(issue_or_identifier) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -21,15 +43,27 @@ defmodule SymphonyElixir.Workspace do
       with :ok <- validate_workspace_path(workspace),
            {:ok, created?} <- ensure_workspace(workspace),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?) do
-        {:ok, workspace}
+        {:ok, workspace, created?}
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
-        Logger.error(
-          "Workspace creation failed #{issue_log_context(issue_context)} error=#{Exception.message(error)}"
-        )
+        Logger.error("Workspace creation failed #{issue_log_context(issue_context)} error=#{Exception.message(error)}")
 
         {:error, error}
+    end
+  end
+
+  @doc """
+  Reset an existing workspace to a clean per-dispatch baseline without rerunning bootstrap.
+  """
+  @spec prepare_for_dispatch(Path.t(), map() | String.t() | nil) :: :ok | {:error, term()}
+  def prepare_for_dispatch(workspace, issue_or_identifier) when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+
+    with :ok <- validate_workspace_path(workspace),
+         :ok <- ensure_git_dispatch_baseline(workspace, issue_context) do
+      clean_tmp_artifacts(workspace)
+      :ok
     end
   end
 
@@ -211,7 +245,7 @@ defmodule SymphonyElixir.Workspace do
   defp normalize_optional_session_meta_value(_value), do: nil
 
   defp clean_tmp_artifacts(workspace) do
-    Enum.each(MapSet.to_list(@excluded_entries), fn entry ->
+    Enum.each(@excluded_entries, fn entry ->
       File.rm_rf(Path.join(workspace, entry))
     end)
   end
@@ -260,9 +294,7 @@ defmodule SymphonyElixir.Workspace do
   defp run_hook(command, workspace, issue_context, hook_name) do
     timeout_ms = Config.workspace_hooks()[:timeout_ms]
 
-    Logger.info(
-      "Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace}"
-    )
+    Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace}")
 
     task =
       Task.async(fn ->
@@ -276,9 +308,7 @@ defmodule SymphonyElixir.Workspace do
       nil ->
         Task.shutdown(task, :brutal_kill)
 
-        Logger.warning(
-          "Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms}"
-        )
+        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
     end
@@ -291,9 +321,7 @@ defmodule SymphonyElixir.Workspace do
   defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name) do
     sanitized_output = sanitize_hook_output_for_log(output)
 
-    Logger.warning(
-      "Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}"
-    )
+    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
 
     {:error, {:workspace_hook_failed, hook_name, status, output}}
   end
@@ -309,6 +337,114 @@ defmodule SymphonyElixir.Workspace do
         binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
     end
   end
+
+  defp ensure_git_dispatch_baseline(workspace, issue_context) do
+    case git_workspace_status(workspace) do
+      :git_repo ->
+        with :ok <- fetch_origin_if_present(workspace, issue_context),
+             :ok <- run_git_step(workspace, ["reset", "--hard", "HEAD"], "reset_hard", issue_context),
+             :ok <-
+               run_git_step(
+                 workspace,
+                 ["clean", "-fd", "-e", ".symphony/", "-e", ".env.sh"],
+                 "clean_untracked",
+                 issue_context
+               ) do
+          :ok
+        end
+
+      :not_git_repo ->
+        Logger.warning("Workspace prepare skipped git reset because workspace is not a git repo #{issue_log_context(issue_context)} workspace=#{workspace}")
+
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp git_workspace_status(workspace) do
+    case run_git_command(workspace, ["rev-parse", "--is-inside-work-tree"]) do
+      {:ok, output} ->
+        case String.trim(output) do
+          "true" -> :git_repo
+          _ -> {:error, {:workspace_prepare_failed, "rev_parse", 0, output}}
+        end
+
+      {:error, {:workspace_prepare_failed, "rev_parse", status, output}} ->
+        if String.contains?(String.downcase(output), "not a git repository") do
+          :not_git_repo
+        else
+          {:error, {:workspace_prepare_failed, "rev_parse", status, output}}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp fetch_origin_if_present(workspace, issue_context) do
+    case run_git_step(workspace, ["fetch", "origin", "--prune"], "fetch_origin", issue_context) do
+      :ok ->
+        :ok
+
+      {:error, {:workspace_prepare_failed, "fetch_origin", _status, _output}} = error ->
+        if origin_remote_configured?(workspace) do
+          error
+        else
+          Logger.warning("Workspace prepare skipped git fetch because origin is missing #{issue_log_context(issue_context)} workspace=#{workspace}")
+
+          :ok
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp origin_remote_configured?(workspace) do
+    case run_git_command(workspace, ["remote", "get-url", "origin"]) do
+      {:ok, _output} -> true
+      {:error, _reason} -> false
+    end
+  end
+
+  defp run_git_step(workspace, args, step, issue_context) do
+    case run_git_command(workspace, args) do
+      {:ok, _output} ->
+        :ok
+
+      {:error, {:workspace_prepare_failed, _raw_step, status, output}} ->
+        sanitized_output = sanitize_hook_output_for_log(output)
+
+        Logger.warning("Workspace prepare failed step=#{step} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
+
+        {:error, {:workspace_prepare_failed, step, status, output}}
+
+      {:error, {:workspace_prepare_exec_failed, _raw_step, reason}} ->
+        Logger.warning("Workspace prepare failed step=#{step} #{issue_log_context(issue_context)} workspace=#{workspace} error=#{inspect(reason)}")
+
+        {:error, {:workspace_prepare_exec_failed, step, reason}}
+    end
+  end
+
+  defp run_git_command(workspace, args) do
+    try do
+      case System.cmd("git", args, cd: workspace, stderr_to_stdout: true) do
+        {output, 0} -> {:ok, output}
+        {output, status} -> {:error, {:workspace_prepare_failed, raw_git_step(args), status, output}}
+      end
+    rescue
+      error in ErlangError ->
+        {:error, {:workspace_prepare_exec_failed, raw_git_step(args), Exception.message(error)}}
+    end
+  end
+
+  defp raw_git_step(["rev-parse" | _rest]), do: "rev_parse"
+  defp raw_git_step(["fetch" | _rest]), do: "fetch_origin"
+  defp raw_git_step(["reset" | _rest]), do: "reset_hard"
+  defp raw_git_step(["clean" | _rest]), do: "clean_untracked"
+  defp raw_git_step(args), do: Enum.join(args, "_")
 
   defp validate_workspace_path(workspace) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
