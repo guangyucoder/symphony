@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, Workspace}
+  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, WorkpadParser, Workspace}
 
   @doc """
   Unit-lite mode: resolve the next unit, run a single fresh Codex session for it,
@@ -237,6 +237,7 @@ defmodule SymphonyElixir.AgentRunner do
     # (for prompt injection). Orchestrator-owned ingestion — do not rely on
     # the agent to fetch review context or self-report commit state.
     opts = enrich_opts_for_commit_guarded_subtask(workspace, issue, unit, opts)
+    opts = maybe_attach_current_subtask_contract(unit, opts)
 
     # Build prompt
     prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
@@ -365,13 +366,25 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  # Run the dispatch body inside before_run / after_run hooks.
+  #
+  # Contract: after_run fires only when the dispatch actually started —
+  # i.e., before_run succeeded. If before_run fails, the attempt never
+  # ran and a cleanup hook would be lying about the state; SPEC.md treats
+  # before_run failure as fatal and shows after_run only on the dispatch
+  # success path. The try/after preserves the happy-path guarantee that
+  # after_run fires even when `fun.()` raises.
   defp with_dispatch_hooks(workspace, issue, fun) do
-    try do
-      with :ok <- Workspace.run_before_run_hook(workspace, issue) do
-        fun.()
-      end
-    after
-      Workspace.run_after_run_hook(workspace, issue)
+    case Workspace.run_before_run_hook(workspace, issue) do
+      :ok ->
+        try do
+          fun.()
+        after
+          Workspace.run_after_run_hook(workspace, issue)
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -1281,7 +1294,66 @@ defmodule SymphonyElixir.AgentRunner do
     enrich_opts_for_rework(workspace, issue, unit, opts)
   end
 
+  # Regular plan-N and merge-sync-* implement_subtask units, plus doc_fix,
+  # are also mutation-bearing: the per-dispatch workspace reset destroys
+  # uncommitted work, so closeout must be able to verify that HEAD
+  # advanced since dispatch. Snapshot it here.
+  defp enrich_opts_for_commit_guarded_subtask(
+         workspace,
+         _issue,
+         %Unit{kind: :implement_subtask},
+         opts
+       ) do
+    Keyword.put_new(opts, :dispatch_head, current_git_head(workspace))
+  end
+
+  defp enrich_opts_for_commit_guarded_subtask(
+         workspace,
+         _issue,
+         %Unit{kind: :doc_fix},
+         opts
+       ) do
+    Keyword.put_new(opts, :dispatch_head, current_git_head(workspace))
+  end
+
   defp enrich_opts_for_commit_guarded_subtask(_workspace, _issue, _unit, opts), do: opts
+
+  # Parse the workpad once here (workpad_text is already fetched by the
+  # caller before prompt build) and attach the active subtask's structured
+  # contract to opts as :current_subtask. PromptBuilder renders that into
+  # a sanitized <subtask_contract> block. Rework/verify-fix/merge-sync
+  # subtasks are skipped: they have their own prompt shape and the planner
+  # contract doesn't apply to them.
+  #
+  # Public (with @doc false) so tests can pin the wiring without mocking
+  # the whole AppServer / dispatch chain.
+  @doc false
+  def maybe_attach_current_subtask_contract(
+        %Unit{kind: :implement_subtask, subtask_id: subtask_id},
+        opts
+      ) do
+    if regular_implement_subtask_id?(subtask_id) do
+      with workpad_text when is_binary(workpad_text) <- Keyword.get(opts, :workpad_text),
+           {:ok, subtasks} <- WorkpadParser.parse(workpad_text),
+           %{} = current_subtask <- Enum.find(subtasks, &(&1.id == subtask_id)) do
+        Keyword.put(opts, :current_subtask, current_subtask)
+      else
+        _ -> opts
+      end
+    else
+      opts
+    end
+  end
+
+  def maybe_attach_current_subtask_contract(_unit, opts), do: opts
+
+  defp regular_implement_subtask_id?(subtask_id) when is_binary(subtask_id) do
+    not String.starts_with?(subtask_id, "rework-") and
+      not String.starts_with?(subtask_id, "verify-fix-") and
+      not String.starts_with?(subtask_id, "merge-sync-")
+  end
+
+  defp regular_implement_subtask_id?(_), do: false
 
   defp enrich_opts_for_rework(workspace, issue, %Unit{subtask_id: "rework-" <> _}, opts) do
     dispatch_head = current_git_head(workspace)

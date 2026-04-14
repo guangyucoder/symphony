@@ -12,6 +12,18 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     workspace = Path.join(System.tmp_dir!(), "integration_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(workspace, ".symphony"))
     IssueExec.init(workspace)
+
+    # Need a real git repo + at least one commit so the commit-advancement
+    # guard in Closeout can observe HEAD transitions. simulate_unit_complete
+    # snapshots pre-closeout HEAD and synthesizes a new commit so the guard
+    # sees :advanced.
+    System.cmd("git", ["init", "-q"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "t@t.com"], cd: workspace)
+    File.write!(Path.join(workspace, "seed.txt"), "seed\n")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-q", "-m", "init"], cd: workspace)
+
     on_exit(fn -> File.rm_rf!(workspace) end)
     %{workspace: workspace}
   end
@@ -20,24 +32,56 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
   defp resolve(workspace, issue, workpad_text \\ nil) do
     {:ok, exec} = IssueExec.read(workspace)
+
     ctx = %{
       issue: %{state: issue[:state] || issue.state},
       exec: exec,
       workpad_text: workpad_text,
       git_head: "abc123"
     }
+
     DispatchResolver.resolve(ctx)
   end
 
   defp simulate_unit_complete(workspace, unit_map, issue, opts \\ []) do
     IssueExec.start_unit(workspace, unit_map)
     Ledger.unit_started(workspace, unit_map)
+
+    # Mutation-bearing units (implement_subtask, doc_fix, rework-*, verify-fix-*)
+    # now require a dispatch_head snapshot + HEAD advance before closeout will
+    # accept them. Synthesize a commit when the caller didn't supply an explicit
+    # dispatch_head, so the integration flow models "agent ran and committed".
+    opts =
+      if Keyword.has_key?(opts, :dispatch_head) or not mutation_bearing?(unit_map) do
+        opts
+      else
+        {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+        dispatch_head = String.trim(head)
+        advance_head!(workspace, unit_map)
+        Keyword.put(opts, :dispatch_head, dispatch_head)
+      end
+
     result = Closeout.run(workspace, unit_map, issue, opts)
+
     if result == :accepted do
       IssueExec.accept_unit(workspace)
       Ledger.unit_accepted(workspace, unit_map)
     end
+
     result
+  end
+
+  defp mutation_bearing?(%{"kind" => "implement_subtask"}), do: true
+  defp mutation_bearing?(%{"kind" => "doc_fix"}), do: true
+  defp mutation_bearing?(_), do: false
+
+  defp advance_head!(workspace, %{"kind" => kind} = unit_map) do
+    tag = (unit_map["subtask_id"] || kind) |> to_string()
+    marker = Path.join(workspace, "progress-#{tag}-#{System.unique_integer([:positive])}.txt")
+    File.write!(marker, "progress\n")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-q", "-m", "simulate #{tag}"], cd: workspace)
+    :ok
   end
 
   describe "Scenario A: normal ticket full flow" do
@@ -60,6 +104,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [ ] [plan-1] Add component
       - [ ] [plan-2] Write tests
       """
+
       assert :accepted = simulate_unit_complete(ws, %{"kind" => "plan"}, @issue, workpad_text: workpad)
 
       # Step 3: resolve → implement_subtask(plan-1)
@@ -183,6 +228,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       # HEAD is now sha_B (different from verified sha_A)
       {:ok, exec} = IssueExec.read(ws)
+
       ctx = %{
         issue: %{state: "In Progress"},
         exec: exec,
@@ -296,10 +342,11 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       assert exec["last_verified_sha"] == nil
 
       # Next dispatch: verify_fix_rule fires (NOT replay verify)
-      {:ok, head_sha} = case System.cmd("git", ["rev-parse", "HEAD"], cd: ws) do
-        {sha, 0} -> {:ok, String.trim(sha)}
-        _ -> {:ok, "abc"}
-      end
+      {:ok, head_sha} =
+        case System.cmd("git", ["rev-parse", "HEAD"], cd: ws) do
+          {sha, 0} -> {:ok, String.trim(sha)}
+          _ -> {:ok, "abc"}
+        end
 
       ctx = %{
         issue: %{state: @issue.state},
@@ -307,6 +354,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         workpad_text: workpad_all_done,
         git_head: head_sha
       }
+
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                DispatchResolver.resolve(ctx)
     end
@@ -410,6 +458,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       """
 
       {:ok, exec} = IssueExec.read(ws)
+
       ctx = %{
         issue: %{state: "In Progress"},
         exec: exec,
@@ -441,6 +490,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         "subtask_id" => "plan-2",
         "attempt" => 2
       })
+
       result = resolve(ws, @issue, workpad)
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2", attempt: 3}} = result
 
@@ -450,6 +500,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         "subtask_id" => "plan-2",
         "attempt" => 3
       })
+
       result = resolve(ws, @issue, workpad)
       assert {:stop, :circuit_breaker} = result
     end
@@ -459,6 +510,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     test "incomplete workpad + rework → falls through to implement old subtasks", %{workspace: ws} do
       IssueExec.mark_bootstrapped(ws)
       IssueExec.bump_plan_version(ws)
+
       IssueExec.update(ws, %{
         "last_accepted_unit" => %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
         "phase" => "implementing"
@@ -607,8 +659,9 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       simulate_rework_cleanup(ws)
 
       result = resolve(ws, rework_issue, workpad)
+
       assert {:dispatch, %Unit{kind: :handoff}} = result,
-        "After verify in rework cycle, should dispatch handoff — not loop back to rework_fix"
+             "After verify in rework cycle, should dispatch handoff — not loop back to rework_fix"
     end
   end
 
@@ -621,8 +674,9 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         current = exec["current_unit"]
         last = exec["last_accepted_unit"]
 
-        fresh_rework? = is_nil(current) and
-                        is_map(last) and last["kind"] in ["handoff", "merge"]
+        fresh_rework? =
+          is_nil(current) and
+            is_map(last) and last["kind"] in ["handoff", "merge"]
 
         if fresh_rework? do
           IssueExec.update(workspace, %{
@@ -633,7 +687,8 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
           })
         end
 
-      _ -> :ok
+      _ ->
+        :ok
     end
   end
 
@@ -730,6 +785,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                resolve(ws, @issue, workpad)
+
       simulate_verify_fix_done(ws)
       IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
@@ -742,6 +798,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                resolve(ws, @issue, workpad)
+
       simulate_verify_fix_done(ws)
       IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
@@ -774,6 +831,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     fix_file = "verify_fix_#{System.unique_integer([:positive])}.txt"
     File.write!(Path.join(ws, fix_file), "fix\n")
     System.cmd("git", ["add", "."], cd: ws)
+
     System.cmd(
       "git",
       ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "verify-fix"],
@@ -809,6 +867,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       merging_issue = %{state: "Merging"}
       {:ok, exec} = IssueExec.read(ws)
       ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                DispatchResolver.resolve(ctx)
     end

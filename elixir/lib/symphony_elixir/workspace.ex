@@ -478,12 +478,18 @@ defmodule SymphonyElixir.Workspace do
   defp log_discarded_wip(%{summary: summary} = discarded, workspace, issue_context) do
     Logger.warning("Workspace prepare will discard uncommitted changes #{issue_log_context(issue_context)} workspace=#{workspace} files=#{inspect(summary)}")
 
-    case Ledger.append(workspace, :workspace_wip_discarded, %{
-           "issue_identifier" => issue_context.issue_identifier,
-           "files" => discarded.files,
-           "file_count" => discarded.file_count,
-           "summary" => discarded.summary
-         }) do
+    stash_paths = stash_discarded_wip(workspace, discarded, issue_context)
+
+    payload =
+      %{
+        "issue_identifier" => issue_context.issue_identifier,
+        "files" => discarded.files,
+        "file_count" => discarded.file_count,
+        "summary" => discarded.summary
+      }
+      |> Map.merge(stash_paths)
+
+    case Ledger.append(workspace, :workspace_wip_discarded, payload) do
       :ok ->
         :ok
 
@@ -493,6 +499,41 @@ defmodule SymphonyElixir.Workspace do
         :ok
     end
   end
+
+  # Best-effort capture of uncommitted work before the reset destroys it.
+  # Writes both a binary-aware diff and the raw untracked-file list into
+  # .symphony/discarded_wip/<iso-ts>.{patch,untracked.txt}. On any failure
+  # we warn + return empty paths; the ledger entry still records the file
+  # list, and the dispatch continues (do not abort on stash failure).
+  defp stash_discarded_wip(workspace, %{file_count: count}, issue_context) when count > 0 do
+    timestamp =
+      DateTime.utc_now()
+      |> DateTime.truncate(:second)
+      |> DateTime.to_iso8601()
+      |> String.replace(":", "-")
+
+    dir = Path.join([workspace, ".symphony", "discarded_wip"])
+    patch_rel = Path.join([".symphony", "discarded_wip", "#{timestamp}.patch"])
+    untracked_rel = Path.join([".symphony", "discarded_wip", "#{timestamp}.untracked.txt"])
+    patch_abs = Path.join(workspace, patch_rel)
+    untracked_abs = Path.join(workspace, untracked_rel)
+
+    with :ok <- File.mkdir_p(dir),
+         {:ok, diff_output} <- run_git_command(workspace, ["diff", "--binary", "HEAD"]),
+         {:ok, porcelain_output} <-
+           run_git_command(workspace, ["status", "--porcelain=v1", "--untracked-files=all"]),
+         :ok <- File.write(patch_abs, diff_output),
+         :ok <- File.write(untracked_abs, porcelain_output) do
+      %{"patch_path" => patch_rel, "untracked_list_path" => untracked_rel}
+    else
+      error ->
+        Logger.warning("Workspace prepare could not stash discarded WIP #{issue_log_context(issue_context)} workspace=#{workspace} error=#{inspect(error)}")
+
+        %{}
+    end
+  end
+
+  defp stash_discarded_wip(_workspace, _discarded, _issue_context), do: %{}
 
   defp porcelain_path(line) when is_binary(line) and byte_size(line) > 3 do
     line

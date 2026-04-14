@@ -320,6 +320,54 @@ defmodule SymphonyElixir.AgentRunnerTest do
     end
   end
 
+  test "unit_lite: before_run failure short-circuits dispatch and does NOT fire after_run" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-before-run-fail-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      after_run_counter = Path.join(test_root, "after_run.count")
+
+      init_git_repo!(template_repo, %{"tracked.txt" => "tracked\n"})
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        execution_mode: "unit_lite",
+        hook_after_create: "git clone #{template_repo} .",
+        hook_before_run: "exit 1",
+        hook_after_run: "echo call >> \"#{after_run_counter}\""
+      )
+
+      issue = %Issue{
+        id: "issue-before-run-fail",
+        identifier: "MT-before-run-fail",
+        title: "Hook failure short-circuit",
+        description: "before_run exits non-zero; after_run must NOT fire.",
+        state: "Merging",
+        url: "https://example.org/issues/MT-before-run-fail",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/unit_lite run failed/, fn ->
+        AgentRunner.run_unit_lite(issue, nil,
+          pr_checker: fn _workspace -> :open end,
+          ci_checker: fn _workspace -> :pending end,
+          workpad_text: "merge fast path"
+        )
+      end
+
+      # The dispatch never actually started, so cleanup hooks must not have fired.
+      refute File.exists?(after_run_counter),
+             "after_run hook fired despite before_run failure — a cleanup hook would be lying about the dispatch state"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "legacy run does not prepare an existing workspace before before_run" do
     test_root =
       Path.join(
@@ -447,6 +495,94 @@ defmodule SymphonyElixir.AgentRunnerTest do
     case File.read(path) do
       {:ok, contents} -> contents |> String.split("\n", trim: true) |> length()
       {:error, :enoent} -> 0
+    end
+  end
+
+  # ---------- subtask contract wiring (regression for silent --ours drop) ----------
+
+  describe "maybe_attach_current_subtask_contract/2" do
+    @workpad_with_contract """
+    ## Codex Workpad
+
+    ### Plan
+    - [ ] [plan-1] Wire the border detector
+      - touch: apps/web/lib/border.ts, apps/web/lib/foo.ts
+      - accept: pnpm --dir apps/web test:unit -- border
+    - [ ] [plan-2] Integrate into Editor
+      - touch: apps/web/components/Editor.tsx
+      - accept: manual smoke on /scan
+    """
+
+    test "attaches :current_subtask for a regular implement_subtask and PromptBuilder renders the contract block" do
+      unit = %SymphonyElixir.Unit{
+        kind: :implement_subtask,
+        subtask_id: "plan-1",
+        subtask_text: "Wire the border detector",
+        display_name: "implement plan-1"
+      }
+
+      opts =
+        SymphonyElixir.AgentRunner.maybe_attach_current_subtask_contract(unit,
+          workpad_text: @workpad_with_contract
+        )
+
+      current = Keyword.get(opts, :current_subtask)
+      assert is_map(current)
+      assert current.id == "plan-1"
+      assert current.touch == ["apps/web/lib/border.ts", "apps/web/lib/foo.ts"]
+      assert current.accept == "pnpm --dir apps/web test:unit -- border"
+
+      issue = %SymphonyElixir.Linear.Issue{identifier: "ENT-1", title: "wire border"}
+      prompt = SymphonyElixir.PromptBuilder.build_unit_prompt(issue, unit, opts)
+
+      assert prompt =~ "<subtask_contract>"
+      assert prompt =~ "touch: apps/web/lib/border.ts, apps/web/lib/foo.ts"
+      assert prompt =~ "accept: pnpm --dir apps/web test:unit -- border"
+    end
+
+    test "does not attach contract for rework-* / verify-fix-* / merge-sync-* subtasks" do
+      for prefix <- ["rework-", "verify-fix-", "merge-sync-"] do
+        unit = %SymphonyElixir.Unit{
+          kind: :implement_subtask,
+          subtask_id: prefix <> "1",
+          subtask_text: "",
+          display_name: prefix <> "1"
+        }
+
+        opts =
+          SymphonyElixir.AgentRunner.maybe_attach_current_subtask_contract(
+            unit,
+            workpad_text: @workpad_with_contract
+          )
+
+        refute Keyword.has_key?(opts, :current_subtask),
+               "expected no :current_subtask for #{prefix} unit, got #{inspect(opts)}"
+      end
+    end
+
+    test "returns opts unchanged when workpad is absent, malformed, or subtask id not in plan" do
+      plan_unit = %SymphonyElixir.Unit{
+        kind: :implement_subtask,
+        subtask_id: "plan-99",
+        subtask_text: "missing from plan",
+        display_name: "implement plan-99"
+      }
+
+      assert SymphonyElixir.AgentRunner.maybe_attach_current_subtask_contract(plan_unit, []) == []
+
+      opts =
+        SymphonyElixir.AgentRunner.maybe_attach_current_subtask_contract(plan_unit,
+          workpad_text: @workpad_with_contract
+        )
+
+      refute Keyword.has_key?(opts, :current_subtask)
+
+      opts =
+        SymphonyElixir.AgentRunner.maybe_attach_current_subtask_contract(plan_unit,
+          workpad_text: "no plan section here"
+        )
+
+      refute Keyword.has_key?(opts, :current_subtask)
     end
   end
 end
