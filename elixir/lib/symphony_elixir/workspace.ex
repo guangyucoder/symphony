@@ -2,17 +2,37 @@ defmodule SymphonyElixir.Workspace do
   @moduledoc """
   Creates isolated per-issue workspaces for parallel Codex agents.
 
-  Per-dispatch cleanup relies on git for repo-owned state and reserves this
-  module's local cleanup list for a small set of tool caches that may exist even
-  outside git control.
+  Per-dispatch cleanup uses `git clean -fd` (tracked + untracked non-ignored
+  files) plus an explicit list of gitignored transient caches (`@excluded_entries`).
+  We do NOT use `-fdx` because it would also delete bootstrap-installed
+  dependencies (`node_modules`, `deps`, `_build`) whose `after_create` hook is
+  one-shot.
   """
 
   require Logger
   alias SymphonyElixir.{Config, Ledger}
 
+  # `git clean -fd` does NOT remove gitignored paths, so stale transient caches
+  # (e.g. Next.js `.next`, Android `build`/`.gradle`, `node_modules/.cache`) accumulate
+  # across dispatches unless we wipe them explicitly here. We intentionally DO NOT
+  # use `-fdx`: that would also destroy bootstrap-installed outputs (`node_modules`,
+  # `deps/`, `_build/`) whose `after_create` hook is one-shot, leaving subsequent
+  # dispatches without dependencies. The list below targets transient build outputs
+  # only; add entries here for new consumer-repo caches that should be nuked per
+  # dispatch.
   @excluded_entries [
+    # Elixir transient state
     ".elixir_ls",
-    "tmp"
+    "tmp",
+    # Next.js build artifacts
+    "apps/web/.next",
+    "apps/admin/.next",
+    # React Native native build caches
+    "mobile-app/ios/build",
+    "mobile-app/android/.gradle",
+    "mobile-app/android/build",
+    # JS package-manager caches (keep node_modules itself)
+    "node_modules/.cache"
   ]
   @session_meta_file ".symphony_session.json"
   @env_staleness_warning_table :symphony_workspace_env_staleness_warnings
@@ -350,7 +370,7 @@ defmodule SymphonyElixir.Workspace do
              :ok <-
                run_git_step(
                  workspace,
-                 ["clean", "-fdx", "-e", ".symphony/", "-e", ".env.sh", "-e", @session_meta_file],
+                 ["clean", "-fd", "-e", ".symphony/", "-e", ".env.sh", "-e", @session_meta_file],
                  "clean_untracked",
                  issue_context
                ) do

@@ -54,7 +54,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Path.basename(first_workspace) == "MT_Det"
   end
 
-  test "workspace reuses existing issue directory while only clearing local transient dirs" do
+  test "workspace reuses existing issue directory while clearing local transient dirs and caches" do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
@@ -95,8 +95,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       refute File.exists?(Path.join([second_workspace, "tmp", "scratch.txt"]))
       refute File.exists?(Path.join([second_workspace, ".elixir_ls", "project.plt"]))
-      assert File.read!(Path.join([second_workspace, "apps", "web", ".next", "build.txt"])) == "remove me too\n"
-      assert File.read!(Path.join([second_workspace, "node_modules", ".cache", "bundler.txt"])) == "remove cache\n"
+      refute File.exists?(Path.join([second_workspace, "apps", "web", ".next", "build.txt"]))
+      refute File.exists?(Path.join([second_workspace, "node_modules", ".cache", "bundler.txt"]))
     after
       File.rm_rf(workspace_root)
     end
@@ -768,7 +768,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "prepare_for_dispatch removes gitignored files during clean" do
+  test "prepare_for_dispatch wipes transient caches but preserves bootstrap-installed dirs" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -782,13 +782,29 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-IGNORED")
 
       init_git_repo!(workspace, %{
-        ".gitignore" => "node_modules/\n",
+        ".gitignore" => "node_modules/\ndeps/\n_build/\napps/web/.next/\n",
         "tracked.txt" => "tracked\n"
       })
 
-      ignored_file = Path.join([workspace, "node_modules", ".cache", "junk"])
-      File.mkdir_p!(Path.dirname(ignored_file))
-      File.write!(ignored_file, "remove me\n")
+      # Transient caches that @excluded_entries targets — must be wiped.
+      transient_cache = Path.join([workspace, "node_modules", ".cache", "junk"])
+      File.mkdir_p!(Path.dirname(transient_cache))
+      File.write!(transient_cache, "remove me\n")
+
+      next_build = Path.join([workspace, "apps", "web", ".next", "stale-chunk.js"])
+      File.mkdir_p!(Path.dirname(next_build))
+      File.write!(next_build, "stale\n")
+
+      # Bootstrap-installed outputs — must survive. after_create is one-shot;
+      # wiping these on redispatch would destroy dependencies installed by
+      # `pnpm install` / `mix deps.get`.
+      bootstrap_dep = Path.join([workspace, "node_modules", "react", "package.json"])
+      File.mkdir_p!(Path.dirname(bootstrap_dep))
+      File.write!(bootstrap_dep, "{}\n")
+
+      elixir_dep = Path.join([workspace, "deps", "jason", "mix.exs"])
+      File.mkdir_p!(Path.dirname(elixir_dep))
+      File.write!(elixir_dep, "defmodule Jason.MixProject do end\n")
 
       log =
         capture_log(fn ->
@@ -796,7 +812,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         end)
 
       assert log =~ "git fetch failed; continuing with reset to local HEAD"
-      refute File.exists?(ignored_file)
+
+      # Transient caches wiped via @excluded_entries.
+      refute File.exists?(transient_cache)
+      refute File.exists?(next_build)
+
+      # Bootstrap outputs preserved — regression guard for the -fdx trap.
+      assert File.exists?(bootstrap_dep)
+      assert File.exists?(elixir_dep)
     after
       File.rm_rf(test_root)
     end
