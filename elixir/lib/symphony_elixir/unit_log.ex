@@ -28,10 +28,10 @@ defmodule SymphonyElixir.UnitLog do
     {:ok, path}
   end
 
-  @doc "Write the prompt that was sent to the agent."
+  @doc "Write the full prompt that was sent to the agent, verbatim."
   @spec log_prompt(Path.t(), String.t()) :: :ok
   def log_prompt(path, prompt) do
-    append(path, "prompt", %{text: String.slice(prompt, 0, 4000)})
+    append(path, "prompt", %{text: prompt})
   end
 
   @doc "Write closeout result."

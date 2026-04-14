@@ -366,7 +366,7 @@ defmodule SymphonyElixir.PromptBuilder do
   defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}) do
     """
     ## Instructions — Rework Fix
-    This ticket was sent back for rework. All Linear comments on this ticket
+    This ticket was sent back for rework. Linear comments on this ticket
     are in the `<ticket_comments>` block above, sorted chronologically with
     author and timestamp. They include supervisor review findings and any
     other context posted on the ticket.
@@ -471,13 +471,17 @@ defmodule SymphonyElixir.PromptBuilder do
     "Follow the instructions for this unit."
   end
 
+  # "Do NOT expand scope" was removed here: for plan-N subtasks it was
+  # redundant with the Instructions ("Do NOT touch other subtasks"); for
+  # rework subtasks it actively contradicted "implement all fixes for
+  # MEDIUM and above severity findings", teaching agents to fix the
+  # loudest blocker and leave the rest.
   defp unit_guardrails(%Unit{kind: :implement_subtask}) do
     """
     ## Guardrails
     - Work only inside the current workspace.
     - Never commit/push from main/master.
     - Close stdin on long commands: append `< /dev/null`.
-    - Do NOT expand scope beyond this subtask.
     """
   end
 
