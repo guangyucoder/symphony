@@ -47,18 +47,136 @@ defmodule SymphonyElixir.WorkpadParserTest do
       {:ok, subtasks} = WorkpadParser.parse(@workpad_with_explicit_ids)
 
       assert length(subtasks) == 3
-      assert Enum.at(subtasks, 0) == %{id: "plan-1", text: "Add BorderDetector component", done: true}
-      assert Enum.at(subtasks, 1) == %{id: "plan-2", text: "Integrate into EditorScreen", done: false}
-      assert Enum.at(subtasks, 2) == %{id: "plan-3", text: "Add unit tests", done: false}
+      assert Enum.at(subtasks, 0) == %{id: "plan-1", text: "Add BorderDetector component", done: true, touch: [], accept: nil}
+      assert Enum.at(subtasks, 1) == %{id: "plan-2", text: "Integrate into EditorScreen", done: false, touch: [], accept: nil}
+      assert Enum.at(subtasks, 2) == %{id: "plan-3", text: "Add unit tests", done: false, touch: [], accept: nil}
     end
 
     test "parses workpad without explicit IDs, falls back to positional" do
       {:ok, subtasks} = WorkpadParser.parse(@workpad_without_ids)
 
       assert length(subtasks) == 3
-      assert Enum.at(subtasks, 0).id == "plan-1"
-      assert Enum.at(subtasks, 1).id == "plan-2"
-      assert Enum.at(subtasks, 2).id == "plan-3"
+      assert Enum.at(subtasks, 0) == %{id: "plan-1", text: "Add BorderDetector component", done: true, touch: [], accept: nil}
+      assert Enum.at(subtasks, 1) == %{id: "plan-2", text: "Integrate into EditorScreen", done: false, touch: [], accept: nil}
+      assert Enum.at(subtasks, 2) == %{id: "plan-3", text: "Add unit tests", done: false, touch: [], accept: nil}
+    end
+
+    test "parses both touch and accept continuation lines" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - touch: lib/a.ex, lib/b.ex
+        - accept: mix test test/symphony_elixir/workpad_parser_test.exs
+      """
+
+      assert {:ok, [%{touch: ["lib/a.ex", "lib/b.ex"], accept: "mix test test/symphony_elixir/workpad_parser_test.exs"}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "concatenates multiple touch lines and keeps the last non-empty accept line" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - touch: lib/a.ex, lib/b.ex
+        - accept: first acceptance
+        - touch: test/a_test.exs
+        - accept: final acceptance
+      """
+
+      assert {:ok, [%{touch: ["lib/a.ex", "lib/b.ex", "test/a_test.exs"], accept: "final acceptance"}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "parses only accept lines and preserves commas in accept text" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - accept: run focused tests, then do a quick smoke check
+      """
+
+      assert {:ok, [%{touch: [], accept: "run focused tests, then do a quick smoke check"}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "defaults touch to [] and accept to nil when continuation lines are absent" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Flat plan entry
+      """
+
+      assert {:ok, [%{touch: [], accept: nil}]} = WorkpadParser.parse(workpad)
+    end
+
+    test "trims extra whitespace around continuation keys and values" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+          -  touch:  lib/a.ex, test/a_test.exs
+          -  accept:   mix test
+      """
+
+      assert {:ok, [%{touch: ["lib/a.ex", "test/a_test.exs"], accept: "mix test"}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "matches continuation keys case-insensitively" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - Touch: lib/a.ex
+        - ACCEPT: mix test
+      """
+
+      assert {:ok, [%{touch: ["lib/a.ex"], accept: "mix test"}]} = WorkpadParser.parse(workpad)
+    end
+
+    test "accepts * bullets for checklist and continuation lines" do
+      workpad = """
+      ### Plan
+      * [ ] [plan-1] Wire parser
+        * touch: lib/a.ex
+        * accept: mix test
+      """
+
+      assert {:ok, [%{id: "plan-1", touch: ["lib/a.ex"], accept: "mix test"}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "keeps parsing plan items across #### subheadings inside the plan section" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] foo
+      #### Sub-note
+        - touch: lib/foo.ex
+        - accept: keep foo working
+      - [ ] [plan-2] bar
+      """
+
+      assert {:ok,
+              [
+                %{id: "plan-1", touch: ["lib/foo.ex"], accept: "keep foo working"},
+                %{id: "plan-2", text: "bar"}
+              ]} = WorkpadParser.parse(workpad)
+    end
+
+    test "ignores unknown continuation keys without leaking them into the contract" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - Note: rebase after foo
+      """
+
+      assert {:ok, [%{id: "plan-1", text: "Wire parser", touch: [], accept: nil}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "trims explicit checklist ids before returning them" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1 ] Wire parser
+      """
+
+      assert {:ok, [%{id: "plan-1", text: "Wire parser"}]} = WorkpadParser.parse(workpad)
     end
 
     test "returns error when no plan section" do
@@ -94,6 +212,7 @@ defmodule SymphonyElixir.WorkpadParserTest do
       - [x] [plan-1] Done
       - [x] [plan-2] Also done
       """
+
       assert WorkpadParser.next_pending(all_done) == nil
     end
   end
@@ -109,6 +228,7 @@ defmodule SymphonyElixir.WorkpadParserTest do
       - [x] [plan-1] Done
       - [x] [plan-2] Also done
       """
+
       assert WorkpadParser.all_done?(all_done)
     end
   end

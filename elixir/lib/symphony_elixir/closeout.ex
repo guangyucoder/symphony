@@ -4,7 +4,9 @@ defmodule SymphonyElixir.Closeout do
   exits normally. Determines whether the unit is accepted or needs retry.
 
   Closeout behavior per unit kind:
-  - `bootstrap`: check workspace ready, run baseline verify, mark bootstrapped
+  - `bootstrap`: check workspace ready, run baseline verify, mark bootstrapped on pass;
+    on baseline failure, still accept but record baseline_verify_failed flag + output
+    for downstream visibility
   - `plan`: check workpad has parseable checklist, bump plan_version
   - `implement_subtask`: check subtask marked done, doc-impact check
   - `doc_fix`: clear doc_fix_required flag
@@ -31,20 +33,20 @@ defmodule SymphonyElixir.Closeout do
   # --- Per-unit closeout ---
 
   defp do_closeout("bootstrap", workspace, _unit, _issue, _opts) do
-    # Mark bootstrapped
-    IssueExec.mark_bootstrapped(workspace)
-
     # Run baseline verification if commands are configured
     case Verifier.run_baseline(workspace) do
       :pass ->
+        IssueExec.clear_baseline_verify_failure(workspace)
+        IssueExec.mark_bootstrapped(workspace)
         Ledger.append(workspace, :baseline_verified, %{})
         :accepted
 
       {:fail, output} ->
+        truncated_output = truncate(output, 2048)
         Logger.warning("Closeout: baseline verification failed")
-        Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncate(output, 2048)})
-        # Baseline failure is not a blocker for bootstrap acceptance
-        # (agent may need to fix in implement phase)
+        IssueExec.set_baseline_verify_failure(workspace, truncated_output)
+        Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncated_output})
+        Ledger.append(workspace, :baseline_accepted_despite_failure, %{"output" => truncated_output})
         :accepted
     end
   end
@@ -108,20 +110,25 @@ defmodule SymphonyElixir.Closeout do
           "verify_fix_count" => 0,
           "merge_needs_verify" => false
         })
+
         :accepted
 
       {:fail, output} when attempt >= max_verify_attempts ->
         # Escalate — exhausted all attempts including verify-fix cycles.
         Logger.warning("Closeout: verify exhausted #{attempt} attempts, failing")
+
         Ledger.append(workspace, :verify_exhausted, %{
           "attempt" => attempt,
           "last_error" => truncate(output, 512)
         })
 
         issue_id = issue_id(issue)
+
         if is_binary(issue_id) do
-          Adapter.create_comment(issue_id,
-            "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff.")
+          Adapter.create_comment(
+            issue_id,
+            "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff."
+          )
         end
 
         # Clear verify_error but keep current_unit set so replay_current_unit_rule
@@ -138,15 +145,18 @@ defmodule SymphonyElixir.Closeout do
         if fix_count < max_verify_fix_cycles do
           truncated_error = truncate(output, 1500)
           IssueExec.set_verify_error(workspace, truncated_error)
+
           IssueExec.update(workspace, %{
             "current_unit" => nil,
             "verify_fix_count" => fix_count + 1
           })
+
           Ledger.append(workspace, :verify_failed_will_fix, %{
             "attempt" => attempt,
             "fix_cycle" => fix_count + 1,
             "error" => truncate(output, 512)
           })
+
           {:retry, "Verification failed (verify-fix ##{fix_count + 1} will be dispatched): #{truncate(output, 1024)}"}
         else
           # No more fix cycles — plain retry, will exhaust on next attempt
@@ -171,7 +181,7 @@ defmodule SymphonyElixir.Closeout do
     end
   end
 
-  defp do_closeout("merge", workspace, _unit, issue, opts) do
+  defp do_closeout("merge", workspace, _unit, _issue, opts) do
     checker = Keyword.get(opts, :merge_checker, &Verifier.check_pr_merged/1)
 
     case checker.(workspace) do
@@ -183,6 +193,7 @@ defmodule SymphonyElixir.Closeout do
           "mergeability_unknown_count" => 0,
           "merge_needs_verify" => false
         })
+
         :accepted
 
       {:not_merged, reason} ->
@@ -190,25 +201,15 @@ defmodule SymphonyElixir.Closeout do
         {:retry, "PR not merged: #{reason}"}
 
       :unknown ->
-        # Cannot determine PR state (e.g., gh CLI not available).
-        # Accept to avoid blocking, but log, record in ledger, and alert human.
-        Logger.warning("Closeout: cannot verify PR merge status, accepting")
+        Logger.warning("Closeout: cannot verify PR merge status, retrying")
         Ledger.append(workspace, :merge_status_unknown, %{})
-
-        issue_id = issue_id(issue)
-        if is_binary(issue_id) do
-          Adapter.create_comment(issue_id,
-            "**Merge status unknown**: could not verify PR merge state (gh CLI unavailable or timed out).\nAccepting merge — please verify manually that the PR was merged.")
-        end
-
-        IssueExec.update(workspace, %{"phase" => "done"})
-        :accepted
+        {:retry, "merge status unverified"}
     end
   end
 
   defp do_closeout(kind, _workspace, _unit, _issue, _opts) do
     Logger.warning("Closeout: unknown unit kind #{kind}")
-    :accepted
+    {:fail, "unknown unit kind: #{kind}"}
   end
 
   # --- Helpers ---
@@ -233,32 +234,24 @@ defmodule SymphonyElixir.Closeout do
   defp handle_rework_closeout(workspace, subtask_id, issue, opts) do
     cond do
       Keyword.get(opts, :linear_fetch_ok, true) == false ->
-        Logger.warning(
-          "Closeout: rework #{subtask_id} dispatched without fresh Linear comments — will retry"
-        )
+        Logger.warning("Closeout: rework #{subtask_id} dispatched without fresh Linear comments — will retry")
 
         {:retry, "rework #{subtask_id}: linear comment fetch failed at dispatch"}
 
       Keyword.get(opts, :rework_has_review_context, true) == false ->
-        Logger.warning(
-          "Closeout: rework #{subtask_id} had no review context (only workpad or empty) — will retry"
-        )
+        Logger.warning("Closeout: rework #{subtask_id} had no review context (only workpad or empty) — will retry")
 
         {:retry, "rework #{subtask_id}: no review context in Linear comments"}
 
       true ->
         case commit_advancement_state(workspace, opts) do
           :unchanged ->
-            Logger.warning(
-              "Closeout: rework #{subtask_id} produced no commit (head unchanged since dispatch)"
-            )
+            Logger.warning("Closeout: rework #{subtask_id} produced no commit (head unchanged since dispatch)")
 
             {:retry, "rework #{subtask_id}: produced no commit"}
 
           :cannot_verify ->
-            Logger.warning(
-              "Closeout: rework #{subtask_id} cannot verify HEAD state (git lookup returned nil)"
-            )
+            Logger.warning("Closeout: rework #{subtask_id} cannot verify HEAD state (git lookup returned nil)")
 
             {:retry, "rework #{subtask_id}: cannot verify HEAD state"}
 
@@ -282,13 +275,10 @@ defmodule SymphonyElixir.Closeout do
             "fix edits may be sitting as uncommitted WIP"
         )
 
-        {:retry,
-         "verify-fix #{subtask_id}: produced no commit (edits likely uncommitted WIP)"}
+        {:retry, "verify-fix #{subtask_id}: produced no commit (edits likely uncommitted WIP)"}
 
       :cannot_verify ->
-        Logger.warning(
-          "Closeout: verify-fix #{subtask_id} cannot verify HEAD state (git lookup returned nil)"
-        )
+        Logger.warning("Closeout: verify-fix #{subtask_id} cannot verify HEAD state (git lookup returned nil)")
 
         {:retry, "verify-fix #{subtask_id}: cannot verify HEAD state"}
 
