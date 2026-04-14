@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, WorkpadParser, Workspace}
+  alias SymphonyElixir.{Closeout, Config, DispatchResolver, IssueExec, Ledger, Linear.Adapter, Linear.Issue, PromptBuilder, Tracker, Unit, UnitLog, Verifier, Workspace}
 
   @doc """
   Unit-lite mode: resolve the next unit, run a single fresh Codex session for it,
@@ -13,16 +13,33 @@ defmodule SymphonyElixir.AgentRunner do
   """
   @spec run_unit_lite(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run_unit_lite(issue, codex_update_recipient \\ nil, opts \\ []) do
-    case Workspace.create_for_issue(issue) do
-      {:ok, workspace} ->
-        Workspace.ensure_symphony_dir(workspace)
-        run_unit_lite_in_workspace(workspace, issue, codex_update_recipient, opts)
+    case Workspace.create_for_issue_with_status(issue) do
+      {:ok, workspace, created?} ->
+        with :ok <- maybe_prepare_workspace_for_dispatch(workspace, issue, created?),
+             :ok <- Workspace.ensure_symphony_dir(workspace),
+             :ok <- run_unit_lite_in_workspace(workspace, issue, codex_update_recipient, opts) do
+          :ok
+        else
+          {:error, reason} ->
+            Logger.error("unit_lite: run failed for #{issue_context(issue)}: #{inspect(reason)}")
+            raise RuntimeError, "unit_lite run failed: #{inspect(reason)}"
+        end
 
       {:error, reason} ->
         Logger.error("unit_lite: workspace creation failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "unit_lite workspace failed: #{inspect(reason)}"
     end
   end
+
+  defp maybe_prepare_workspace_for_dispatch(workspace, issue, false) do
+    if Config.unit_lite?() do
+      Workspace.prepare_for_dispatch(workspace, issue)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_prepare_workspace_for_dispatch(_workspace, _issue, true), do: :ok
 
   defp run_unit_lite_in_workspace(workspace, issue, codex_update_recipient, opts) do
     # 1. Initialize issue_exec if needed
@@ -133,11 +150,16 @@ defmodule SymphonyElixir.AgentRunner do
 
     case DispatchResolver.resolve(ctx) do
       {:dispatch, %Unit{kind: :merge} = unit} ->
-        execute_merge_programmatic(workspace, issue, unit, codex_update_recipient, opts)
+        with_dispatch_hooks(workspace, issue, fn ->
+          execute_merge_programmatic(workspace, issue, unit, codex_update_recipient, opts)
+        end)
 
       {:dispatch, unit} ->
         Logger.info("unit_lite: dispatching #{unit.display_name} (effort=#{unit.reasoning_effort}) for #{issue_context(issue)}")
-        execute_unit(workspace, issue, unit, codex_update_recipient, opts)
+
+        with_dispatch_hooks(workspace, issue, fn ->
+          execute_unit(workspace, issue, unit, codex_update_recipient, opts)
+        end)
 
       {:stop, :circuit_breaker} ->
         Logger.error("unit_lite: circuit breaker tripped for #{issue_context(issue)}")
@@ -210,15 +232,11 @@ defmodule SymphonyElixir.AgentRunner do
       reasoning_effort: unit.reasoning_effort
     })
 
-    # Run before_run hook
-    Workspace.run_before_run_hook(workspace, issue)
-
     # For rework-* and verify-fix-* subtasks: snapshot HEAD (for closeout
     # zero-commit guard). For rework-* additionally fetch all Linear comments
     # (for prompt injection). Orchestrator-owned ingestion — do not rely on
     # the agent to fetch review context or self-report commit state.
     opts = enrich_opts_for_commit_guarded_subtask(workspace, issue, unit, opts)
-    opts = maybe_attach_current_subtask_contract(unit, opts)
 
     # Build prompt
     prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
@@ -240,111 +258,117 @@ defmodule SymphonyElixir.AgentRunner do
       UnitLog.log_codex_event(unit_log_path, message)
     end
 
-    try do
-      case AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort) do
-        {:ok, session} ->
-          try do
-            case AppServer.run_turn(
-                   session,
-                   prompt,
-                   issue,
-                   on_message: token_tracking_handler
-                 ) do
-              {:ok, _turn_session} ->
-                Logger.info("unit_lite: worker finished #{unit.display_name} for #{issue_context(issue)}")
+    case AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort) do
+      {:ok, session} ->
+        try do
+          case AppServer.run_turn(
+                 session,
+                 prompt,
+                 issue,
+                 on_message: token_tracking_handler
+               ) do
+            {:ok, _turn_session} ->
+              Logger.info("unit_lite: worker finished #{unit.display_name} for #{issue_context(issue)}")
 
-                # Run closeout — this is where verification, doc-impact, and
-                # acceptance checks actually happen. Without this, all protection
-                # mechanisms are dead code.
-                closeout_opts =
-                  Keyword.take(opts, [
-                    :workpad_text,
-                    :dispatch_head,
-                    :linear_fetch_ok,
-                    :rework_has_review_context
-                  ])
+              # Run closeout — this is where verification, doc-impact, and
+              # acceptance checks actually happen. Without this, all protection
+              # mechanisms are dead code.
+              closeout_opts =
+                Keyword.take(opts, [
+                  :workpad_text,
+                  :dispatch_head,
+                  :linear_fetch_ok,
+                  :rework_has_review_context
+                ])
 
-                unit_map = Unit.to_map(unit)
+              unit_map = Unit.to_map(unit)
 
-                unit_token_stats = read_token_counter(token_counter)
+              unit_token_stats = read_token_counter(token_counter)
 
-                closeout_result = Closeout.run(workspace, unit_map, issue, closeout_opts)
-                UnitLog.log_closeout(unit_log_path, closeout_result, unit_token_stats)
+              closeout_result = Closeout.run(workspace, unit_map, issue, closeout_opts)
+              UnitLog.log_closeout(unit_log_path, closeout_result, unit_token_stats)
 
-                case closeout_result do
-                  :accepted ->
-                    commit_sha = current_git_head(workspace)
-                    IssueExec.accept_unit(workspace)
+              case closeout_result do
+                :accepted ->
+                  commit_sha = current_git_head(workspace)
+                  IssueExec.accept_unit(workspace)
 
-                    if commit_sha do
-                      IssueExec.set_commit_sha(workspace, commit_sha)
-                    end
+                  if commit_sha do
+                    IssueExec.set_commit_sha(workspace, commit_sha)
+                  end
 
-                    Ledger.unit_accepted(workspace, unit_map, %{"commit" => commit_sha})
-                    Ledger.unit_tokens(workspace, unit_map, unit_token_stats)
+                  Ledger.unit_accepted(workspace, unit_map, %{"commit" => commit_sha})
+                  Ledger.unit_tokens(workspace, unit_map, unit_token_stats)
 
-                    # Notify orchestrator so dashboard shows completed stage history
-                    send_codex_update(codex_update_recipient, issue, %{
-                      event: :unit_completed,
-                      timestamp: DateTime.utc_now(),
-                      unit_kind: to_string(unit.kind),
-                      unit_display_name: unit.display_name,
-                      reasoning_effort: unit.reasoning_effort,
-                      unit_tokens: unit_token_stats,
-                      closeout_result: :accepted
-                    })
+                  # Notify orchestrator so dashboard shows completed stage history
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: :accepted
+                  })
 
-                    Logger.info("unit_lite: accepted #{unit.display_name} tokens=#{unit_token_stats[:total_tokens]}")
-                    :ok
+                  Logger.info("unit_lite: accepted #{unit.display_name} tokens=#{unit_token_stats[:total_tokens]}")
+                  :ok
 
-                  {:retry, reason} ->
-                    Logger.warning("unit_lite: closeout retry for #{unit.display_name}: #{reason}")
-                    Ledger.unit_failed(workspace, unit_map, reason)
+                {:retry, reason} ->
+                  Logger.warning("unit_lite: closeout retry for #{unit.display_name}: #{reason}")
+                  Ledger.unit_failed(workspace, unit_map, reason)
 
-                    send_codex_update(codex_update_recipient, issue, %{
-                      event: :unit_completed,
-                      timestamp: DateTime.utc_now(),
-                      unit_kind: to_string(unit.kind),
-                      unit_display_name: unit.display_name,
-                      reasoning_effort: unit.reasoning_effort,
-                      unit_tokens: unit_token_stats,
-                      closeout_result: {:retry, reason}
-                    })
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: {:retry, reason}
+                  })
 
-                    :ok
+                  :ok
 
-                  {:fail, reason} ->
-                    Logger.error("unit_lite: closeout rejected #{unit.display_name}: #{reason}")
-                    Ledger.unit_failed(workspace, unit_map, reason)
+                {:fail, reason} ->
+                  Logger.error("unit_lite: closeout rejected #{unit.display_name}: #{reason}")
+                  Ledger.unit_failed(workspace, unit_map, reason)
 
-                    send_codex_update(codex_update_recipient, issue, %{
-                      event: :unit_completed,
-                      timestamp: DateTime.utc_now(),
-                      unit_kind: to_string(unit.kind),
-                      unit_display_name: unit.display_name,
-                      reasoning_effort: unit.reasoning_effort,
-                      unit_tokens: unit_token_stats,
-                      closeout_result: {:fail, reason}
-                    })
+                  send_codex_update(codex_update_recipient, issue, %{
+                    event: :unit_completed,
+                    timestamp: DateTime.utc_now(),
+                    unit_kind: to_string(unit.kind),
+                    unit_display_name: unit.display_name,
+                    reasoning_effort: unit.reasoning_effort,
+                    unit_tokens: unit_token_stats,
+                    closeout_result: {:fail, reason}
+                  })
 
-                    raise RuntimeError, "unit_lite closeout rejected: #{reason}"
-                end
+                  raise RuntimeError, "unit_lite closeout rejected: #{reason}"
+              end
 
-              {:error, reason} ->
-                Logger.error("unit_lite: turn failed for #{unit.display_name}: #{inspect(reason)}")
-                UnitLog.log_error(unit_log_path, inspect(reason))
-                Ledger.unit_failed(workspace, Unit.to_map(unit), inspect(reason))
-                raise RuntimeError, "unit_lite turn failed: #{inspect(reason)}"
-            end
-          after
-            AppServer.stop_session(session)
+            {:error, reason} ->
+              Logger.error("unit_lite: turn failed for #{unit.display_name}: #{inspect(reason)}")
+              UnitLog.log_error(unit_log_path, inspect(reason))
+              Ledger.unit_failed(workspace, Unit.to_map(unit), inspect(reason))
+              raise RuntimeError, "unit_lite turn failed: #{inspect(reason)}"
           end
+        after
+          AppServer.stop_session(session)
+        end
 
-        {:error, reason} ->
-          Logger.error("unit_lite: session start failed for #{unit.display_name}: #{inspect(reason)}")
-          UnitLog.log_error(unit_log_path, "session_start_failed: #{inspect(reason)}")
-          Ledger.unit_failed(workspace, Unit.to_map(unit), "session_start_failed: #{inspect(reason)}")
-          raise RuntimeError, "unit_lite session start failed: #{inspect(reason)}"
+      {:error, reason} ->
+        Logger.error("unit_lite: session start failed for #{unit.display_name}: #{inspect(reason)}")
+        UnitLog.log_error(unit_log_path, "session_start_failed: #{inspect(reason)}")
+        Ledger.unit_failed(workspace, Unit.to_map(unit), "session_start_failed: #{inspect(reason)}")
+        raise RuntimeError, "unit_lite session start failed: #{inspect(reason)}"
+    end
+  end
+
+  defp with_dispatch_hooks(workspace, issue, fun) do
+    try do
+      with :ok <- Workspace.run_before_run_hook(workspace, issue) do
+        fun.()
       end
     after
       Workspace.run_after_run_hook(workspace, issue)
@@ -930,8 +954,8 @@ defmodule SymphonyElixir.AgentRunner do
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     Logger.info("Starting agent run for #{issue_context(issue)}")
 
-    case Workspace.create_for_issue(issue) do
-      {:ok, workspace} ->
+    case Workspace.create_for_issue_with_status(issue) do
+      {:ok, workspace, _created?} ->
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue),
                :ok <- run_codex_turns(workspace, issue, codex_update_recipient, opts) do
@@ -1258,31 +1282,6 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp enrich_opts_for_commit_guarded_subtask(_workspace, _issue, _unit, opts), do: opts
-
-  defp maybe_attach_current_subtask_contract(
-         %Unit{kind: :implement_subtask, subtask_id: subtask_id},
-         opts
-       ) do
-    if regular_implement_subtask_id?(subtask_id) do
-      with workpad_text when is_binary(workpad_text) <- Keyword.get(opts, :workpad_text),
-           {:ok, subtasks} <- WorkpadParser.parse(workpad_text),
-           %{} = current_subtask <- Enum.find(subtasks, &(&1.id == subtask_id)) do
-        Keyword.put(opts, :current_subtask, current_subtask)
-      else
-        _ -> opts
-      end
-    else
-      opts
-    end
-  end
-
-  defp maybe_attach_current_subtask_contract(_unit, opts), do: opts
-
-  defp regular_implement_subtask_id?(subtask_id) when is_binary(subtask_id) do
-    not String.starts_with?(subtask_id, "rework-") and
-      not String.starts_with?(subtask_id, "verify-fix-") and
-      not String.starts_with?(subtask_id, "merge-sync-")
-  end
 
   defp enrich_opts_for_rework(workspace, issue, %Unit{subtask_id: "rework-" <> _}, opts) do
     dispatch_head = current_git_head(workspace)
