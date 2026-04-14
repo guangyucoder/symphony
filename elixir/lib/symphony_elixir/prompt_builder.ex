@@ -120,11 +120,17 @@ defmodule SymphonyElixir.PromptBuilder do
     |> String.replace("<workpad>", "<workpad_filtered>")
   end
 
-  # Size budgets: keep the ticket_comments block bounded so it doesn't blow the
-  # project's <2000-char unit-prompt convention on long-running tickets. On
-  # overflow, drop oldest comments first; within a kept comment, truncate the
-  # body tail.
-  @max_comment_body_chars 2048
+  # Size budget: total ticket_comments block is capped at 10KB, and on overflow
+  # we drop oldest comments first (newer comments supersede older ones per the
+  # rework instructions). Per-comment cap is set just below the total so a
+  # single huge comment still fits with a truncation marker rather than being
+  # silently dropped by the total-budget check (which counts rendered size
+  # including the `<comment ...>` wrapper). Supervisor review comments are
+  # naturally information-dense (multi-finding lists with file:line refs) and
+  # routinely run 5-8KB, so a previous 2KB per-comment cap was slicing the
+  # actionable tail — see ENT-171 round 4 where the `scan-workbench.test.ts`
+  # file:line references were cut mid-enumeration and silently missed.
+  @max_comment_body_chars 9_216
   @max_ticket_comments_bytes 10_240
 
   defp render_ticket_comments(comments) do

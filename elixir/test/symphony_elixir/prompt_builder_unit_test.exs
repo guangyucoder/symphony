@@ -199,16 +199,17 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       assert prompt =~ "no-timestamp"
     end
 
-    test "truncates per-comment body over 2KB" do
+    test "truncates a single comment body larger than the per-comment cap" do
       unit = Unit.implement_subtask("rework-1")
-      huge_body = String.duplicate("x", 5000)
+      # Per-comment cap is 9216; use a body safely above it so truncation fires.
+      huge_body = String.duplicate("x", 12_000)
       comments = [comment(body: huge_body)]
 
       prompt = PromptBuilder.build_unit_prompt(@issue, unit, linear_comments: comments)
 
       assert prompt =~ "comment body truncated"
-      # Huge body shouldn't appear in full.
-      refute prompt =~ String.duplicate("x", 3000)
+      # The full huge body must not appear verbatim.
+      refute prompt =~ String.duplicate("x", 11_000)
     end
 
     test "drops oldest comments when total exceeds 10KB budget" do
