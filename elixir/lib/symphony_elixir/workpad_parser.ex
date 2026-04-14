@@ -12,6 +12,13 @@ defmodule SymphonyElixir.WorkpadParser do
 
   Falls back to positional IDs (plan-1, plan-2, ...) when explicit IDs
   are missing.
+
+  Continuation-line semantics are intentionally asymmetric:
+  - Multiple `touch:` lines concatenate their comma-split paths.
+  - Multiple `accept:` lines keep the last non-empty value.
+
+  Plan authors: merge acceptance criteria onto one `accept:` line when the
+  intent is a single criterion.
   """
 
   @type subtask :: %{
@@ -26,7 +33,7 @@ defmodule SymphonyElixir.WorkpadParser do
   @explicit_id_pattern ~r/^\s*[-*]\s+\[([ xX])\]\s+\[([^\]]+)\]\s+(.+)$/
   # Matches: - [x] text  OR  * [ ] text (no explicit ID)
   @implicit_id_pattern ~r/^\s*[-*]\s+\[([ xX])\]\s+(.+)$/
-  @continuation_pattern ~r/^\s+[-*]\s+([[:alpha:]]+)\s*:\s*(.*?)\s*$/
+  @continuation_pattern ~r/^\s+[-*]\s+(touch|accept)\s*:\s*(.*?)\s*$/i
 
   @doc """
   Parse workpad text and extract subtask checklist from the `### Plan` section.
@@ -81,8 +88,8 @@ defmodule SymphonyElixir.WorkpadParser do
   # --- Private ---
 
   defp extract_plan_section(text) do
-    # Find ### Plan header, capture until next ### or end
-    case Regex.run(~r/###\s*Plan\s*\n(.*?)(?=\n###|\z)/s, text) do
+    # Find ### Plan header, capture until the next level-3 heading or end.
+    case Regex.run(~r/###\s*Plan\s*\n(.*?)(?=\n###(?!#)|\z)/s, text) do
       [_, section] -> String.trim(section)
       _ -> nil
     end
@@ -135,7 +142,7 @@ defmodule SymphonyElixir.WorkpadParser do
       match = Regex.run(@explicit_id_pattern, line) ->
         [_, check, id, text] = match
 
-        %{id: id, text: String.trim(text), done: checked?(check)}
+        %{id: String.trim(id), text: String.trim(text), done: checked?(check)}
         |> Map.merge(contract)
 
       # Fall back to implicit ID: - [x] text
@@ -206,7 +213,7 @@ defmodule SymphonyElixir.WorkpadParser do
   end
 
   defp continuation_line?(line), do: Regex.match?(@continuation_pattern, line)
-  defp heading_line?(line), do: Regex.match?(~r/^\s*###/, line)
+  defp heading_line?(line), do: Regex.match?(~r/^\s*###(?!#)/, line)
 
   defp checked?(check), do: check in ["x", "X"]
 end

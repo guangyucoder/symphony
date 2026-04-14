@@ -411,9 +411,12 @@ defmodule SymphonyElixir.PromptBuilder do
 
     The current Codex Workpad (if any) is in the `<workpad>` block above. Before
     starting, read it:
-    - Look at the `[#{id}]` entry under `### Plan`. If the plan author added
-      `touch:` and `accept:` sub-lines, scope your work to those paths and aim
-      at that accept criterion; otherwise follow the subtask title above.
+    - Look at the `[#{id}]` entry under `### Plan` for context. If a
+      `<subtask_contract>` block appears below, treat it as the orchestrator's
+      authoritative parse of that entry and prefer it over manually re-reading
+      `touch:` / `accept:` sub-lines. If no contract block is present, read any
+      `touch:` / `accept:` sub-lines directly from the workpad entry; otherwise
+      follow the subtask title above.
     - Read any prior continuation notes under `### Notes` (entries named
       `#### [plan-N] continuation`) so you know what earlier subtasks changed
       and which gotchas they flagged. Do not re-do exploration that a prior
@@ -507,9 +510,14 @@ defmodule SymphonyElixir.PromptBuilder do
         nil
 
       _ ->
+        body =
+          lines
+          |> Enum.join("\n")
+          |> sanitize_contract_body()
+
         """
         <subtask_contract>
-        #{Enum.join(lines, "\n")}
+        #{body}
         </subtask_contract>
         """
     end
@@ -531,6 +539,14 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   defp render_accept_line(_), do: nil
+
+  # Defense-in-depth: plan authors can paste arbitrary text into continuation
+  # lines, so neutralize literal wrapper tags before rendering the block.
+  defp sanitize_contract_body(body) do
+    body
+    |> String.replace("</subtask_contract>", "</subtask_contract_filtered>")
+    |> String.replace("<subtask_contract>", "<subtask_contract_filtered>")
+  end
 
   # "Do NOT expand scope" was removed here: for plan-N subtasks it was
   # redundant with the Instructions ("Do NOT touch other subtasks"); for

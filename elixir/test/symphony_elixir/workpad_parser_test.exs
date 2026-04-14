@@ -73,15 +73,17 @@ defmodule SymphonyElixir.WorkpadParserTest do
                WorkpadParser.parse(workpad)
     end
 
-    test "parses only touch lines and merges multiple touch continuations" do
+    test "concatenates multiple touch lines and keeps the last non-empty accept line" do
       workpad = """
       ### Plan
       - [ ] [plan-1] Wire parser
         - touch: lib/a.ex, lib/b.ex
+        - accept: first acceptance
         - touch: test/a_test.exs
+        - accept: final acceptance
       """
 
-      assert {:ok, [%{touch: ["lib/a.ex", "lib/b.ex", "test/a_test.exs"], accept: nil}]} =
+      assert {:ok, [%{touch: ["lib/a.ex", "lib/b.ex", "test/a_test.exs"], accept: "final acceptance"}]} =
                WorkpadParser.parse(workpad)
     end
 
@@ -138,6 +140,43 @@ defmodule SymphonyElixir.WorkpadParserTest do
 
       assert {:ok, [%{id: "plan-1", touch: ["lib/a.ex"], accept: "mix test"}]} =
                WorkpadParser.parse(workpad)
+    end
+
+    test "keeps parsing plan items across #### subheadings inside the plan section" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] foo
+      #### Sub-note
+        - touch: lib/foo.ex
+        - accept: keep foo working
+      - [ ] [plan-2] bar
+      """
+
+      assert {:ok,
+              [
+                %{id: "plan-1", touch: ["lib/foo.ex"], accept: "keep foo working"},
+                %{id: "plan-2", text: "bar"}
+              ]} = WorkpadParser.parse(workpad)
+    end
+
+    test "ignores unknown continuation keys without leaking them into the contract" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1] Wire parser
+        - Note: rebase after foo
+      """
+
+      assert {:ok, [%{id: "plan-1", text: "Wire parser", touch: [], accept: nil}]} =
+               WorkpadParser.parse(workpad)
+    end
+
+    test "trims explicit checklist ids before returning them" do
+      workpad = """
+      ### Plan
+      - [ ] [plan-1 ] Wire parser
+      """
+
+      assert {:ok, [%{id: "plan-1", text: "Wire parser"}]} = WorkpadParser.parse(workpad)
     end
 
     test "returns error when no plan section" do
