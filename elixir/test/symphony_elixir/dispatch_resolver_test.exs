@@ -288,5 +288,33 @@ defmodule SymphonyElixir.DispatchResolverTest do
       }))
       assert {:stop, :circuit_breaker} = result
     end
+
+    # Regression: verify-fix replay must re-inject verify_error as
+    # subtask_text. Without this, `Unit.to_map/1` drops subtask_text on
+    # write, replay rebuilds with text=nil, and PromptBuilder renders
+    # "(no error output captured)" — leaving the agent blind on retry.
+    test "replays verify-fix with verify_error re-injected as subtask_text" do
+      exec =
+        %{@default_exec |
+          "bootstrapped" => true,
+          "current_unit" => %{
+            "kind" => "implement_subtask",
+            "subtask_id" => "verify-fix-1",
+            "attempt" => 1
+          }
+        }
+        |> Map.put("verify_error", "FooTest line 42: assertion failed")
+
+      assert {:dispatch, %Unit{
+                kind: :implement_subtask,
+                subtask_id: "verify-fix-1",
+                subtask_text: "FooTest line 42: assertion failed",
+                attempt: 2
+              }} =
+               DispatchResolver.resolve(ctx(%{
+                 exec: exec,
+                 workpad_text: @workpad_with_pending
+               }))
+    end
   end
 end

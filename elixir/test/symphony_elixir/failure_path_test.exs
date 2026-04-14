@@ -117,12 +117,25 @@ defmodule SymphonyElixir.FailurePathTest do
         "failed verify must NOT set verified_sha — handoff must be blocked"
     end
 
-    test "verify_error is cleared by verify-fix closeout", %{workspace: ws} do
+    test "verify_error is cleared by verify-fix closeout when HEAD advanced",
+         %{workspace: ws} do
       IssueExec.set_verify_error(ws, "some test failure")
+
+      # Capture dispatch_head before the agent runs, then simulate the agent
+      # committing a fix. The commit-advancement guard requires this path —
+      # without a new commit, the closeout retries rather than clearing state.
+      {dispatch_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: ws)
+      dispatch_head = String.trim(dispatch_head)
+
+      File.write!(Path.join(ws, "verify_fix.txt"), "fix\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com",
+                          "commit", "-m", "verify-fix"], cd: ws)
 
       unit = %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}
       IssueExec.start_unit(ws, unit)
-      Closeout.run(ws, unit, @issue)
+      assert :accepted =
+               Closeout.run(ws, unit, @issue, dispatch_head: dispatch_head)
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["verify_error"] == nil, "verify-fix must clear verify_error"
@@ -241,7 +254,7 @@ defmodule SymphonyElixir.FailurePathTest do
   #            and survive intermediate doc_fix/verify units.
   # ──────────────────────────────────────────────────────────────────
 
-  describe "rework_fix_applied lifecycle" do
+  describe "commit-advancement guards (rework_fix_applied + verify-fix)" do
     setup do
       workspace = Path.join(System.tmp_dir!(), "rework_flag_#{System.unique_integer([:positive])}")
       File.mkdir_p!(Path.join(workspace, ".symphony"))
@@ -411,6 +424,85 @@ defmodule SymphonyElixir.FailurePathTest do
       {:ok, exec} = IssueExec.read(ws)
       assert exec["rework_fix_applied"] == true,
         "doc_fix must NOT clear rework_fix_applied — it's part of the same cycle"
+    end
+
+    # ────────────────────────────────────────────────────────────────
+    # verify-fix commit-advancement guard. Same shape as the rework
+    # guard above: closeout must reject the unit when the agent made
+    # no commit, so `verify` does not re-run against the same stale
+    # SHA (ENT-172 incident: Codex wrote the fix as uncommitted WIP,
+    # closeout silently accepted the unchanged SHA, then three verify
+    # replays on the same code tripped the circuit breaker).
+    # ────────────────────────────────────────────────────────────────
+
+    test "verify-fix closeout accepts when HEAD advanced since dispatch",
+         %{workspace: ws, dispatch_head: dispatch_head} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"verify_error" => "prior verify failed", "verify_attempt" => 2})
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # Simulate agent committing the fix.
+      File.write!(Path.join(ws, "fix.txt"), "fix\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "verify-fix commit"], cd: ws)
+
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "In Progress"},
+          dispatch_head: dispatch_head
+        )
+
+      assert result == :accepted
+      # verify_error + verify_attempt reset so the next `verify` starts fresh.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_error"] == nil
+      assert exec["verify_attempt"] == 0
+    end
+
+    test "verify-fix closeout returns {:retry, _} when HEAD unchanged since dispatch",
+         %{workspace: ws, dispatch_head: dispatch_head} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"verify_error" => "prior verify failed"})
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}
+      IssueExec.start_unit(ws, unit)
+
+      # Agent edited files but never committed — HEAD still at dispatch_head.
+      File.write!(Path.join(ws, "wip.txt"), "uncommitted edit\n")
+
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "In Progress"},
+          dispatch_head: dispatch_head
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "produced no commit"
+      # verify_error must still be set so the resolver re-dispatches verify-fix.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["verify_error"] == "prior verify failed"
+    end
+
+    test "verify-fix closeout returns {:retry, _} when dispatch_head missing (fail-closed)",
+         %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"verify_error" => "prior verify failed"})
+      unit = %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}
+      IssueExec.start_unit(ws, unit)
+
+      result =
+        Closeout.run(
+          ws,
+          unit,
+          %{id: "test", identifier: "T-1", title: "T", state: "In Progress"}
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "cannot verify HEAD state"
     end
 
     test "flag blocks redundant rework fix dispatch" do

@@ -46,6 +46,24 @@ defmodule SymphonyElixir.Verifier do
     end
   end
 
+  @doc "Return `git status -sb --porcelain=v1` output, or nil on failure. Diagnostic only."
+  @spec git_status(Path.t()) :: String.t() | nil
+  def git_status(workspace) do
+    case run_git(workspace, ["status", "-sb", "--porcelain=v1"], 5_000) do
+      {:ok, out} -> String.trim(out)
+      _ -> nil
+    end
+  end
+
+  @doc "Return `git diff HEAD --stat` output, or nil on failure. Diagnostic only."
+  @spec git_diff_stat(Path.t()) :: String.t() | nil
+  def git_diff_stat(workspace) do
+    case run_git(workspace, ["diff", "HEAD", "--stat"], 5_000) do
+      {:ok, out} -> String.trim(out)
+      _ -> nil
+    end
+  end
+
   @pr_check_timeout_ms 15_000
   @merge_timeout_ms 60_000
 

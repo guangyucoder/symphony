@@ -118,7 +118,7 @@ defmodule SymphonyElixir.DispatchResolver do
         subtask_id = unit["subtask_id"]
 
         base_unit = case {kind, subtask_id} do
-          {:implement_subtask, id} -> Unit.implement_subtask(id)
+          {:implement_subtask, id} -> Unit.implement_subtask(id, replay_subtask_text(id, exec))
           {:bootstrap, _} -> Unit.bootstrap()
           {:plan, _} -> Unit.plan()
           {:doc_fix, _} -> Unit.doc_fix()
@@ -135,6 +135,25 @@ defmodule SymphonyElixir.DispatchResolver do
   end
 
   defp replay_current_unit_rule(_), do: nil
+
+  # On replay, `Unit.to_map/1` does not persist `subtask_text`, so a
+  # naive rebuild loses the dispatch-time payload. For verify-fix-* that
+  # payload is the verify error output — without it the prompt shows
+  # "(no error output captured)" and the agent retries blind. Re-inject
+  # from the canonical source (`exec.verify_error`) when we're rebuilding
+  # a verify-fix unit.
+  defp replay_subtask_text(id, exec)
+       when is_binary(id) do
+    cond do
+      String.starts_with?(id, "verify-fix-") and is_binary(exec["verify_error"]) ->
+        exec["verify_error"]
+
+      true ->
+        nil
+    end
+  end
+
+  defp replay_subtask_text(_id, _exec), do: nil
 
   # Merging flow: dispatch merge-sync when the PR has conflicts against main.
   # agent_runner.handle_merge_conflict sets merge_conflict=true and clears

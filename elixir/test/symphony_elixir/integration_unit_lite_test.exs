@@ -676,10 +676,9 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
                resolve(ws, @issue, workpad)
 
-      # Simulate verify-fix accepted
-      IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"})
-      Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}, @issue)
-      IssueExec.accept_unit(ws)
+      # Simulate verify-fix accepted — agent commits a real fix so the
+      # commit-advancement guard clears verify_error.
+      simulate_verify_fix_done(ws)
       IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
 
       # verify_error cleared
@@ -767,8 +766,29 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
   end
 
   defp simulate_verify_fix_done(ws) do
+    # Snapshot HEAD, simulate an agent commit, then run closeout with the
+    # dispatch_head so the commit-advancement guard sees HEAD advanced.
+    {dispatch_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: ws)
+    dispatch_head = String.trim(dispatch_head)
+
+    fix_file = "verify_fix_#{System.unique_integer([:positive])}.txt"
+    File.write!(Path.join(ws, fix_file), "fix\n")
+    System.cmd("git", ["add", "."], cd: ws)
+    System.cmd(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "verify-fix"],
+      cd: ws
+    )
+
     IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"})
-    Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"}, @issue)
+
+    Closeout.run(
+      ws,
+      %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"},
+      @issue,
+      dispatch_head: dispatch_head
+    )
+
     IssueExec.accept_unit(ws)
   end
 

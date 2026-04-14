@@ -212,10 +212,11 @@ defmodule SymphonyElixir.AgentRunner do
     # Run before_run hook
     Workspace.run_before_run_hook(workspace, issue)
 
-    # For rework-* subtasks: snapshot HEAD (for closeout zero-commit guard)
-    # and fetch all Linear comments (for prompt injection). Orchestrator-owned
-    # ingestion — do not rely on the agent to fetch review context itself.
-    opts = enrich_opts_for_rework(workspace, issue, unit, opts)
+    # For rework-* and verify-fix-* subtasks: snapshot HEAD (for closeout
+    # zero-commit guard). For rework-* additionally fetch all Linear comments
+    # (for prompt injection). Orchestrator-owned ingestion — do not rely on
+    # the agent to fetch review context or self-report commit state.
+    opts = enrich_opts_for_commit_guarded_subtask(workspace, issue, unit, opts)
 
     # Build prompt
     prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
@@ -678,8 +679,9 @@ defmodule SymphonyElixir.AgentRunner do
           Logger.warning("unit_lite: failed to escalate #{issue_context(issue)}: #{inspect(err)}")
       end
 
-      # Post reason as comment
-      case Adapter.create_comment(issue_id, "**Symphony escalation**: #{reason}\n\nThis ticket needs human attention. Check `.symphony/ledger.jsonl` and `.symphony/units/` logs in the workspace for details.") do
+      # Post reason + diagnostic snapshot as comment. Snapshot is best-effort:
+      # any section that can't be read is omitted rather than blocking escalation.
+      case Adapter.create_comment(issue_id, build_escalation_comment(workspace, reason)) do
         :ok -> :ok
         {:error, err} -> Logger.warning("unit_lite: escalation comment failed for #{issue_id}: #{inspect(err)}")
       end
@@ -702,6 +704,106 @@ defmodule SymphonyElixir.AgentRunner do
     Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
     :ok
   end
+
+  # Maximum characters for each diagnostic section in the escalation comment.
+  # Linear has a ~64 KB per-comment hard cap; sections are kept small so the
+  # total stays well under it and the human-facing summary is readable.
+  @escalation_section_chars 1500
+  @escalation_ledger_tail_lines 12
+
+  # Build the escalation comment body. The reason is mandatory; every
+  # diagnostic section is best-effort and omitted if unreadable.
+  defp build_escalation_comment(workspace, reason) do
+    head = Verifier.current_head(workspace)
+    verify_error = read_verify_error(workspace)
+    status = Verifier.git_status(workspace)
+    diff_stat = Verifier.git_diff_stat(workspace)
+    ledger_tail = read_ledger_tail(workspace, @escalation_ledger_tail_lines)
+
+    sections = [
+      "**Symphony escalation**: #{reason}",
+      "This ticket needs human attention. The diagnostic snapshot below is from the moment of escalation — full logs remain in `.symphony/ledger.jsonl` and `.symphony/units/`.",
+      escalation_section("Workspace HEAD", head),
+      escalation_section("Last verify error", verify_error),
+      escalation_section("git status -sb", status),
+      escalation_section("git diff HEAD --stat", diff_stat),
+      escalation_section("Recent ledger events", ledger_tail)
+    ]
+
+    sections
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+  end
+
+  defp escalation_section(_title, nil), do: nil
+  defp escalation_section(_title, ""), do: nil
+
+  defp escalation_section(title, content) when is_binary(content) do
+    truncated =
+      if String.length(content) > @escalation_section_chars do
+        String.slice(content, 0, @escalation_section_chars) <> "\n… [truncated]"
+      else
+        content
+      end
+
+    "### #{title}\n\n```\n#{truncated}\n```"
+  end
+
+  defp read_verify_error(workspace) do
+    case IssueExec.read(workspace) do
+      {:ok, exec} -> exec["verify_error"]
+      _ -> nil
+    end
+  end
+
+  defp read_ledger_tail(workspace, n) do
+    case Ledger.read(workspace) do
+      {:ok, entries} when is_list(entries) and entries != [] ->
+        entries
+        |> Enum.take(-n)
+        |> Enum.map(&format_ledger_entry/1)
+        |> Enum.join("\n")
+
+      _ ->
+        nil
+    end
+  end
+
+  # Keys kept from a ledger payload in the escalation snapshot. `error` and
+  # `last_error` matter for :verify_failed_will_fix / :verify_exhausted events,
+  # which often carry the only surviving copy of the verify output by the time
+  # escalation runs (closeout clears `exec.verify_error` on verify exhaustion).
+  @ledger_payload_keys ["subtask_id", "kind", "reason", "attempt", "fix_cycle", "error", "last_error"]
+  @ledger_value_chars 160
+
+  defp format_ledger_entry(%{"event" => event, "ts" => ts} = entry) do
+    payload = entry["payload"] || %{}
+    summary = payload |> Map.take(@ledger_payload_keys) |> format_payload()
+    "#{ts} #{event}#{summary}"
+  end
+
+  defp format_ledger_entry(entry), do: inspect(entry, limit: 120)
+
+  defp format_payload(payload) when map_size(payload) == 0, do: ""
+
+  defp format_payload(payload) do
+    pairs =
+      payload
+      |> Enum.reject(fn {_k, v} -> is_nil(v) or v == "" end)
+      |> Enum.map(fn {k, v} -> "#{k}=#{format_payload_value(v)}" end)
+
+    if pairs == [], do: "", else: " " <> Enum.join(pairs, " ")
+  end
+
+  defp format_payload_value(v) when is_binary(v) do
+    if String.length(v) > @ledger_value_chars do
+      inspect(String.slice(v, 0, @ledger_value_chars) <> "…")
+    else
+      inspect(v)
+    end
+  end
+
+  defp format_payload_value(v), do: inspect(v, limit: 60)
 
   # A unit counts as a merge-cycle unit (shouldn't be wiped on Merging entry) if
   # it's either a merge-sync-* subtask, or a verify triggered by merge_needs_verify.
@@ -1148,6 +1250,29 @@ defmodule SymphonyElixir.AgentRunner do
   # agent ran (or would run) effectively blind, so we return {:retry, ...}
   # and let the circuit breaker eventually escalate. The two flags are split
   # so retry reasons in the ledger stay diagnostically useful.
+  defp enrich_opts_for_commit_guarded_subtask(
+         workspace,
+         _issue,
+         %Unit{subtask_id: "verify-fix-" <> _},
+         opts
+       ) do
+    # verify-fix units only need the HEAD snapshot — they have no Linear
+    # review-context contract, and the verify error is already injected via
+    # exec state by the dispatch resolver / prompt builder.
+    Keyword.put(opts, :dispatch_head, current_git_head(workspace))
+  end
+
+  defp enrich_opts_for_commit_guarded_subtask(
+         workspace,
+         issue,
+         %Unit{subtask_id: "rework-" <> _} = unit,
+         opts
+       ) do
+    enrich_opts_for_rework(workspace, issue, unit, opts)
+  end
+
+  defp enrich_opts_for_commit_guarded_subtask(_workspace, _issue, _unit, opts), do: opts
+
   defp enrich_opts_for_rework(workspace, issue, %Unit{subtask_id: "rework-" <> _}, opts) do
     dispatch_head = current_git_head(workspace)
 
@@ -1182,8 +1307,6 @@ defmodule SymphonyElixir.AgentRunner do
     |> Keyword.put(:linear_fetch_ok, fetch_ok)
     |> Keyword.put(:rework_has_review_context, has_review_context)
   end
-
-  defp enrich_opts_for_rework(_workspace, _issue, _unit, opts), do: opts
 
   # A "review comment" is any Linear comment that is not Symphony's own
   # Codex Workpad artifact. Keeping the predicate here (instead of only in

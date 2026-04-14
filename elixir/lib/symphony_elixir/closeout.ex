@@ -62,10 +62,15 @@ defmodule SymphonyElixir.Closeout do
   defp do_closeout("implement_subtask", workspace, unit, issue, opts) do
     subtask_id = unit["subtask_id"]
 
-    if is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") do
-      handle_rework_closeout(workspace, subtask_id, issue, opts)
-    else
-      accept_implement_subtask(workspace, subtask_id, issue)
+    cond do
+      is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") ->
+        handle_rework_closeout(workspace, subtask_id, issue, opts)
+
+      is_binary(subtask_id) and String.starts_with?(subtask_id, "verify-fix-") ->
+        handle_verify_fix_closeout(workspace, subtask_id, issue, opts)
+
+      true ->
+        accept_implement_subtask(workspace, subtask_id, issue)
     end
   end
 
@@ -220,9 +225,11 @@ defmodule SymphonyElixir.Closeout do
   #      leaves the agent effectively blind even though the fetch succeeded.
   #   3. git HEAD advanced since dispatch (agent produced at least one commit).
   #
-  # Both (1) and (2) are computed upstream in agent_runner.enrich_opts_for_rework
-  # and passed through the closeout opts. They are split into two flags so the
-  # ledger's retry reason stays diagnostically useful.
+  # Both (1) and (2) are computed upstream in
+  # `agent_runner.enrich_opts_for_commit_guarded_subtask` (which delegates to
+  # the rework-specific enricher) and passed through the closeout opts. They
+  # are split into two flags so the ledger's retry reason stays diagnostically
+  # useful.
   defp handle_rework_closeout(workspace, subtask_id, issue, opts) do
     cond do
       Keyword.get(opts, :linear_fetch_ok, true) == false ->
@@ -240,7 +247,7 @@ defmodule SymphonyElixir.Closeout do
         {:retry, "rework #{subtask_id}: no review context in Linear comments"}
 
       true ->
-        case rework_head_state(workspace, opts) do
+        case commit_advancement_state(workspace, opts) do
           :unchanged ->
             Logger.warning(
               "Closeout: rework #{subtask_id} produced no commit (head unchanged since dispatch)"
@@ -258,6 +265,35 @@ defmodule SymphonyElixir.Closeout do
           :advanced ->
             accept_implement_subtask(workspace, subtask_id, issue)
         end
+    end
+  end
+
+  # Verify-fix acceptance requires the agent to have advanced HEAD. Without
+  # this guard, a unit where the agent edited files but never committed (an
+  # observed Codex failure mode) is silently accepted at the stale SHA; the
+  # next `verify` sees the same broken code, fails identically, and Symphony
+  # burns attempts until the circuit breaker trips — losing the uncommitted
+  # WIP in the process. Parallel to the zero-commit guard on rework-*.
+  defp handle_verify_fix_closeout(workspace, subtask_id, issue, opts) do
+    case commit_advancement_state(workspace, opts) do
+      :unchanged ->
+        Logger.warning(
+          "Closeout: verify-fix #{subtask_id} produced no commit (HEAD unchanged since dispatch) — " <>
+            "fix edits may be sitting as uncommitted WIP"
+        )
+
+        {:retry,
+         "verify-fix #{subtask_id}: produced no commit (edits likely uncommitted WIP)"}
+
+      :cannot_verify ->
+        Logger.warning(
+          "Closeout: verify-fix #{subtask_id} cannot verify HEAD state (git lookup returned nil)"
+        )
+
+        {:retry, "verify-fix #{subtask_id}: cannot verify HEAD state"}
+
+      :advanced ->
+        accept_implement_subtask(workspace, subtask_id, issue)
     end
   end
 
@@ -304,7 +340,10 @@ defmodule SymphonyElixir.Closeout do
   # | :cannot_verify (either current HEAD or dispatch_head is missing).
   # The caller uses :cannot_verify to fail-closed (retry) so transient git
   # lookup failures cannot silently disable the zero-commit guard.
-  defp rework_head_state(workspace, opts) do
+  #
+  # Used by both rework-* and verify-fix-* subtasks — both require a
+  # dispatch_head snapshot captured upstream in agent_runner.
+  defp commit_advancement_state(workspace, opts) do
     case {Verifier.current_head(workspace), Keyword.get(opts, :dispatch_head)} do
       {head, dispatch} when is_binary(head) and is_binary(dispatch) ->
         if head == dispatch, do: :unchanged, else: :advanced
