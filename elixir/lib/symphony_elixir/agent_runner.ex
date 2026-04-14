@@ -42,52 +42,10 @@ defmodule SymphonyElixir.AgentRunner do
     if issue_state == "rework" do
       case IssueExec.read(workspace) do
         {:ok, exec_check} when is_map(exec_check) ->
-          current = exec_check["current_unit"]
-          last = exec_check["last_accepted_unit"]
-
-          # 1. Fresh rework entry: last_accepted is handoff/merge from the
-          #    previous cycle, current_unit is nil (clean exit). Clear
-          #    rework_fix_applied so the fix rule fires for this new cycle.
-          #    NOTE: "verify" is NOT included — verify can complete within a
-          #    rework cycle (rework_fix → doc_fix → verify), and treating it
-          #    as fresh entry causes an infinite rework loop.
-          fresh_rework? = is_nil(current) and
-                          is_map(last) and last["kind"] in ["handoff", "merge"]
-
-          if fresh_rework? do
-            IssueExec.update(workspace, %{
-              "rework_fix_applied" => false,
-              "last_verified_sha" => nil,
-              "verify_error" => nil,
-              "verify_attempt" => 0,
-              "verify_fix_count" => 0,
-              "merge_conflict" => false,
-              "merge_sync_count" => 0,
-              "mergeability_unknown_count" => 0,
-              "merge_needs_verify" => false
-            })
-          end
-
-          # 2. Stale current_unit from previous cycle (e.g., handoff was
-          #    in-flight). Clear it so DispatchResolver sees clean state.
-          #    Do NOT clear verify/doc_fix/rework-* — these are part of the
-          #    current rework cycle and need replay for circuit breaker.
-          rework_cycle_unit? = current != nil and
-            case current["kind"] do
-              k when k in ["verify", "doc_fix"] -> true
-              "implement_subtask" ->
-                is_binary(current["subtask_id"]) and
-                String.starts_with?(current["subtask_id"], "rework-")
-              _ -> false
-            end
-
-          stale? = current != nil and not rework_cycle_unit?
-
-          if stale? do
-            IssueExec.update(workspace, %{
-              "current_unit" => nil,
-              "last_verified_sha" => nil
-            })
+          case plan_rework_entry_cleanup(exec_check) do
+            %{action: :none} -> :ok
+            %{updates: updates} when map_size(updates) > 0 ->
+              IssueExec.update(workspace, updates)
           end
 
         _ ->
@@ -753,6 +711,94 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp merge_cycle_unit?(%{"kind" => "verify"}, %{"merge_needs_verify" => true}), do: true
   defp merge_cycle_unit?(_unit, _exec), do: false
+
+  @doc """
+  Decide how to clean up exec state when (re-)entering the Rework lane.
+
+  Returns `%{action: :fresh | :stale | :none, updates: map()}`. The caller
+  applies `updates` via `IssueExec.update/2` only when `map_size(updates) > 0`.
+
+  Two "fresh" shapes reset the full rework-cycle flag set so
+  `rework_fix_rule` fires again on the next dispatch:
+
+    * clean prior cycle — `current_unit` is nil and `last_accepted_unit.kind`
+      is `handoff` or `merge`.
+    * handoff/merge race — `current_unit.kind` is `handoff` or `merge`
+      because the orchestrator's state-transition poller killed the Task
+      before `Closeout` + `IssueExec.accept_unit/1` ran. The agent
+      completed the work that mattered (flipped Linear state), but exec
+      looks in-flight. Without this branch, the stale handoff blocks
+      `fresh_rework`, `rework_fix_applied` stays `true` forever, and every
+      subsequent rework cycle silently skips `rework-1` (→ no new commits,
+      infinite verify/handoff/kill loop).
+
+  `verify` is deliberately excluded from both shapes — verify completes
+  within a rework cycle (`rework-1 → doc_fix → verify`), so treating it as
+  a fresh entry would reset `rework_fix_applied` and re-dispatch
+  `rework-1` forever. See Invariant 5b in `failure_path_test.exs`.
+
+  A narrower `:stale` action only clears `current_unit` + `last_verified_sha`
+  when `current_unit` is an unexpected kind (neither a fresh handoff/merge
+  race nor a mid-cycle verify/doc_fix/rework-* unit). Defensive cleanup for
+  corrupted exec state.
+  """
+  @spec plan_rework_entry_cleanup(map()) ::
+          %{action: :fresh | :stale | :none, updates: map()}
+  def plan_rework_entry_cleanup(exec_check) when is_map(exec_check) do
+    current = exec_check["current_unit"]
+    last = exec_check["last_accepted_unit"]
+
+    fresh_rework? =
+      (is_nil(current) and is_map(last) and last["kind"] in ["handoff", "merge"]) or
+        (is_map(current) and current["kind"] in ["handoff", "merge"])
+
+    rework_cycle_unit? =
+      current != nil and
+        case current["kind"] do
+          k when k in ["verify", "doc_fix"] ->
+            true
+
+          "implement_subtask" ->
+            is_binary(current["subtask_id"]) and
+              String.starts_with?(current["subtask_id"], "rework-")
+
+          _ ->
+            false
+        end
+
+    stale? = current != nil and not rework_cycle_unit? and not fresh_rework?
+
+    cond do
+      fresh_rework? ->
+        %{
+          action: :fresh,
+          updates: %{
+            "current_unit" => nil,
+            "rework_fix_applied" => false,
+            "last_verified_sha" => nil,
+            "verify_error" => nil,
+            "verify_attempt" => 0,
+            "verify_fix_count" => 0,
+            "merge_conflict" => false,
+            "merge_sync_count" => 0,
+            "mergeability_unknown_count" => 0,
+            "merge_needs_verify" => false
+          }
+        }
+
+      stale? ->
+        %{
+          action: :stale,
+          updates: %{
+            "current_unit" => nil,
+            "last_verified_sha" => nil
+          }
+        }
+
+      true ->
+        %{action: :none, updates: %{}}
+    end
+  end
 
   defp issue_to_dispatch_map(%Issue{} = issue) do
     %{state: issue.state || "Unknown"}

@@ -14,7 +14,7 @@ defmodule SymphonyElixir.FailurePathTest do
   """
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.{Closeout, Codex.AppServer, DispatchResolver, IssueExec, Unit}
+  alias SymphonyElixir.{AgentRunner, Closeout, Codex.AppServer, DispatchResolver, IssueExec, Unit}
 
   # ──────────────────────────────────────────────────────────────────
   # Invariant 1: codex_command_with_effort graceful degradation
@@ -525,6 +525,198 @@ defmodule SymphonyElixir.FailurePathTest do
         "fresh_rework must only match handoff/merge, not verify (causes infinite rework loop)"
       refute source =~ ~s(last["kind"] in ["handoff", "verify", "merge"]),
         "verify must NOT be in fresh_rework detection — it's a normal step within rework cycle"
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Invariant 5c: fresh_rework must treat stale handoff/merge current_unit
+  #              as fresh (handoff/merge race handling)
+  #
+  # Finding: the orchestrator polls Linear every ~5s and terminates the
+  # running Task as soon as the agent flips the issue to a non-active
+  # state. The handoff agent's final action is to move Linear state to
+  # Human Review — which is exactly what triggers the poller's kill. The
+  # Task dies before Closeout + IssueExec.accept_unit runs, leaving
+  # current_unit="handoff" in exec. On the next rework entry, the old
+  # fresh_rework keyed only on `is_nil(current)` never fired, so
+  # rework_fix_applied stayed true from the prior cycle forever, and
+  # rework-1 was silently skipped on every subsequent round (verify →
+  # handoff → kill → repeat, zero new commits).
+  #
+  # Observed in ENT-169 Rounds 3-4: three review cycles in a row, every
+  # "handoff" Results comment a generic re-paste of the prior one, HEAD
+  # SHA frozen at 20c039b across rounds because rework-1 never dispatched.
+  #
+  # Invariant: fresh_rework must also trigger when current_unit.kind is
+  # handoff/merge. The same full flag-set reset applies (not just the
+  # narrower stale current_unit cleanup), and current_unit itself must be
+  # cleared so DispatchResolver sees a clean slate for the new cycle.
+  # ──────────────────────────────────────────────────────────────────
+
+  describe "fresh_rework detection handles handoff/merge race (Invariant 5c)" do
+    @base_exec %{
+      "mode" => "unit_lite",
+      "phase" => "implementing",
+      "bootstrapped" => true,
+      "plan_version" => 1,
+      "doc_fix_required" => false
+    }
+
+    test "stale handoff current_unit triggers :fresh with full reset" do
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{"kind" => "handoff", "attempt" => 1, "subtask_id" => nil},
+          "last_accepted_unit" => %{"kind" => "verify"},
+          "rework_fix_applied" => true,
+          "last_verified_sha" => "abc123",
+          "verify_attempt" => 0
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :fresh,
+        "stale handoff current_unit must be treated as fresh rework entry — " <>
+        "orchestrator killed the Task mid-accept after the agent flipped state"
+
+      assert result.updates["current_unit"] == nil,
+        "fresh reset must clear current_unit so DispatchResolver sees clean state"
+
+      assert result.updates["rework_fix_applied"] == false,
+        "fresh reset must clear rework_fix_applied — otherwise rework-1 is " <>
+        "silently skipped on every subsequent cycle (infinite no-op handoff loop)"
+
+      assert result.updates["last_verified_sha"] == nil,
+        "fresh reset must invalidate last_verified_sha so verify re-runs after fix"
+    end
+
+    test "stale merge current_unit triggers :fresh with full reset" do
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{"kind" => "merge", "attempt" => 1, "subtask_id" => nil},
+          "last_accepted_unit" => %{"kind" => "verify"},
+          "rework_fix_applied" => true,
+          "last_verified_sha" => "abc123"
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :fresh
+      assert result.updates["current_unit"] == nil
+      assert result.updates["rework_fix_applied"] == false
+    end
+
+    test "clean prior cycle (current=nil, last=handoff) still triggers :fresh (prior shape)" do
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => nil,
+          "last_accepted_unit" => %{"kind" => "handoff"},
+          "rework_fix_applied" => true
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :fresh
+      assert result.updates["rework_fix_applied"] == false
+    end
+
+    test "mid-cycle verify current_unit does NOT trigger :fresh (preserves cycle flags)" do
+      # verify within a rework cycle must not reset rework_fix_applied —
+      # otherwise we loop rework-1 forever. Verify is also a rework-cycle
+      # unit (replayable for circuit breaker), so :stale doesn't fire either.
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{"kind" => "verify", "attempt" => 1, "subtask_id" => nil},
+          "last_accepted_unit" => %{"kind" => "doc_fix"},
+          "rework_fix_applied" => true
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :none,
+        "verify mid-cycle is neither fresh nor stale — replay_current_unit_rule handles it"
+
+      assert result.updates == %{}
+    end
+
+    test "mid-cycle rework-1 implement_subtask does NOT trigger :fresh or :stale" do
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{
+            "kind" => "implement_subtask",
+            "subtask_id" => "rework-1",
+            "attempt" => 1
+          },
+          "last_accepted_unit" => %{"kind" => "handoff"},
+          "rework_fix_applied" => false
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :none,
+        "in-flight rework-1 must replay for circuit breaker correctness"
+    end
+
+    test "unexpected current_unit kind triggers narrow :stale cleanup only" do
+      # Defensive branch — corrupted exec with non-standard kind should
+      # still let the orchestrator make forward progress.
+      exec =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{"kind" => "bootstrap", "attempt" => 1, "subtask_id" => nil},
+          "last_accepted_unit" => %{"kind" => "plan"},
+          "rework_fix_applied" => true,
+          "last_verified_sha" => "abc123"
+        })
+
+      result = AgentRunner.plan_rework_entry_cleanup(exec)
+
+      assert result.action == :stale
+      assert result.updates["current_unit"] == nil
+      assert result.updates["last_verified_sha"] == nil
+
+      refute Map.has_key?(result.updates, "rework_fix_applied"),
+        "stale cleanup must NOT clear rework_fix_applied — that's fresh-only behavior"
+    end
+
+    test "end-to-end: stale handoff → fresh_rework reset → rework_fix_rule fires" do
+      # Integration-flavored: simulate the exec state ENT-169 was stuck in
+      # after the orchestrator killed the handoff mid-accept. After applying
+      # the planned cleanup, DispatchResolver must fire rework-1 (not
+      # verify/handoff).
+      exec_before =
+        @base_exec
+        |> Map.merge(%{
+          "current_unit" => %{"kind" => "handoff", "attempt" => 1, "subtask_id" => nil},
+          "last_accepted_unit" => %{"kind" => "verify"},
+          "rework_fix_applied" => true,
+          "last_verified_sha" => "20c039b"
+        })
+
+      %{updates: updates} = AgentRunner.plan_rework_entry_cleanup(exec_before)
+      exec_after = Map.merge(exec_before, updates)
+
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Done
+      """
+
+      ctx = %{
+        issue: %{state: "Rework"},
+        exec: exec_after,
+        workpad_text: workpad,
+        git_head: "20c039b"
+      }
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "rework-1"}} =
+               DispatchResolver.resolve(ctx),
+             "after stale-handoff reset, dispatch must be rework-1 — not verify/handoff"
     end
   end
 
