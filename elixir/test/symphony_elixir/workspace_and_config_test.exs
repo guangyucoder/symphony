@@ -54,7 +54,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Path.basename(first_workspace) == "MT_Det"
   end
 
-  test "workspace reuses existing issue directory without deleting local changes" do
+  test "workspace reuses existing issue directory while only clearing local transient dirs" do
     workspace_root =
       Path.join(
         System.tmp_dir!(),
@@ -74,11 +74,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(Path.join(first_workspace, "deps"))
       File.mkdir_p!(Path.join(first_workspace, "_build"))
       File.mkdir_p!(Path.join(first_workspace, "tmp"))
+      File.mkdir_p!(Path.join(first_workspace, ".elixir_ls"))
       File.mkdir_p!(Path.join([first_workspace, "apps", "web", ".next"]))
       File.mkdir_p!(Path.join([first_workspace, "node_modules", ".cache"]))
       File.write!(Path.join([first_workspace, "deps", "cache.txt"]), "cached deps\n")
       File.write!(Path.join([first_workspace, "_build", "artifact.txt"]), "compiled artifact\n")
       File.write!(Path.join([first_workspace, "tmp", "scratch.txt"]), "remove me\n")
+      File.write!(Path.join([first_workspace, ".elixir_ls", "project.plt"]), "remove me too\n")
       File.write!(Path.join([first_workspace, "apps", "web", ".next", "build.txt"]), "remove me too\n")
       File.write!(Path.join([first_workspace, "node_modules", ".cache", "bundler.txt"]), "remove cache\n")
 
@@ -92,8 +94,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "compiled artifact\n"
 
       refute File.exists?(Path.join([second_workspace, "tmp", "scratch.txt"]))
-      refute File.exists?(Path.join([second_workspace, "apps", "web", ".next", "build.txt"]))
-      refute File.exists?(Path.join([second_workspace, "node_modules", ".cache", "bundler.txt"]))
+      refute File.exists?(Path.join([second_workspace, ".elixir_ls", "project.plt"]))
+      assert File.read!(Path.join([second_workspace, "apps", "web", ".next", "build.txt"])) == "remove me too\n"
+      assert File.read!(Path.join([second_workspace, "node_modules", ".cache", "bundler.txt"])) == "remove cache\n"
     after
       File.rm_rf(workspace_root)
     end
@@ -688,7 +691,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "prepare_for_dispatch preserves .symphony state and .env.sh across repeated dispatches" do
+  test "prepare_for_dispatch preserves .symphony state, .env.sh, and session metadata across repeated dispatches" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -699,18 +702,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-PRESERVE")
       symphony_state = Path.join([workspace, ".symphony", "state.json"])
       env_snapshot = Path.join(workspace, ".env.sh")
+      session_meta = Path.join(workspace, ".symphony_session.json")
 
       File.mkdir_p!(Path.dirname(symphony_state))
       File.write!(symphony_state, ~s({"status":"keep"}) <> "\n")
       File.write!(env_snapshot, "export KEEP=1\n")
+      File.write!(session_meta, ~s({"thread_id":"thread-preserve"}) <> "\n")
 
-      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
+        end)
+
       assert File.read!(symphony_state) == ~s({"status":"keep"}) <> "\n"
       assert File.read!(env_snapshot) == "export KEEP=1\n"
+      assert File.read!(session_meta) == ~s({"thread_id":"thread-preserve"}) <> "\n"
+      assert log =~ ".env.sh is preserved and may be stale"
 
-      assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-PRESERVE")
-      assert File.read!(symphony_state) == ~s({"status":"keep"}) <> "\n"
-      assert File.read!(env_snapshot) == "export KEEP=1\n"
+      assert length(Regex.scan(~r/\.env\.sh is preserved and may be stale/, log)) == 1
     after
       File.rm_rf(test_root)
     end
@@ -758,6 +768,40 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "prepare_for_dispatch removes gitignored files during clean" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-ignored-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-IGNORED")
+
+      init_git_repo!(workspace, %{
+        ".gitignore" => "node_modules/\n",
+        "tracked.txt" => "tracked\n"
+      })
+
+      ignored_file = Path.join([workspace, "node_modules", ".cache", "junk"])
+      File.mkdir_p!(Path.dirname(ignored_file))
+      File.write!(ignored_file, "remove me\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-IGNORED")
+        end)
+
+      assert log =~ "git fetch failed; continuing with reset to local HEAD"
+      refute File.exists?(ignored_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "prepare_for_dispatch does not rerun after_create" do
     test_root =
       Path.join(
@@ -781,7 +825,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "prepare_for_dispatch tolerates repositories without origin" do
+  test "prepare_for_dispatch continues when git fetch fails without origin" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -806,9 +850,112 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
           assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-NO-ORIGIN")
         end)
 
-      assert log =~ "origin is missing"
+      assert log =~ "git fetch failed; continuing with reset to local HEAD"
       assert File.read!(tracked_file) == "tracked\n"
       refute File.exists?(scratch_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch continues when origin is configured but unreachable" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-bad-origin-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-BAD-ORIGIN")
+      init_git_repo!(workspace, %{"tracked.txt" => "tracked\n"})
+      git!(workspace, ["remote", "add", "origin", "/nonexistent"])
+
+      tracked_file = Path.join(workspace, "tracked.txt")
+      scratch_file = Path.join(workspace, "scratch.txt")
+      File.write!(tracked_file, "dirty\n")
+      File.write!(scratch_file, "remove me\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-BAD-ORIGIN")
+        end)
+
+      assert log =~ "git fetch failed; continuing with reset to local HEAD"
+      assert File.read!(tracked_file) == "tracked\n"
+      refute File.exists?(scratch_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch skips reset and still cleans when HEAD is unset" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-empty-head-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREP-EMPTY")
+
+      git!(workspace, ["init", "-b", "main"])
+      git!(workspace, ["config", "user.email", "t@t.com"])
+      git!(workspace, ["config", "user.name", "t"])
+
+      scratch_file = Path.join(workspace, "scratch.txt")
+      File.write!(scratch_file, "remove me\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-EMPTY")
+        end)
+
+      assert log =~ "HEAD is unset (empty repo)"
+      refute File.exists?(scratch_file)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "prepare_for_dispatch records discarded WIP in the ledger" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prepare-wip-ledger-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-WIP")
+      tracked_file = Path.join(workspace, "tracked.txt")
+      scratch_file = Path.join(workspace, "scratch.txt")
+
+      File.write!(tracked_file, "dirty tracked change\n")
+      File.write!(scratch_file, "dirty scratch\n")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Workspace.prepare_for_dispatch(workspace, "MT-PREP-WIP")
+        end)
+
+      assert log =~ "will discard uncommitted changes"
+
+      assert {:ok, ledger_entries} = SymphonyElixir.Ledger.read(workspace)
+
+      discarded_event =
+        Enum.find(ledger_entries, fn entry ->
+          entry["event"] == "workspace_wip_discarded"
+        end)
+
+      assert discarded_event
+      assert discarded_event["payload"]["issue_identifier"] == "MT-PREP-WIP"
+      assert discarded_event["payload"]["file_count"] >= 2
+      assert discarded_event["payload"]["summary"] =~ "tracked.txt"
     after
       File.rm_rf(test_root)
     end

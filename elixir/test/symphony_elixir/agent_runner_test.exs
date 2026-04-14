@@ -292,6 +292,7 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
+        execution_mode: "unit_lite",
         hook_after_create: "git clone #{template_repo} .",
         hook_before_run: "test -f tracked.txt\necho call >> \"#{before_run_counter}\""
       )
@@ -314,6 +315,102 @@ defmodule SymphonyElixir.AgentRunnerTest do
                )
 
       assert count_lines(before_run_counter) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "legacy run does not prepare an existing workspace before before_run" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-legacy-prepare-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      before_run_counter = Path.join(test_root, "before_run.count")
+
+      init_git_repo!(template_repo, %{"tracked.txt" => "tracked\n"})
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-legacy"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-legacy"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        execution_mode: "legacy",
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never",
+        codex_thread_sandbox: "danger-full-access",
+        codex_turn_sandbox_policy: %{type: "dangerFullAccess", networkAccess: true},
+        hook_after_create: "git clone #{template_repo} .",
+        hook_before_run:
+          "grep -q 'dirty tracked change' tracked.txt\n" <>
+            "test -f local-progress.txt\n" <>
+            "test -f .symphony_session.json\n" <>
+            "echo call >> \"#{before_run_counter}\"",
+        max_turns: 1,
+        prompt: "You are a test agent."
+      )
+
+      issue = %Issue{
+        id: "issue-legacy-prepare",
+        identifier: "MT-legacy-prepare",
+        title: "Verify legacy run preserves workspace state",
+        description: "Legacy run should not call prepare_for_dispatch.",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-legacy-prepare",
+        labels: []
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      tracked_file = Path.join(workspace, "tracked.txt")
+      local_progress = Path.join(workspace, "local-progress.txt")
+      session_meta = Path.join(workspace, ".symphony_session.json")
+
+      File.write!(tracked_file, "dirty tracked change\n")
+      File.write!(local_progress, "keep me\n")
+      File.write!(session_meta, ~s({"thread_id":"legacy-thread"}) <> "\n")
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 max_turns: 1,
+                 issue_state_fetcher: fn [_issue_id] ->
+                   {:ok, [%Issue{issue | state: "Done"}]}
+                 end
+               )
+
+      assert count_lines(before_run_counter) == 1
+      assert File.read!(tracked_file) == "dirty tracked change\n"
+      assert File.read!(local_progress) == "keep me\n"
+      assert File.exists?(session_meta)
+      assert %{"thread_id" => "thread-legacy"} = Jason.decode!(File.read!(session_meta))
     after
       File.rm_rf(test_root)
     end

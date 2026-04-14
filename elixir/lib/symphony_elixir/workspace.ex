@@ -1,26 +1,22 @@
 defmodule SymphonyElixir.Workspace do
   @moduledoc """
   Creates isolated per-issue workspaces for parallel Codex agents.
+
+  Per-dispatch cleanup relies on git for repo-owned state and reserves this
+  module's local cleanup list for a small set of tool caches that may exist even
+  outside git control.
   """
 
   require Logger
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Ledger}
 
   @excluded_entries [
-    # Elixir transient state
     ".elixir_ls",
-    "tmp",
-    # Next.js build artifacts
-    "apps/web/.next",
-    "apps/admin/.next",
-    # React Native native build caches
-    "mobile-app/ios/build",
-    "mobile-app/android/.gradle",
-    "mobile-app/android/build",
-    # JS package-manager caches
-    "node_modules/.cache"
+    "tmp"
   ]
   @session_meta_file ".symphony_session.json"
+  @env_staleness_warning_table :symphony_workspace_env_staleness_warnings
+  @max_discarded_wip_files 10
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
@@ -55,12 +51,19 @@ defmodule SymphonyElixir.Workspace do
 
   @doc """
   Reset an existing workspace to a clean per-dispatch baseline without rerunning bootstrap.
+
+  ALL uncommitted changes are destroyed on every dispatch; this is observable via
+  the `:workspace_wip_discarded` ledger event. Agents must commit before yielding.
+
+  KNOWN LIMITATION: `.env.sh` is preserved for local bootstrap compatibility and
+  is NOT refreshed per dispatch.
   """
   @spec prepare_for_dispatch(Path.t(), map() | String.t() | nil) :: :ok | {:error, term()}
   def prepare_for_dispatch(workspace, issue_or_identifier) when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
 
     with :ok <- validate_workspace_path(workspace),
+         :ok <- maybe_warn_env_snapshot_staleness(workspace),
          :ok <- ensure_git_dispatch_baseline(workspace, issue_context) do
       clean_tmp_artifacts(workspace)
       :ok
@@ -342,11 +345,12 @@ defmodule SymphonyElixir.Workspace do
     case git_workspace_status(workspace) do
       :git_repo ->
         with :ok <- fetch_origin_if_present(workspace, issue_context),
-             :ok <- run_git_step(workspace, ["reset", "--hard", "HEAD"], "reset_hard", issue_context),
+             :ok <- maybe_record_discarded_wip(workspace, issue_context),
+             :ok <- maybe_reset_workspace_head(workspace, issue_context),
              :ok <-
                run_git_step(
                  workspace,
-                 ["clean", "-fd", "-e", ".symphony/", "-e", ".env.sh"],
+                 ["clean", "-fdx", "-e", ".symphony/", "-e", ".env.sh", "-e", @session_meta_file],
                  "clean_untracked",
                  issue_context
                ) do
@@ -384,28 +388,139 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp fetch_origin_if_present(workspace, issue_context) do
-    case run_git_step(workspace, ["fetch", "origin", "--prune"], "fetch_origin", issue_context) do
-      :ok ->
+    case run_git_command(workspace, ["fetch", "origin", "--prune"]) do
+      {:ok, _output} ->
         :ok
 
-      {:error, {:workspace_prepare_failed, "fetch_origin", _status, _output}} = error ->
-        if origin_remote_configured?(workspace) do
-          error
-        else
-          Logger.warning("Workspace prepare skipped git fetch because origin is missing #{issue_log_context(issue_context)} workspace=#{workspace}")
+      {:error, reason} ->
+        Logger.warning(
+          "Workspace prepare: git fetch failed; continuing with reset to local HEAD: #{format_workspace_prepare_reason(reason)} #{issue_log_context(issue_context)} workspace=#{workspace}"
+        )
 
-          :ok
-        end
+        :ok
+    end
+  end
+
+  defp maybe_record_discarded_wip(workspace, issue_context) do
+    case run_git_command(workspace, ["status", "--porcelain=v1"]) do
+      {:ok, output} ->
+        output
+        |> String.split("\n", trim: true)
+        |> summarize_discarded_wip()
+        |> log_discarded_wip(workspace, issue_context)
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp origin_remote_configured?(workspace) do
-    case run_git_command(workspace, ["remote", "get-url", "origin"]) do
-      {:ok, _output} -> true
-      {:error, _reason} -> false
+  defp maybe_reset_workspace_head(workspace, issue_context) do
+    case run_git_command(workspace, ["rev-parse", "--verify", "HEAD"]) do
+      {:ok, _output} ->
+        run_git_step(workspace, ["reset", "--hard", "HEAD"], "reset_hard", issue_context)
+
+      {:error, {:workspace_prepare_failed, "verify_head", _status, _output}} ->
+        Logger.warning("Workspace prepare skipped git reset because HEAD is unset (empty repo) #{issue_log_context(issue_context)} workspace=#{workspace}")
+
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp summarize_discarded_wip([]), do: nil
+
+  defp summarize_discarded_wip(lines) do
+    files =
+      lines
+      |> Enum.map(&porcelain_path/1)
+      |> Enum.reject(&(&1 == ""))
+
+    truncated_files = Enum.take(files, @max_discarded_wip_files)
+    hidden_count = max(length(files) - length(truncated_files), 0)
+
+    summary =
+      truncated_files
+      |> Enum.join(", ")
+      |> append_hidden_count(hidden_count)
+      |> sanitize_hook_output_for_log(512)
+
+    %{
+      files: truncated_files,
+      file_count: length(files),
+      summary: summary
+    }
+  end
+
+  defp log_discarded_wip(nil, _workspace, _issue_context), do: :ok
+
+  defp log_discarded_wip(%{summary: summary} = discarded, workspace, issue_context) do
+    Logger.warning("Workspace prepare will discard uncommitted changes #{issue_log_context(issue_context)} workspace=#{workspace} files=#{inspect(summary)}")
+
+    case Ledger.append(workspace, :workspace_wip_discarded, %{
+           "issue_identifier" => issue_context.issue_identifier,
+           "files" => discarded.files,
+           "file_count" => discarded.file_count,
+           "summary" => discarded.summary
+         }) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Workspace prepare could not record discarded WIP in ledger #{issue_log_context(issue_context)} workspace=#{workspace} error=#{inspect(reason)}")
+
+        :ok
+    end
+  end
+
+  defp porcelain_path(line) when is_binary(line) and byte_size(line) > 3 do
+    line
+    |> binary_part(3, byte_size(line) - 3)
+    |> String.trim()
+    |> String.split(" -> ")
+    |> List.last()
+  end
+
+  defp porcelain_path(_line), do: ""
+
+  defp append_hidden_count("", 0), do: ""
+  defp append_hidden_count(summary, 0), do: summary
+  defp append_hidden_count("", hidden_count), do: "(+#{hidden_count} more)"
+  defp append_hidden_count(summary, hidden_count), do: "#{summary} ... (+#{hidden_count} more)"
+
+  defp maybe_warn_env_snapshot_staleness(workspace) do
+    env_snapshot = Path.join(workspace, ".env.sh")
+
+    if is_nil(Config.workspace_hooks()[:before_run]) and File.exists?(env_snapshot) and
+         mark_env_snapshot_warning_emitted(workspace) do
+      Logger.warning("Workspace prepare: .env.sh is preserved and may be stale until refreshed by a before_run hook workspace=#{workspace}")
+    end
+
+    :ok
+  end
+
+  defp mark_env_snapshot_warning_emitted(workspace) do
+    :ets.insert_new(ensure_env_warning_table(), {Path.expand(workspace), true})
+  end
+
+  defp ensure_env_warning_table do
+    case :ets.whereis(@env_staleness_warning_table) do
+      :undefined ->
+        try do
+          :ets.new(@env_staleness_warning_table, [
+            :named_table,
+            :public,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> @env_staleness_warning_table
+        end
+
+      table ->
+        table
     end
   end
 
@@ -425,22 +540,62 @@ defmodule SymphonyElixir.Workspace do
         Logger.warning("Workspace prepare failed step=#{step} #{issue_log_context(issue_context)} workspace=#{workspace} error=#{inspect(reason)}")
 
         {:error, {:workspace_prepare_exec_failed, step, reason}}
+
+      {:error, {:workspace_prepare_timeout, _raw_step, timeout_ms}} ->
+        {:error, {:workspace_prepare_timeout, step, timeout_ms}}
     end
   end
 
   defp run_git_command(workspace, args) do
-    try do
-      case System.cmd("git", args, cd: workspace, stderr_to_stdout: true) do
-        {output, 0} -> {:ok, output}
-        {output, status} -> {:error, {:workspace_prepare_failed, raw_git_step(args), status, output}}
-      end
-    rescue
-      error in ErlangError ->
-        {:error, {:workspace_prepare_exec_failed, raw_git_step(args), Exception.message(error)}}
+    step = raw_git_step(args)
+    timeout_ms = Config.workspace_hooks()[:timeout_ms]
+
+    task =
+      Task.async(fn ->
+        try do
+          {:ok, System.cmd("git", args, cd: workspace, stderr_to_stdout: true)}
+        rescue
+          error in ErlangError ->
+            {:error, Exception.message(error)}
+        end
+      end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, {:ok, {output, 0}}} ->
+        {:ok, output}
+
+      {:ok, {:ok, {output, status}}} ->
+        {:error, {:workspace_prepare_failed, step, status, output}}
+
+      {:ok, {:error, reason}} ->
+        {:error, {:workspace_prepare_exec_failed, step, reason}}
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+
+        Logger.warning("Workspace prepare timed out step=#{step} workspace=#{workspace} timeout_ms=#{timeout_ms}")
+
+        {:error, {:workspace_prepare_timeout, step, timeout_ms}}
     end
   end
 
+  defp format_workspace_prepare_reason({:workspace_prepare_failed, step, status, output}) do
+    "#{step} exited #{status}: #{inspect(sanitize_hook_output_for_log(output))}"
+  end
+
+  defp format_workspace_prepare_reason({:workspace_prepare_exec_failed, step, reason}) do
+    "#{step} exec failed: #{inspect(reason)}"
+  end
+
+  defp format_workspace_prepare_reason({:workspace_prepare_timeout, step, timeout_ms}) do
+    "#{step} timed out after #{timeout_ms}ms"
+  end
+
+  defp format_workspace_prepare_reason(reason), do: inspect(reason)
+
+  defp raw_git_step(["rev-parse", "--verify" | _rest]), do: "verify_head"
   defp raw_git_step(["rev-parse" | _rest]), do: "rev_parse"
+  defp raw_git_step(["status" | _rest]), do: "status_porcelain"
   defp raw_git_step(["fetch" | _rest]), do: "fetch_origin"
   defp raw_git_step(["reset" | _rest]), do: "reset_hard"
   defp raw_git_step(["clean" | _rest]), do: "clean_untracked"

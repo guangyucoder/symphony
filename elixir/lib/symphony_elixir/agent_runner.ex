@@ -32,7 +32,11 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp maybe_prepare_workspace_for_dispatch(workspace, issue, false) do
-    Workspace.prepare_for_dispatch(workspace, issue)
+    if Config.unit_lite?() do
+      Workspace.prepare_for_dispatch(workspace, issue)
+    else
+      :ok
+    end
   end
 
   defp maybe_prepare_workspace_for_dispatch(_workspace, _issue, true), do: :ok
@@ -951,10 +955,9 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting agent run for #{issue_context(issue)}")
 
     case Workspace.create_for_issue_with_status(issue) do
-      {:ok, workspace, created?} ->
+      {:ok, workspace, _created?} ->
         try do
-          with :ok <- maybe_prepare_workspace_for_dispatch(workspace, issue, created?),
-               :ok <- Workspace.run_before_run_hook(workspace, issue),
+          with :ok <- Workspace.run_before_run_hook(workspace, issue),
                :ok <- run_codex_turns(workspace, issue, codex_update_recipient, opts) do
             :ok
           else
