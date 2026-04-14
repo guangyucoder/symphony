@@ -50,11 +50,36 @@ defmodule SymphonyElixir.CloseoutTest do
       assert :accepted = Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
 
       {:ok, exec} = IssueExec.read(ws)
-      assert exec["bootstrapped"] == false
+      # bootstrapped=true even on baseline failure: the dispatcher must advance
+      # past bootstrap_rule. Baseline state lives in baseline_verify_failed.
+      assert exec["bootstrapped"] == true
       assert exec["baseline_verify_failed"] == true
       assert is_binary(exec["baseline_verify_output"])
       assert ledger_events(ws) |> Enum.member?("baseline_verify_failed")
       assert ledger_events(ws) |> Enum.member?("baseline_accepted_despite_failure")
+    end
+
+    test "second bootstrap after soft-accept does not re-dispatch bootstrap", %{workspace: ws} do
+      # Regression guard for the accepted-bootstrap infinite loop:
+      # before this fix, :accepted with bootstrapped=false + cleared
+      # current_unit caused DispatchResolver.bootstrap_rule/1 to re-dispatch
+      # bootstrap forever with no circuit-breaker escape.
+      write_workflow_file!(Workflow.workflow_file_path(), verification_baseline_commands: ["false"])
+
+      assert :accepted = Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
+      {:ok, exec} = IssueExec.read(ws)
+
+      ctx = %{
+        issue: %SymphonyElixir.Linear.Issue{identifier: "ENT-42", state: "In Progress"},
+        exec: exec,
+        workpad_text: nil,
+        git_head: "abc123"
+      }
+
+      result = SymphonyElixir.DispatchResolver.resolve(ctx)
+
+      refute match?({:dispatch, %SymphonyElixir.Unit{kind: :bootstrap}}, result),
+             "expected dispatcher to advance past bootstrap after soft-accept, got #{inspect(result)}"
     end
   end
 
@@ -86,23 +111,71 @@ defmodule SymphonyElixir.CloseoutTest do
   end
 
   describe "implement_subtask closeout" do
-    test "accepts when no doc impact", %{workspace: ws} do
-      # No git history -> changed_files is empty -> fresh
+    test "accepts when HEAD advanced since dispatch (regular plan-N path)", %{workspace: ws} do
+      {dispatch_head, head_after_commit} = init_git_and_advance!(ws)
+      assert dispatch_head != head_after_commit
+
       assert :accepted =
-               Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-1"}, @issue)
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 @issue,
+                 dispatch_head: dispatch_head
+               )
+    end
+
+    test "retries when HEAD unchanged — plan-N forgot to commit", %{workspace: ws} do
+      dispatch_head = init_git_only!(ws)
+
+      assert {:retry, reason} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 @issue,
+                 dispatch_head: dispatch_head
+               )
+
+      assert reason =~ "implement_subtask plan-1: produced no commit"
+    end
+
+    test "retries when HEAD cannot be verified (missing dispatch_head)", %{workspace: ws} do
+      assert {:retry, reason} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 @issue
+               )
+
+      assert reason =~ "cannot verify HEAD state"
     end
   end
 
   describe "doc_fix closeout" do
-    test "clears doc_fix_required flag", %{workspace: ws} do
+    test "clears doc_fix_required flag when HEAD advanced", %{workspace: ws} do
       IssueExec.mark_doc_fix_required(ws)
       {:ok, exec} = IssueExec.read(ws)
       assert exec["doc_fix_required"] == true
 
-      assert :accepted = Closeout.run(ws, %{"kind" => "doc_fix"}, @issue)
+      {dispatch_head, _} = init_git_and_advance!(ws)
+
+      assert :accepted = Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
 
       {:ok, exec} = IssueExec.read(ws)
       assert exec["doc_fix_required"] == false
+    end
+
+    test "retries when HEAD unchanged — doc_fix forgot to commit", %{workspace: ws} do
+      IssueExec.mark_doc_fix_required(ws)
+      dispatch_head = init_git_only!(ws)
+
+      assert {:retry, reason} =
+               Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
+
+      assert reason =~ "doc_fix: produced no commit"
+
+      # doc_fix_required must still be set so the dispatcher re-dispatches.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["doc_fix_required"] == true
     end
   end
 
@@ -167,5 +240,29 @@ defmodule SymphonyElixir.CloseoutTest do
   defp ledger_events(workspace) do
     {:ok, entries} = Ledger.read(workspace)
     Enum.map(entries, & &1["event"])
+  end
+
+  # Init a git repo with one initial commit. Returns the initial HEAD sha
+  # — use this as dispatch_head when you want to assert "HEAD did not advance".
+  defp init_git_only!(workspace) do
+    System.cmd("git", ["init", "-q"], cd: workspace)
+    System.cmd("git", ["config", "user.name", "Test"], cd: workspace)
+    System.cmd("git", ["config", "user.email", "t@t.com"], cd: workspace)
+    File.write!(Path.join(workspace, "seed.txt"), "seed\n")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-q", "-m", "init"], cd: workspace)
+    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+    String.trim(head)
+  end
+
+  # Init a git repo, snapshot HEAD as dispatch_head, then make a second
+  # commit so HEAD advances. Returns {dispatch_head, new_head}.
+  defp init_git_and_advance!(workspace) do
+    dispatch_head = init_git_only!(workspace)
+    File.write!(Path.join(workspace, "progress.txt"), "progress\n")
+    System.cmd("git", ["add", "."], cd: workspace)
+    System.cmd("git", ["commit", "-q", "-m", "progress"], cd: workspace)
+    {new_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workspace)
+    {dispatch_head, String.trim(new_head)}
   end
 end

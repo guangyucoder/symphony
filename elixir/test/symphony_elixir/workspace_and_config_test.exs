@@ -979,6 +979,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert discarded_event["payload"]["issue_identifier"] == "MT-PREP-WIP"
       assert discarded_event["payload"]["file_count"] >= 2
       assert discarded_event["payload"]["summary"] =~ "tracked.txt"
+
+      # Ledger payload points to a recoverable patch + untracked list.
+      patch_rel = discarded_event["payload"]["patch_path"]
+      untracked_rel = discarded_event["payload"]["untracked_list_path"]
+      assert is_binary(patch_rel)
+      assert is_binary(untracked_rel)
+
+      patch_abs = Path.join(workspace, patch_rel)
+      untracked_abs = Path.join(workspace, untracked_rel)
+      assert File.exists?(patch_abs), "discarded WIP patch not written at #{patch_abs}"
+      assert File.exists?(untracked_abs), "untracked-file list not written at #{untracked_abs}"
+
+      # Patch captures the dirty tracked-file change.
+      patch_contents = File.read!(patch_abs)
+      assert patch_contents =~ "tracked.txt"
+      assert patch_contents =~ "dirty tracked change"
+
+      # Untracked list mentions the scratch file.
+      untracked_contents = File.read!(untracked_abs)
+      assert untracked_contents =~ "scratch.txt"
     after
       File.rm_rf(test_root)
     end

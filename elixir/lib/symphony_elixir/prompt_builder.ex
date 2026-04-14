@@ -413,19 +413,22 @@ defmodule SymphonyElixir.PromptBuilder do
     starting, read it:
     - Look at the `[#{id}]` entry under `### Plan` for context. If a
       `<subtask_contract>` block appears below, treat it as the orchestrator's
-      authoritative parse of that entry and prefer it over manually re-reading
-      `touch:` / `accept:` sub-lines. If no contract block is present, read any
-      `touch:` / `accept:` sub-lines directly from the workpad entry; otherwise
-      follow the subtask title above.
+      authoritative parse of that entry. When `touch:` paths are listed,
+      start with those files; expand to adjacent files only when necessary
+      to satisfy the `accept:` criterion (treat `touch:` as a default
+      starting surface, not a hard fence). If no contract block is present,
+      read any `touch:` / `accept:` sub-lines directly from the workpad
+      entry; otherwise follow the subtask title above.
     - Read any prior continuation notes under `### Notes` (entries named
       `#### [plan-N] continuation`) so you know what earlier subtasks changed
       and which gotchas they flagged. Do not re-do exploration that a prior
       continuation note already answered.
     #{subtask_contract}
 
-    1. Implement this subtask only, scoped to the `touch` paths when present
-       and aimed at satisfying the `accept` criterion (or the subtask title
-       when the plan entry is flat).
+    1. Implement this subtask only, starting with the `touch` paths when
+       present and aimed at satisfying the `accept` criterion (or the
+       subtask title when the plan entry is flat). Expand beyond the
+       listed paths only when necessary to meet `accept`.
     2. Commit your changes with a descriptive message that references `#{id}`.
     3. **Append a continuation note** under `### Notes` in the workpad, as a
        new sub-block named `#### [#{id}] continuation`, keeping it under ~200

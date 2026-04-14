@@ -4,9 +4,10 @@ defmodule SymphonyElixir.Closeout do
   exits normally. Determines whether the unit is accepted or needs retry.
 
   Closeout behavior per unit kind:
-  - `bootstrap`: check workspace ready, run baseline verify, mark bootstrapped on pass;
-    on baseline failure, still accept but record baseline_verify_failed flag + output
-    for downstream visibility
+  - `bootstrap`: run baseline verify; mark bootstrapped either way so the
+    dispatcher advances past bootstrap_rule. Baseline pass/fail is carried
+    separately by `baseline_verify_failed` / `baseline_verify_output` fields
+    in `issue_exec.json`; downstream units can consume that signal.
   - `plan`: check workpad has parseable checklist, bump plan_version
   - `implement_subtask`: check subtask marked done, doc-impact check
   - `doc_fix`: clear doc_fix_required flag
@@ -45,6 +46,13 @@ defmodule SymphonyElixir.Closeout do
         truncated_output = truncate(output, 2048)
         Logger.warning("Closeout: baseline verification failed")
         IssueExec.set_baseline_verify_failure(workspace, truncated_output)
+        # Mark bootstrapped even on baseline failure. Without this, the
+        # dispatcher's bootstrap_rule (matches on bootstrapped==false) keeps
+        # re-firing forever on an :accepted unit that clears current_unit,
+        # with no circuit-breaker escape. The baseline state lives in
+        # baseline_verify_failed / baseline_verify_output; downstream units
+        # read those to decide whether to fix the baseline before their own work.
+        IssueExec.mark_bootstrapped(workspace)
         Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncated_output})
         Ledger.append(workspace, :baseline_accepted_despite_failure, %{"output" => truncated_output})
         :accepted
@@ -72,13 +80,42 @@ defmodule SymphonyElixir.Closeout do
         handle_verify_fix_closeout(workspace, subtask_id, issue, opts)
 
       true ->
-        accept_implement_subtask(workspace, subtask_id, issue)
+        # Regular plan-N and merge-sync-* — require HEAD advance so uncommitted
+        # work isn't silently destroyed by the next dispatch's workspace reset.
+        # Parallel to the rework / verify-fix guards.
+        case commit_advancement_state(workspace, opts) do
+          :advanced ->
+            accept_implement_subtask(workspace, subtask_id, issue)
+
+          :unchanged ->
+            Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} produced no commit (HEAD unchanged since dispatch) — fix edits may be sitting as uncommitted WIP")
+
+            {:retry, "implement_subtask #{subtask_id || "(nil)"}: produced no commit (edits likely uncommitted WIP)"}
+
+          :cannot_verify ->
+            Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} cannot verify HEAD state (git lookup returned nil)")
+
+            {:retry, "implement_subtask #{subtask_id || "(nil)"}: cannot verify HEAD state"}
+        end
     end
   end
 
-  defp do_closeout("doc_fix", workspace, _unit, _issue, _opts) do
-    IssueExec.clear_doc_fix_required(workspace)
-    :accepted
+  defp do_closeout("doc_fix", workspace, _unit, _issue, opts) do
+    case commit_advancement_state(workspace, opts) do
+      :advanced ->
+        IssueExec.clear_doc_fix_required(workspace)
+        :accepted
+
+      :unchanged ->
+        Logger.warning("Closeout: doc_fix produced no commit (HEAD unchanged since dispatch) — doc edits may be sitting as uncommitted WIP")
+
+        {:retry, "doc_fix: produced no commit (edits likely uncommitted WIP)"}
+
+      :cannot_verify ->
+        Logger.warning("Closeout: doc_fix cannot verify HEAD state (git lookup returned nil)")
+
+        {:retry, "doc_fix: cannot verify HEAD state"}
+    end
   end
 
   defp do_closeout("verify", workspace, _unit, issue, opts) do
@@ -331,7 +368,8 @@ defmodule SymphonyElixir.Closeout do
   # The caller uses :cannot_verify to fail-closed (retry) so transient git
   # lookup failures cannot silently disable the zero-commit guard.
   #
-  # Used by both rework-* and verify-fix-* subtasks — both require a
+  # Used by every mutation-bearing unit — rework-*, verify-fix-*, regular
+  # plan-N / merge-sync-* implement_subtask, and doc_fix. All require a
   # dispatch_head snapshot captured upstream in agent_runner.
   defp commit_advancement_state(workspace, opts) do
     case {Verifier.current_head(workspace), Keyword.get(opts, :dispatch_head)} do

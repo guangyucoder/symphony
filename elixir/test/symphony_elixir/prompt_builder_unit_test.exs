@@ -455,7 +455,10 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
         )
 
       assert prompt =~ "authoritative parse"
-      assert prompt =~ "prefer it over manually re-reading"
+      # Softened phrasing: contract is a starting surface, not a hard fence.
+      assert prompt =~ "start with those files"
+      assert prompt =~ "expand to adjacent"
+      assert prompt =~ "not a hard fence"
     end
 
     test "prompt requires writing a continuation note before marking done" do
