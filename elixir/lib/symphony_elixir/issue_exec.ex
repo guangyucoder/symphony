@@ -15,6 +15,8 @@ defmodule SymphonyElixir.IssueExec do
           last_accepted_unit: map() | nil,
           last_commit_sha: String.t() | nil,
           last_verified_sha: String.t() | nil,
+          baseline_verify_failed: boolean(),
+          baseline_verify_output: String.t() | nil,
           doc_fix_required: boolean(),
           bootstrapped: boolean(),
           plan_version: non_neg_integer(),
@@ -28,6 +30,8 @@ defmodule SymphonyElixir.IssueExec do
     "last_accepted_unit" => nil,
     "last_commit_sha" => nil,
     "last_verified_sha" => nil,
+    "baseline_verify_failed" => false,
+    "baseline_verify_output" => nil,
     "doc_fix_required" => false,
     "rework_fix_applied" => false,
     "bootstrapped" => false,
@@ -130,6 +134,24 @@ defmodule SymphonyElixir.IssueExec do
   @spec mark_bootstrapped(Path.t()) :: :ok | {:error, term()}
   def mark_bootstrapped(workspace) do
     update(workspace, %{"bootstrapped" => true})
+  end
+
+  @doc "Record a baseline verification failure for downstream units."
+  @spec set_baseline_verify_failure(Path.t(), String.t()) :: :ok | {:error, term()}
+  def set_baseline_verify_failure(workspace, output) when is_binary(output) do
+    update(workspace, %{
+      "baseline_verify_failed" => true,
+      "baseline_verify_output" => output
+    })
+  end
+
+  @doc "Clear any recorded baseline verification failure."
+  @spec clear_baseline_verify_failure(Path.t()) :: :ok | {:error, term()}
+  def clear_baseline_verify_failure(workspace) do
+    update(workspace, %{
+      "baseline_verify_failed" => false,
+      "baseline_verify_output" => nil
+    })
   end
 
   @doc "Bump plan version."

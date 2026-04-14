@@ -1,9 +1,26 @@
 defmodule SymphonyElixir.CloseoutTest do
-  use ExUnit.Case, async: true
+  use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{Closeout, IssueExec}
+  alias SymphonyElixir.{Closeout, IssueExec, Ledger, Workflow}
+
+  defmodule FakeLinearClient do
+    def graphql(query, variables) do
+      send(self(), {:graphql_called, query, variables})
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+    end
+  end
 
   setup do
+    linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
+
+    on_exit(fn ->
+      if is_nil(linear_client_module) do
+        Application.delete_env(:symphony_elixir, :linear_client_module)
+      else
+        Application.put_env(:symphony_elixir, :linear_client_module, linear_client_module)
+      end
+    end)
+
     workspace = Path.join(System.tmp_dir!(), "closeout_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(workspace, ".symphony"))
     IssueExec.init(workspace)
@@ -14,10 +31,30 @@ defmodule SymphonyElixir.CloseoutTest do
   @issue %{state: "In Progress", identifier: "ENT-42"}
 
   describe "bootstrap closeout" do
-    test "accepts and marks bootstrapped", %{workspace: ws} do
+    test "accepts and marks bootstrapped after baseline passes", %{workspace: ws} do
+      write_workflow_file!(Workflow.workflow_file_path(), verification_baseline_commands: ["true"])
+
       assert :accepted = Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
+
       {:ok, exec} = IssueExec.read(ws)
       assert exec["bootstrapped"] == true
+      assert exec["baseline_verify_failed"] == false
+      assert exec["baseline_verify_output"] == nil
+      assert ledger_events(ws) |> Enum.member?("baseline_verified")
+    end
+
+    test "accepts bootstrap even when baseline fails, but records the failure for downstream units",
+         %{workspace: ws} do
+      write_workflow_file!(Workflow.workflow_file_path(), verification_baseline_commands: ["false"])
+
+      assert :accepted = Closeout.run(ws, %{"kind" => "bootstrap"}, @issue)
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["bootstrapped"] == false
+      assert exec["baseline_verify_failed"] == true
+      assert is_binary(exec["baseline_verify_output"])
+      assert ledger_events(ws) |> Enum.member?("baseline_verify_failed")
+      assert ledger_events(ws) |> Enum.member?("baseline_accepted_despite_failure")
     end
   end
 
@@ -30,12 +67,16 @@ defmodule SymphonyElixir.CloseoutTest do
       - [ ] [plan-1] First task
       - [ ] [plan-2] Second task
       """
+
       assert :accepted = Closeout.run(ws, %{"kind" => "plan"}, @issue, workpad_text: workpad)
+
       {:ok, exec} = IssueExec.read(ws)
       assert exec["plan_version"] == 1
     end
 
-    test "accepts even without workpad (checklist verification deferred to DispatchResolver)", %{workspace: ws} do
+    test "accepts even without workpad (checklist verification deferred to DispatchResolver)", %{
+      workspace: ws
+    } do
       assert :accepted = Closeout.run(ws, %{"kind" => "plan"}, @issue, workpad_text: "no plan here")
     end
 
@@ -46,8 +87,9 @@ defmodule SymphonyElixir.CloseoutTest do
 
   describe "implement_subtask closeout" do
     test "accepts when no doc impact", %{workspace: ws} do
-      # No git history → changed_files is empty → fresh
-      assert :accepted = Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-1"}, @issue)
+      # No git history -> changed_files is empty -> fresh
+      assert :accepted =
+               Closeout.run(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-1"}, @issue)
     end
   end
 
@@ -58,6 +100,7 @@ defmodule SymphonyElixir.CloseoutTest do
       assert exec["doc_fix_required"] == true
 
       assert :accepted = Closeout.run(ws, %{"kind" => "doc_fix"}, @issue)
+
       {:ok, exec} = IssueExec.read(ws)
       assert exec["doc_fix_required"] == false
     end
@@ -67,7 +110,7 @@ defmodule SymphonyElixir.CloseoutTest do
     test "accepts when verified sha matches HEAD", %{workspace: ws} do
       # Simulate verified state — we can't run real git here, so test the rejection path
       IssueExec.set_verified_sha(ws, "abc123")
-      # HEAD will be nil (no git repo in temp dir) → fail
+      # HEAD will be nil (no git repo in temp dir) -> fail
       assert {:fail, _reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
     end
 
@@ -96,18 +139,33 @@ defmodule SymphonyElixir.CloseoutTest do
       assert exec["phase"] != "done"
     end
 
-    test "accepts with warning when PR status unknown", %{workspace: ws} do
+    test "retries when PR status is unknown, without posting a Linear comment", %{workspace: ws} do
+      Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+      IssueExec.update(ws, %{"phase" => "merging"})
+
       checker = fn _workspace -> :unknown end
-      assert :accepted = Closeout.run(ws, %{"kind" => "merge"}, @issue, merge_checker: checker)
+      issue = Map.put(@issue, :id, "issue-123")
+
+      assert {:retry, "merge status unverified"} =
+               Closeout.run(ws, %{"kind" => "merge"}, issue, merge_checker: checker)
+
+      refute_received {:graphql_called, _, _}
 
       {:ok, exec} = IssueExec.read(ws)
-      assert exec["phase"] == "done"
+      assert exec["phase"] == "merging"
+      assert ledger_events(ws) |> Enum.member?("merge_status_unknown")
     end
   end
 
   describe "unknown unit" do
-    test "accepts gracefully", %{workspace: ws} do
-      assert :accepted = Closeout.run(ws, %{"kind" => "unknown_thing"}, @issue)
+    test "fails closed for unknown unit kind", %{workspace: ws} do
+      assert {:fail, "unknown unit kind: unknown_thing"} =
+               Closeout.run(ws, %{"kind" => "unknown_thing"}, @issue)
     end
+  end
+
+  defp ledger_events(workspace) do
+    {:ok, entries} = Ledger.read(workspace)
+    Enum.map(entries, & &1["event"])
   end
 end
