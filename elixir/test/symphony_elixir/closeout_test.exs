@@ -378,6 +378,89 @@ defmodule SymphonyElixir.CloseoutTest do
       assert exec_after["pending_workpad_mark"] == nil
     end
 
+    test "regular plan-N: nil HEAD (transient git failure) defers recovery and preserves the sentinel", %{workspace: ws} do
+      # Round-5c guard. The previous version treated nil HEAD identically to
+      # "HEAD moved" via `nil != pending_sha`, silently destroying a valid
+      # sentinel on a transient `git rev-parse` failure. The new case branch
+      # must defer recovery (`:still_pending` → `{:retry, _}`) AND leave the
+      # sentinel on disk so the next dispatch can retry once git is reachable.
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      # Plant a valid map-shape sentinel. Workspace has no .git dir, so
+      # `Verifier.current_head/1` returns nil — the defer branch must fire.
+      IssueExec.set_pending_workpad_mark(ws, "plan-1", "abc123abc123abc123abc123abc123abc123abc1")
+
+      assert {:retry, reason} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: "abc123abc123abc123abc123abc123abc123abc1"
+               )
+
+      assert reason =~ "cannot validate sentinel"
+
+      # Sentinel must NOT have been cleared — recovery is deferred, not abandoned.
+      {:ok, exec_after} = IssueExec.read(ws)
+      assert exec_after["pending_workpad_mark"] == %{
+               "subtask_id" => "plan-1",
+               "committed_sha" => "abc123abc123abc123abc123abc123abc123abc1"
+             }
+    end
+
+    test "regular plan-N: legacy binary sentinel from a prior release is cleared during upgrade", %{workspace: ws} do
+      # Round-5c guard for the schema migration. Round-5 wrote
+      # `pending_workpad_mark` as a bare binary; round-5b switched to a map.
+      # An in-flight workspace upgraded across releases may still have the
+      # binary on disk. Recovery must clear it (with a log) and let the
+      # normal HEAD-advance flow run; otherwise the upgrade burns a retry
+      # before the next writer overwrites the field.
+      previous = Application.get_env(:symphony_elixir, :linear_client_module)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:symphony_elixir, :linear_client_module, previous),
+          else: Application.delete_env(:symphony_elixir, :linear_client_module)
+      end)
+
+      defmodule AlwaysOkLinearClient do
+        @workpad %{
+          "id" => "comment-workpad-1",
+          "body" => "## Codex Workpad\n\n### Plan\n- [ ] [plan-1] First\n",
+          "user" => %{"name" => "Symphony"},
+          "createdAt" => "2026-04-15T00:00:00.000Z"
+        }
+
+        def graphql(_query, %{issueId: _}),
+          do: {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => [@workpad]}}}}}
+
+        def graphql(_query, %{commentId: _, body: _}),
+          do: {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+      end
+
+      Application.put_env(:symphony_elixir, :linear_client_module, AlwaysOkLinearClient)
+
+      # Plant a legacy binary sentinel directly (bypass the typed setter).
+      IssueExec.update(ws, %{"pending_workpad_mark" => "plan-1"})
+
+      {dispatch_head, _post_commit_head} = init_git_and_advance!(ws)
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      # Recovery sees the binary, clears it via maybe_clear_legacy_sentinel,
+      # falls through to normal flow. HEAD advanced since dispatch → :advanced
+      # → accept_implement_subtask → mark succeeds → :accepted.
+      assert :accepted =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: dispatch_head
+               )
+
+      {:ok, exec_after} = IssueExec.read(ws)
+      assert exec_after["pending_workpad_mark"] == nil
+    end
+
     test "synthetic subtasks (rework-/verify-fix-/merge-sync-): Linear mark failure does NOT retry", %{workspace: ws} do
       # Synthetic subtask kinds (rework-* / verify-fix-* / merge-sync-*) are
       # not dispatched from the workpad checklist, so a workpad mark failure
