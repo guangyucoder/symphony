@@ -12,13 +12,17 @@ defmodule SymphonyElixir.Config do
   # carry them. NimbleOptions only validates keys we extract, so silent
   # acceptance is the failure mode without this guard. Warn once on each
   # removed key so operators notice instead of silently running stripped-down
-  # behaviour.
+  # behaviour. The "once" part is real: `validated_workflow_options/0` runs on
+  # every Config getter (every dispatch tick × ~30 getters), so dedup matters
+  # — without it we'd produce thousands of identical warnings per day per stale
+  # key and drown real errors.
   @removed_workflow_keys [
     {["agent", "execution_mode"], "agent.execution_mode (legacy mode was removed; unit-lite is the only mode)"},
     {["agent", "max_turns"], "agent.max_turns (multi-turn loop was removed; one dispatch = one turn)"},
     {["agent", "compact_between_turns"], "agent.compact_between_turns (no multi-turn loop to compact)"},
     {["docs", "doc_impact_command"], "docs.doc_impact_command (DocImpact was removed; doc_fix runs unconditionally before verify)"}
   ]
+  @removed_workflow_keys_warning_table :symphony_config_removed_keys_warnings
 
   @default_active_states ["Todo", "In Progress"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
@@ -495,10 +499,55 @@ defmodule SymphonyElixir.Config do
   defp warn_on_removed_keys(config) do
     Enum.each(@removed_workflow_keys, fn {path, label} ->
       case get_in_path(config, path) do
-        :missing -> :ok
-        _ -> Logger.warning("Config: WORKFLOW.md still sets #{label}; this key has been removed and is now ignored")
+        :missing ->
+          :ok
+
+        _ ->
+          if mark_removed_key_warning_emitted(path) do
+            Logger.warning("Config: WORKFLOW.md still sets #{label}; this key has been removed and is now ignored")
+          end
       end
     end)
+  end
+
+  # ETS-backed warn-once table. Keyed by the removed-key path — once we've
+  # warned for `agent.max_turns`, we won't warn again until the table is reset.
+  # Resetting on Workflow reload would be ideal, but for now boot-once dedup
+  # is enough to stop dispatch-loop log spam.
+  defp mark_removed_key_warning_emitted(path) do
+    :ets.insert_new(ensure_removed_keys_warning_table(), {path, true})
+  end
+
+  defp ensure_removed_keys_warning_table do
+    case :ets.whereis(@removed_workflow_keys_warning_table) do
+      :undefined ->
+        try do
+          :ets.new(@removed_workflow_keys_warning_table, [
+            :named_table,
+            :public,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> @removed_workflow_keys_warning_table
+        end
+
+      table ->
+        table
+    end
+  end
+
+  @doc false
+  # Test-only: reset the warn-once dedup table so capture_log can observe
+  # the warning more than once per VM lifetime.
+  def __reset_removed_keys_warning_table__ do
+    case :ets.whereis(@removed_workflow_keys_warning_table) do
+      :undefined -> :ok
+      _ -> :ets.delete_all_objects(@removed_workflow_keys_warning_table)
+    end
+
+    :ok
   end
 
   defp extract_workflow_options(config) do

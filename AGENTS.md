@@ -91,7 +91,7 @@ if Rework + stale                             → plan (reset)
 if !bootstrapped                              → bootstrap
 if !checklist                                 → plan
 if pending subtask                            → implement_subtask(next)
-if all done + last_accepted_unit ∉ {doc_fix, verify, handoff} → doc_fix (mandatory pre-verify pass; clean no-op accepted)
+if all done + last_accepted_unit ∉ {doc_fix, verify, handoff} and last subtask_id is not "verify-fix-*" → doc_fix (mandatory pre-verify pass; clean no-op accepted)
 if unverified                                 → verify
 else                                          → handoff
 ```

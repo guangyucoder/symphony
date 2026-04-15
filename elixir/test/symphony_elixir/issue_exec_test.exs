@@ -29,6 +29,31 @@ defmodule SymphonyElixir.IssueExecTest do
       assert state["mode"] == "unit_lite"
       assert state["bootstrapped"] == false
     end
+
+    test "fills new schema fields with defaults when on-disk file is missing them (upgrade path)", %{workspace: ws} do
+      # Simulate an issue_exec.json written by an older Symphony build that
+      # predates round-5 fields (e.g., `pending_workpad_mark`). After upgrade,
+      # `read/1` must not lose these defaults, otherwise downstream code that
+      # reads `exec["pending_workpad_mark"]` would explode on KeyError.
+      legacy_state = %{
+        "mode" => "unit_lite",
+        "phase" => "implementing",
+        "bootstrapped" => true,
+        "plan_version" => 1
+      }
+
+      File.mkdir_p!(Path.join(ws, ".symphony"))
+      File.write!(Path.join([ws, ".symphony", "issue_exec.json"]), Jason.encode!(legacy_state))
+
+      {:ok, state} = IssueExec.read(ws)
+
+      assert state["pending_workpad_mark"] == nil
+      assert state["baseline_verify_failed"] == false
+      assert state["verify_attempt"] == 0
+      # Pre-existing legacy values are preserved through the merge.
+      assert state["bootstrapped"] == true
+      assert state["plan_version"] == 1
+    end
   end
 
   describe "update/2" do

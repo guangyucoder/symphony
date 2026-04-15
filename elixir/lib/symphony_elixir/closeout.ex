@@ -382,11 +382,21 @@ defmodule SymphonyElixir.Closeout do
         post_accept_implement_subtask(workspace, subtask_id)
 
       {:retry, reason} ->
-        # The work is committed but the workpad mark failed. Persist a
-        # sentinel so the next closeout entry can retry the mark without
-        # requiring HEAD to advance again (no further commit is coming).
+        # The work is committed but the workpad mark failed. Persist a sentinel
+        # (subtask_id + the post-commit HEAD) so the next closeout entry can
+        # retry the mark without requiring HEAD to advance again. The HEAD pin
+        # is essential: without it, a stale sentinel that survives a replan
+        # could fast-path-accept a new attempt whose work hasn't actually
+        # committed.
         if regular_plan_subtask?(subtask_id) do
-          IssueExec.set_pending_workpad_mark(workspace, subtask_id)
+          case Verifier.current_head(workspace) do
+            sha when is_binary(sha) ->
+              IssueExec.set_pending_workpad_mark(workspace, subtask_id, sha)
+
+            _ ->
+              # Can't capture HEAD → don't set a sentinel that recovery can't validate.
+              :ok
+          end
         end
 
         {:retry, reason}
@@ -394,26 +404,43 @@ defmodule SymphonyElixir.Closeout do
   end
 
   # Fast-path: if a previous closeout already committed the work and only the
-  # Linear mark failed, retry the mark here. No HEAD advance is required.
+  # Linear mark failed, retry the mark here. No HEAD advance is required, but
+  # we DO require HEAD to still equal the committed_sha captured at sentinel-set
+  # time — otherwise the sentinel has been invalidated by intervening commits
+  # / resets / replans and falling through to the normal HEAD-advance check is
+  # the safe move.
+  #
   # Returns :recovered (mark succeeded; caller should run post-accept),
   # {:still_pending, reason} (mark still failing; caller should retry the unit),
-  # or :no_pending (no recovery applies; caller should run normal flow).
+  # or :no_pending (no recovery applies; caller should run normal flow). On
+  # stale-sentinel detection we clear the sentinel and return :no_pending so
+  # the caller's normal flow runs and can take a fresh decision.
   defp recover_pending_workpad_mark(workspace, subtask_id, issue) do
     with true <- regular_plan_subtask?(subtask_id),
          {:ok, exec} <- IssueExec.read(workspace),
-         pending when is_binary(pending) <- exec["pending_workpad_mark"],
-         true <- pending == subtask_id,
+         %{"subtask_id" => pending_id, "committed_sha" => pending_sha} when is_binary(pending_id) and is_binary(pending_sha) <-
+           exec["pending_workpad_mark"],
+         true <- pending_id == subtask_id,
          issue_id when is_binary(issue_id) <- issue_id(issue) do
-      case Adapter.mark_subtask_done(issue_id, subtask_id) do
-        :ok ->
+      cond do
+        Verifier.current_head(workspace) != pending_sha ->
+          Logger.info("Closeout: clearing stale pending workpad mark for #{subtask_id} (HEAD has moved since sentinel was set)")
+
           IssueExec.clear_pending_workpad_mark(workspace)
-          Logger.info("Closeout: recovered pending Linear workpad mark for #{subtask_id}")
-          :recovered
+          :no_pending
 
-        {:error, reason} ->
-          Logger.warning("Closeout: pending workpad mark for #{subtask_id} still failing: #{inspect(reason)}")
+        true ->
+          case Adapter.mark_subtask_done(issue_id, subtask_id) do
+            :ok ->
+              IssueExec.clear_pending_workpad_mark(workspace)
+              Logger.info("Closeout: recovered pending Linear workpad mark for #{subtask_id}")
+              :recovered
 
-          {:still_pending, "implement_subtask #{subtask_id}: workpad sync still failing (#{inspect(reason)})"}
+            {:error, reason} ->
+              Logger.warning("Closeout: pending workpad mark for #{subtask_id} still failing: #{inspect(reason)}")
+
+              {:still_pending, "implement_subtask #{subtask_id}: workpad sync still failing (#{inspect(reason)})"}
+          end
       end
     else
       _ -> :no_pending
@@ -459,6 +486,14 @@ defmodule SymphonyElixir.Closeout do
   # strings, whitespace) is NOT a plan-N, so a Linear-mark failure is at most
   # bookkeeping noise and must not promote to a unit retry — that would
   # circuit-break a synthetic dispatch over a checkbox the workpad never had.
+  #
+  # The planner prompt (see `prompt_builder.ex` plan unit instructions) is the
+  # source of truth for subtask-id shape — it instructs the agent to emit
+  # `[plan-N]` checkboxes and only those. WorkpadParser will accept other
+  # explicit ids (`plan-db`, `cleanup-1`, etc.) for forward-compat, but
+  # those are downgraded to warn-only here on the same theory: if the planner
+  # prompt ever loosens, this regex must loosen with it (or we silently lose
+  # split-brain protection for the new id shapes).
   defp regular_plan_subtask?(subtask_id) when is_binary(subtask_id) do
     Regex.match?(~r/^plan-\d+$/, subtask_id)
   end

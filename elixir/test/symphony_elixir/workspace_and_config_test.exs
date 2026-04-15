@@ -1338,4 +1338,101 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       {:error, :enoent} -> 0
     end
   end
+
+  describe "Config.warn_on_removed_keys" do
+    setup do
+      # Reset the warn-once dedup table so each test observes the warning
+      # itself, not a no-op caused by a prior test having tripped the table.
+      SymphonyElixir.Config.__reset_removed_keys_warning_table__()
+      :ok
+    end
+
+    test "logs a warning for each stale removed key in WORKFLOW.md" do
+      stale_workflow = """
+      ---
+      tracker:
+        kind: linear
+        api_key: token
+        project_slug: project
+      agent:
+        execution_mode: legacy
+        max_turns: 99
+        compact_between_turns: true
+      docs:
+        doc_impact_command: ./scripts/doc_check.sh
+      ---
+      Prompt body.
+      """
+
+      File.write!(SymphonyElixir.Workflow.workflow_file_path(), stale_workflow)
+
+      if Process.whereis(SymphonyElixir.WorkflowStore) do
+        try do
+          SymphonyElixir.WorkflowStore.force_reload()
+        catch
+          :exit, _ -> :ok
+        end
+      end
+
+      log =
+        capture_log(fn ->
+          # Any Config getter triggers validated_workflow_options/0 once.
+          SymphonyElixir.Config.tracker_kind()
+        end)
+
+      assert log =~ "agent.execution_mode"
+      assert log =~ "agent.max_turns"
+      assert log =~ "agent.compact_between_turns"
+      assert log =~ "docs.doc_impact_command"
+    end
+
+    test "warn fires only once per key across many getter calls (dedup)" do
+      stale_workflow = """
+      ---
+      tracker:
+        kind: linear
+        api_key: token
+        project_slug: project
+      agent:
+        max_turns: 42
+      ---
+      Prompt body.
+      """
+
+      File.write!(SymphonyElixir.Workflow.workflow_file_path(), stale_workflow)
+
+      if Process.whereis(SymphonyElixir.WorkflowStore) do
+        try do
+          SymphonyElixir.WorkflowStore.force_reload()
+        catch
+          :exit, _ -> :ok
+        end
+      end
+
+      log =
+        capture_log(fn ->
+          # Hit several getters — each calls validated_workflow_options/0.
+          # Without dedup, this would log N warnings for max_turns.
+          for _ <- 1..5 do
+            SymphonyElixir.Config.tracker_kind()
+            SymphonyElixir.Config.poll_interval_ms()
+            SymphonyElixir.Config.max_concurrent_agents()
+          end
+        end)
+
+      max_turns_warnings = Regex.scan(~r/agent\.max_turns/, log) |> length()
+      assert max_turns_warnings == 1, "expected exactly one warning for agent.max_turns, got #{max_turns_warnings}"
+    end
+
+    test "does not warn when WORKFLOW.md is clean" do
+      write_workflow_file!(SymphonyElixir.Workflow.workflow_file_path())
+
+      log =
+        capture_log(fn ->
+          SymphonyElixir.Config.tracker_kind()
+        end)
+
+      refute log =~ "this key has been removed"
+    end
+  end
 end

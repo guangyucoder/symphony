@@ -145,10 +145,21 @@ defmodule SymphonyElixir.IssueExec do
   Record that a regular plan-N subtask committed code but its Linear workpad
   mark failed. Closeout uses this on the next dispatch to recover the mark
   without requiring HEAD to advance again (the work is already in HEAD).
+
+  Stores both the `subtask_id` and the `committed_sha` at set time. Recovery
+  must verify current HEAD equals `committed_sha` before fast-pathing the
+  accept — otherwise a stale sentinel that survives a replan / re-emission
+  of the same plan-N could accept a new attempt without verifying its commit.
   """
-  @spec set_pending_workpad_mark(Path.t(), String.t()) :: :ok | {:error, term()}
-  def set_pending_workpad_mark(workspace, subtask_id) when is_binary(subtask_id) do
-    update(workspace, %{"pending_workpad_mark" => subtask_id})
+  @spec set_pending_workpad_mark(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def set_pending_workpad_mark(workspace, subtask_id, committed_sha)
+      when is_binary(subtask_id) and is_binary(committed_sha) do
+    update(workspace, %{
+      "pending_workpad_mark" => %{
+        "subtask_id" => subtask_id,
+        "committed_sha" => committed_sha
+      }
+    })
   end
 
   @doc "Clear the pending workpad mark sentinel after a successful retry."
@@ -191,7 +202,11 @@ defmodule SymphonyElixir.IssueExec do
       "merge_conflict" => false,
       "merge_sync_count" => 0,
       "mergeability_unknown_count" => 0,
-      "merge_needs_verify" => false
+      "merge_needs_verify" => false,
+      # A new rework cycle invalidates any prior plan-N workpad-mark bookkeeping;
+      # the new plan may re-emit plan-N with different content, and recovery
+      # against a stale sentinel would mark the wrong work done on Linear.
+      "pending_workpad_mark" => nil
     })
   end
 

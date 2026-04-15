@@ -296,7 +296,8 @@ defmodule SymphonyElixir.CloseoutTest do
       {dispatch_head, _post_commit_head} = init_git_and_advance!(ws)
       issue = Map.put(@issue, :id, "issue-with-linear-id")
 
-      # First attempt: HEAD advanced, mark fails → {:retry, _}, sentinel set.
+      # First attempt: HEAD advanced, mark fails → {:retry, _}, sentinel set
+      # to the map shape carrying both subtask_id and the post-commit HEAD.
       assert {:retry, _} =
                Closeout.run(
                  ws,
@@ -305,15 +306,18 @@ defmodule SymphonyElixir.CloseoutTest do
                  dispatch_head: dispatch_head
                )
 
+      post_commit_head = Verifier.current_head(ws)
+
       {:ok, exec_after_first} = IssueExec.read(ws)
-      assert exec_after_first["pending_workpad_mark"] == "plan-1"
+      assert exec_after_first["pending_workpad_mark"] == %{
+               "subtask_id" => "plan-1",
+               "committed_sha" => post_commit_head
+             }
 
       # Second attempt: dispatch_head is the post-commit HEAD (HEAD will NOT
       # advance again since no agent work is needed). Without the recovery
       # path, this would hit :unchanged → retry → loop. With it: fast-path
       # retries the mark, succeeds, accepts, and clears the sentinel.
-      post_commit_head = Verifier.current_head(ws)
-
       assert :accepted =
                Closeout.run(
                  ws,
@@ -324,6 +328,54 @@ defmodule SymphonyElixir.CloseoutTest do
 
       {:ok, exec_after_second} = IssueExec.read(ws)
       assert exec_after_second["pending_workpad_mark"] == nil
+    end
+
+    test "regular plan-N: stale sentinel (HEAD moved) is cleared and falls through to normal flow", %{workspace: ws} do
+      # Guard for round-5 review finding: the recovery fast-path must not
+      # accept-with-no-commit when the sentinel is stale (HEAD has moved past
+      # the captured committed_sha — e.g., a replan re-emitted the same plan-N
+      # with different content). In that case it should clear the stale
+      # sentinel and let the normal HEAD-advance check decide.
+      previous = Application.get_env(:symphony_elixir, :linear_client_module)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:symphony_elixir, :linear_client_module, previous),
+          else: Application.delete_env(:symphony_elixir, :linear_client_module)
+      end)
+
+      defmodule AlwaysFailLinearClient do
+        def graphql(_query, _vars), do: {:error, :network_unreachable}
+      end
+
+      Application.put_env(:symphony_elixir, :linear_client_module, AlwaysFailLinearClient)
+
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      # Manually plant a sentinel that points at a SHA that does not match
+      # current HEAD (simulating "HEAD moved since sentinel was set").
+      IssueExec.set_pending_workpad_mark(ws, "plan-1", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
+      {_dispatch_head, _} = init_git_and_advance!(ws)
+      post_commit_head = Verifier.current_head(ws)
+      refute post_commit_head == "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+      # With dispatch_head == post-commit HEAD (i.e., :unchanged in the normal
+      # path), the stale-sentinel branch must clear the sentinel and the
+      # normal :unchanged retry must fire. Without the stale check, the
+      # fast-path would incorrectly accept on a subsequent successful mark.
+      assert {:retry, reason} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: post_commit_head
+               )
+
+      assert reason =~ "produced no commit"
+
+      {:ok, exec_after} = IssueExec.read(ws)
+      assert exec_after["pending_workpad_mark"] == nil
     end
 
     test "synthetic subtasks (rework-/verify-fix-/merge-sync-): Linear mark failure does NOT retry", %{workspace: ws} do

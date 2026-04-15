@@ -324,8 +324,12 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
 
       assert prompt =~ "When NOT to keep trying"
       assert prompt =~ "infrastructure"
-      assert prompt =~ "Linear"
       assert prompt =~ "circuit breaker"
+      # Action pins: the paragraph must instruct the agent to comment + exit,
+      # not just reframe the situation. Without these, a refactor that kept
+      # the framing but dropped the action would slip through.
+      assert prompt =~ "post a short Linear comment"
+      assert prompt =~ ~r/(then exit|after exiting)/
     end
 
     test "merge-sync-* does NOT receive workpad injection" do
