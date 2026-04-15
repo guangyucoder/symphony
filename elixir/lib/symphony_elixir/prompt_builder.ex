@@ -3,10 +3,6 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
-
-  @render_opts [strict_variables: true, strict_filters: true]
-
   alias SymphonyElixir.Unit
 
   @doc """
@@ -337,6 +333,18 @@ defmodule SymphonyElixir.PromptBuilder do
 
     Do NOT skip, disable, or delete tests — fix or update them.
     Do NOT do handoff or create a PR — the orchestrator handles the rest.
+
+    ### When NOT to keep trying
+    If the failure does not look like a code or test bug — for example: CI
+    infrastructure outage, GitHub Actions / runner unreachable, a dependency
+    that cannot be downloaded, a permission/billing/auth error from an
+    external service, a network timeout — do NOT keep editing code. The
+    environment, not the code, is broken, and "fix the env" is not your job
+    here. Instead: write a short summary of what you observed and why you
+    believe it is an infrastructure / human-ops issue, post it as a comment
+    on the Linear issue, and stop. The orchestrator will escalate to Human
+    Input Needed once you exit; a few wasted retries are far cheaper than
+    code damage from forcing edits onto a green codebase.
     """
   end
 
@@ -572,60 +580,5 @@ defmodule SymphonyElixir.PromptBuilder do
     - Never commit/push from main/master.
     - Unattended session — never ask human for input.
     """
-  end
-
-  @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
-  def build_prompt(issue, opts \\ []) do
-    template =
-      Workflow.current()
-      |> prompt_template!()
-      |> parse_template!()
-
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.iodata_to_binary()
-  end
-
-  defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
-
-  defp prompt_template!({:error, reason}) do
-    raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
-  end
-
-  defp parse_template!(prompt) when is_binary(prompt) do
-    Solid.parse!(prompt)
-  rescue
-    error ->
-      reraise %RuntimeError{
-                message: "template_parse_error: #{Exception.message(error)} template=#{inspect(prompt)}"
-              },
-              __STACKTRACE__
-  end
-
-  defp to_solid_map(map) when is_map(map) do
-    Map.new(map, fn {key, value} -> {to_string(key), to_solid_value(value)} end)
-  end
-
-  defp to_solid_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp to_solid_value(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
-  defp to_solid_value(%Date{} = value), do: Date.to_iso8601(value)
-  defp to_solid_value(%Time{} = value), do: Time.to_iso8601(value)
-  defp to_solid_value(%_{} = value), do: value |> Map.from_struct() |> to_solid_map()
-  defp to_solid_value(value) when is_map(value), do: to_solid_map(value)
-  defp to_solid_value(value) when is_list(value), do: Enum.map(value, &to_solid_value/1)
-  defp to_solid_value(value), do: value
-
-  defp default_prompt(prompt) when is_binary(prompt) do
-    if String.trim(prompt) == "" do
-      Config.workflow_prompt()
-    else
-      prompt
-    end
   end
 end

@@ -68,8 +68,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       with {:ok, session_policies} <- session_policies(expanded_workspace),
            {:ok, resumed_thread_id} <-
              do_resume_session(port, expanded_workspace, session_policies, thread_id) do
-        {:ok,
-         build_session(port, metadata, session_policies, resumed_thread_id, expanded_workspace)}
+        {:ok, build_session(port, metadata, session_policies, resumed_thread_id, expanded_workspace)}
       else
         {:error, reason} ->
           stop_port(port)
@@ -126,9 +125,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
           {:ok, result} ->
-            Logger.info(
-              "Codex session completed for #{issue_context(issue)} session_id=#{session_id}"
-            )
+            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
             {:ok,
              %{
@@ -139,9 +136,7 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
-            Logger.warning(
-              "Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}"
-            )
+            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
             emit_message(
               on_message,
@@ -250,8 +245,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:invalid_workspace_cwd, :workspace_root, workspace_path}}
 
       not String.starts_with?(workspace_path <> "/", root_prefix) ->
-        {:error,
-         {:invalid_workspace_cwd, :outside_workspace_root, workspace_path, workspace_root}}
+        {:error, {:invalid_workspace_cwd, :outside_workspace_root, workspace_path, workspace_root}}
 
       true ->
         :ok
@@ -299,12 +293,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         "model_reasoning_effort=#{reasoning_effort}"
       )
     else
-      result = String.replace(
-        base,
-        "app-server",
-        "--config model_reasoning_effort=#{reasoning_effort} app-server",
-        global: false
-      )
+      result =
+        String.replace(
+          base,
+          "app-server",
+          "--config model_reasoning_effort=#{reasoning_effort} app-server",
+          global: false
+        )
 
       if result == base do
         Logger.warning("codex_command_with_effort: command lacks 'app-server', reasoning_effort=#{reasoning_effort} was NOT applied to: #{base}")
@@ -974,8 +969,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       Enum.reduce_while(questions, %{}, fn question, acc ->
         case tool_request_user_input_question_id(question) do
           {:ok, question_id} ->
-            {:cont,
-             Map.put(acc, question_id, %{"answers" => [@non_interactive_tool_input_answer]})}
+            {:cont, Map.put(acc, question_id, %{"answers" => [@non_interactive_tool_input_answer]})}
 
           :error ->
             {:halt, :error}

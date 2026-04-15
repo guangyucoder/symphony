@@ -595,18 +595,22 @@ defmodule SymphonyElixir.StatusDashboard do
       []
     else
       Enum.map(completed, fn cu ->
-        kind = compact_unit_kind(
-          cu[:unit_kind] || "",
-          cu[:unit_display_name]
-        )
+        kind =
+          compact_unit_kind(
+            cu[:unit_kind] || "",
+            cu[:unit_display_name]
+          )
+
         effort = effort_label(cu[:reasoning_effort])
         tokens = Map.get(cu[:tokens] || %{}, :total_tokens, 0)
-        result_icon = case cu[:result] do
-          :accepted -> "✓"
-          {:retry, _} -> "↻"
-          {:fail, _} -> "✗"
-          _ -> "✓"
-        end
+
+        result_icon =
+          case cu[:result] do
+            :accepted -> "✓"
+            {:retry, _} -> "↻"
+            {:fail, _} -> "✗"
+            _ -> "✓"
+          end
 
         stage_text = format_cell("#{result_icon} #{kind} #{effort}", @running_stage_width)
         tokens_text = format_count(tokens) |> format_cell(@running_tokens_width, :right)

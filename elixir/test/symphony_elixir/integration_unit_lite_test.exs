@@ -167,21 +167,14 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       # Step 1: implement plan-1
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-1"}} = resolve(ws, @issue, workpad)
 
-      # Simulate subtask complete + doc impact detected
+      # Simulate subtask complete (no per-subtask doc_fix detection; doc_fix
+      # runs once after all subtasks are done — see Scenario A)
       IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-1"})
       IssueExec.accept_unit(ws)
-      IssueExec.mark_doc_fix_required(ws, "architecture_doc_stale")
-      Ledger.doc_fix_required(ws, "architecture_doc_stale")
 
       workpad_after_1 = String.replace(workpad, "- [ ] [plan-1]", "- [x] [plan-1]")
 
-      # Step 2: resolve → doc_fix (NOT plan-2!)
-      assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, @issue, workpad_after_1)
-
-      # Simulate doc_fix complete
-      assert :accepted = simulate_unit_complete(ws, %{"kind" => "doc_fix"}, @issue)
-
-      # Step 3: resolve → implement plan-2 (doc_fix cleared)
+      # Resolve → next implement, NOT doc_fix (doc_fix is a pre-verify sweep)
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = resolve(ws, @issue, workpad_after_1)
     end
   end
@@ -288,16 +281,12 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       IssueExec.accept_unit(ws)
       IssueExec.update(ws, %{"rework_fix_applied" => true})
 
-      # Simulate doc_fix triggered
-      IssueExec.mark_doc_fix_required(ws, "arch files changed")
-
-      # Step 2: resolve → doc_fix (NOT another rework fix!)
+      # Step 2: resolve → doc_fix (mandatory pre-verify sweep, NOT another rework fix!)
       assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad_all_done)
 
       # Simulate doc_fix accepted
       IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
       IssueExec.accept_unit(ws)
-      IssueExec.clear_doc_fix_required(ws)
 
       # Step 3: resolve → verify (NOT rework fix again!)
       assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad_all_done)
@@ -386,13 +375,11 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "rework-1"})
       IssueExec.accept_unit(ws)
       IssueExec.update(ws, %{"rework_fix_applied" => true, "last_verified_sha" => nil})
-      IssueExec.mark_doc_fix_required(ws, "docs stale")
 
-      # Step 2: doc_fix
+      # Step 2: doc_fix (mandatory pre-verify sweep)
       assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad)
       IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
       IssueExec.accept_unit(ws)
-      IssueExec.clear_doc_fix_required(ws)
 
       # Step 3: verify
       assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad)
@@ -645,7 +632,6 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
       IssueExec.accept_unit(ws)
-      IssueExec.clear_doc_fix_required(ws)
 
       # --- Dispatch 3: cleanup + resolve → verify ---
       simulate_rework_cleanup(ws)

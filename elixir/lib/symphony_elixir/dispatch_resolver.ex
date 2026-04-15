@@ -31,8 +31,8 @@ defmodule SymphonyElixir.DispatchResolver do
   @spec resolve(resolve_context()) :: result()
   def resolve(%{issue: issue} = ctx) do
     rules(flow(issue))
-    |> Enum.find_value(fn rule -> rule.(ctx) end)
-    || {:stop, :no_matching_rule}
+    |> Enum.find_value(fn rule -> rule.(ctx) end) ||
+      {:stop, :no_matching_rule}
   end
 
   # --- Flow routing ---
@@ -49,41 +49,42 @@ defmodule SymphonyElixir.DispatchResolver do
 
   # --- Rule tables ---
 
-  defp rules(:merging), do: [
-    &replay_current_unit_rule/1,
-    &verify_fix_rule/1,
-    &merge_sync_rule/1,
-    &merge_verify_rule/1,
-    &merge_rule/1,
-    &merge_done_rule/1
-  ]
+  defp rules(:merging),
+    do: [
+      &replay_current_unit_rule/1,
+      &verify_fix_rule/1,
+      &merge_sync_rule/1,
+      &merge_verify_rule/1,
+      &merge_rule/1,
+      &merge_done_rule/1
+    ]
 
-  defp rules(:rework), do: [
-    &replay_current_unit_rule/1,
-    &rework_fix_rule/1,
-    &rework_reset_rule/1,
-    &plan_rule/1,
-    &doc_fix_rule/1,
-    &implement_subtask_rule/1,
-    &pre_verify_doc_check_rule/1,
-    &verify_fix_rule/1,
-    &verify_rule/1,
-    &handoff_rule/1,
-    &done_rule/1
-  ]
+  defp rules(:rework),
+    do: [
+      &replay_current_unit_rule/1,
+      &rework_fix_rule/1,
+      &rework_reset_rule/1,
+      &plan_rule/1,
+      &implement_subtask_rule/1,
+      &pre_verify_doc_check_rule/1,
+      &verify_fix_rule/1,
+      &verify_rule/1,
+      &handoff_rule/1,
+      &done_rule/1
+    ]
 
-  defp rules(:normal), do: [
-    &replay_current_unit_rule/1,
-    &done_rule/1,
-    &bootstrap_rule/1,
-    &plan_rule/1,
-    &doc_fix_rule/1,
-    &implement_subtask_rule/1,
-    &pre_verify_doc_check_rule/1,
-    &verify_fix_rule/1,
-    &verify_rule/1,
-    &handoff_rule/1
-  ]
+  defp rules(:normal),
+    do: [
+      &replay_current_unit_rule/1,
+      &done_rule/1,
+      &bootstrap_rule/1,
+      &plan_rule/1,
+      &implement_subtask_rule/1,
+      &pre_verify_doc_check_rule/1,
+      &verify_fix_rule/1,
+      &verify_rule/1,
+      &handoff_rule/1
+    ]
 
   # --- Rule implementations ---
 
@@ -92,8 +93,13 @@ defmodule SymphonyElixir.DispatchResolver do
   # and escalate to human instead of burning tokens forever.
   @valid_unit_kinds ~w(bootstrap plan implement_subtask doc_fix verify handoff merge)
   @kind_atoms %{
-    "bootstrap" => :bootstrap, "plan" => :plan, "implement_subtask" => :implement_subtask,
-    "doc_fix" => :doc_fix, "verify" => :verify, "handoff" => :handoff, "merge" => :merge
+    "bootstrap" => :bootstrap,
+    "plan" => :plan,
+    "implement_subtask" => :implement_subtask,
+    "doc_fix" => :doc_fix,
+    "verify" => :verify,
+    "handoff" => :handoff,
+    "merge" => :merge
   }
 
   defp replay_current_unit_rule(%{exec: %{"current_unit" => unit} = exec}) when not is_nil(unit) do
@@ -117,20 +123,18 @@ defmodule SymphonyElixir.DispatchResolver do
         kind = Map.fetch!(@kind_atoms, kind_str)
         subtask_id = unit["subtask_id"]
 
-        base_unit = case {kind, subtask_id} do
-          {:implement_subtask, id} -> Unit.implement_subtask(id, replay_subtask_text(id, exec))
-          {:bootstrap, _} -> Unit.bootstrap()
-          {:plan, _} -> Unit.plan()
-          {:doc_fix, _} -> Unit.doc_fix()
-          {:verify, _} -> Unit.verify()
-          {:handoff, _} -> Unit.handoff()
-          {:merge, _} -> Unit.merge()
-        end
+        base_unit =
+          case {kind, subtask_id} do
+            {:implement_subtask, id} -> Unit.implement_subtask(id, replay_subtask_text(id, exec))
+            {:bootstrap, _} -> Unit.bootstrap()
+            {:plan, _} -> Unit.plan()
+            {:doc_fix, _} -> Unit.doc_fix()
+            {:verify, _} -> Unit.verify()
+            {:handoff, _} -> Unit.handoff()
+            {:merge, _} -> Unit.merge()
+          end
 
-        {:dispatch, %{base_unit |
-          display_name: "replay:#{kind_str}#{if subtask_id, do: ":#{subtask_id}", else: ""}",
-          attempt: attempt
-        }}
+        {:dispatch, %{base_unit | display_name: "replay:#{kind_str}#{if subtask_id, do: ":#{subtask_id}", else: ""}", attempt: attempt}}
     end
   end
 
@@ -232,35 +236,29 @@ defmodule SymphonyElixir.DispatchResolver do
     end
   end
 
-  # Doc fix: required flag is set — dispatch before next coding subtask
-  defp doc_fix_rule(%{exec: %{"doc_fix_required" => true}}) do
-    {:dispatch, Unit.doc_fix()}
-  end
-
-  defp doc_fix_rule(_), do: nil
-
   # Implement subtask: next unchecked item
   defp implement_subtask_rule(%{workpad_text: workpad_text}) do
     case WorkpadParser.next_pending(workpad_text) do
       %{id: id, text: text} ->
         {:dispatch, Unit.implement_subtask(id, text)}
+
       nil ->
         nil
     end
   end
 
-  # Pre-verify doc check: run doc-impact once after all subtasks are done.
-  # If docs are stale, dispatch doc_fix before verify. This replaces the
-  # per-subtask doc-impact check that was burning N×doc_fix sessions.
+  # Pre-verify doc sweep: dispatch doc_fix exactly once, after all subtasks
+  # are checked off, before verify runs. doc_fix is a mandatory pre-verify
+  # documentation pass — the orchestrator does not try to predict whether
+  # docs are stale (a previous DocImpact heuristic was removed because its
+  # path-pattern signal had a near-100% false-positive rate, so plugging it
+  # in produced behavior identical to "always dispatch doc_fix once").
+  # The agent decides what (if anything) to update; closeout accepts a clean
+  # no-op as a legitimate outcome.
   defp pre_verify_doc_check_rule(%{workpad_text: workpad_text, exec: exec, git_head: git_head})
        when is_binary(git_head) do
-    all_done = WorkpadParser.all_done?(workpad_text)
-
-    if all_done and not exec["doc_fix_required"] do
-      # Check if docs need updating based on cumulative changes
-      # Use git diff against the base (all changes in this branch)
-      {:dispatch, Unit.doc_fix()}
-      |> maybe_dispatch_doc_fix(exec)
+    if WorkpadParser.all_done?(workpad_text) do
+      maybe_dispatch_doc_fix({:dispatch, Unit.doc_fix()}, exec)
     end
   end
 
@@ -271,9 +269,10 @@ defmodule SymphonyElixir.DispatchResolver do
   defp maybe_dispatch_doc_fix(dispatch, exec) do
     last = exec["last_accepted_unit"]
 
-    skip? = is_map(last) and
-      (last["kind"] in ["doc_fix", "verify", "handoff"] or
-       (is_binary(last["subtask_id"]) and String.starts_with?(last["subtask_id"], "verify-fix-")))
+    skip? =
+      is_map(last) and
+        (last["kind"] in ["doc_fix", "verify", "handoff"] or
+           (is_binary(last["subtask_id"]) and String.starts_with?(last["subtask_id"], "verify-fix-")))
 
     if skip?, do: nil, else: dispatch
   end
@@ -281,9 +280,11 @@ defmodule SymphonyElixir.DispatchResolver do
   # Verify fix: if verify_error is set, dispatch implement_subtask to fix the code
   # rather than blindly retrying verify against the same broken code.
   defp verify_fix_rule(%{exec: %{"verify_error" => error}}) when is_binary(error) do
-    prompt_error = if String.length(error) > 1500,
-      do: String.slice(error, 0, 1500) <> "\n... (truncated)",
-      else: error
+    prompt_error =
+      if String.length(error) > 1500,
+        do: String.slice(error, 0, 1500) <> "\n... (truncated)",
+        else: error
+
     {:dispatch, Unit.implement_subtask("verify-fix-1", prompt_error)}
   end
 

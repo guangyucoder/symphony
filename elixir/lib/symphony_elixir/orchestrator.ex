@@ -396,9 +396,7 @@ defmodule SymphonyElixir.Orchestrator do
       elapsed_ms > timeout_ms ->
         session_id = running_entry_session_id(running_entry)
 
-        Logger.warning(
-          "Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}; restarting with backoff"
-        )
+        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}; restarting with backoff")
 
         next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -410,9 +408,7 @@ defmodule SymphonyElixir.Orchestrator do
         })
 
       elapsed_ms > div(timeout_ms, 2) ->
-        Logger.info(
-          "Issue approaching stall timeout: issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}"
-        )
+        Logger.info("Issue approaching stall timeout: issue_identifier=#{identifier} elapsed_ms=#{elapsed_ms} timeout_ms=#{timeout_ms}")
 
         state
 
@@ -614,12 +610,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt) do
     recipient = self()
 
-    runner_fn =
-      if Config.unit_lite?() do
-        fn -> AgentRunner.run_unit_lite(issue, recipient, attempt: attempt) end
-      else
-        fn -> AgentRunner.run(issue, recipient, attempt: attempt) end
-      end
+    runner_fn = fn -> AgentRunner.run_unit_lite(issue, recipient, attempt: attempt) end
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, runner_fn) do
       {:ok, pid} ->
@@ -1047,20 +1038,21 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    merged = Map.merge(running_entry, %{
-      last_codex_timestamp: timestamp,
-      last_codex_message: summarize_codex_update(update),
-      session_id: session_id_for_update(running_entry.session_id, update),
-      last_codex_event: event,
-      codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
-      codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
-      codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
-      codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
-      codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-      codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
-      codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-      turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-    })
+    merged =
+      Map.merge(running_entry, %{
+        last_codex_timestamp: timestamp,
+        last_codex_message: summarize_codex_update(update),
+        session_id: session_id_for_update(running_entry.session_id, update),
+        last_codex_event: event,
+        codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
+        codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
+        codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
+        codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
+        codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
+        codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+      })
 
     # Capture unit-lite stage info from :unit_dispatched events
     merged =

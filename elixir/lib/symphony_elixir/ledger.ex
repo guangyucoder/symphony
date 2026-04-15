@@ -39,7 +39,9 @@ defmodule SymphonyElixir.Ledger do
           |> String.split("\n", trim: true)
           |> Enum.reduce([], fn line, acc ->
             case Jason.decode(line) do
-              {:ok, entry} -> [entry | acc]
+              {:ok, entry} ->
+                [entry | acc]
+
               {:error, _} ->
                 Logger.warning("Ledger: skipping corrupt line in #{path}")
                 acc
@@ -73,11 +75,14 @@ defmodule SymphonyElixir.Ledger do
   @doc "Convenience: append unit_tokens event (token usage for a completed unit)."
   @spec unit_tokens(Path.t(), map(), map()) :: :ok | {:error, term()}
   def unit_tokens(workspace, unit, token_stats) do
-    payload = Map.take(unit, ["kind", "subtask_id"]) |> Map.merge(%{
-      "input_tokens" => token_stats[:input_tokens] || 0,
-      "output_tokens" => token_stats[:output_tokens] || 0,
-      "total_tokens" => token_stats[:total_tokens] || 0
-    })
+    payload =
+      Map.take(unit, ["kind", "subtask_id"])
+      |> Map.merge(%{
+        "input_tokens" => token_stats[:input_tokens] || 0,
+        "output_tokens" => token_stats[:output_tokens] || 0,
+        "total_tokens" => token_stats[:total_tokens] || 0
+      })
+
     append(workspace, :unit_tokens, payload)
   end
 
@@ -92,12 +97,6 @@ defmodule SymphonyElixir.Ledger do
   @spec verify_passed(Path.t(), String.t()) :: :ok | {:error, term()}
   def verify_passed(workspace, sha) do
     append(workspace, :verify_passed, %{"sha" => sha})
-  end
-
-  @doc "Convenience: append doc_fix_required event."
-  @spec doc_fix_required(Path.t(), String.t()) :: :ok | {:error, term()}
-  def doc_fix_required(workspace, reason) do
-    append(workspace, :doc_fix_required, %{"reason" => reason})
   end
 
   # --- Private ---

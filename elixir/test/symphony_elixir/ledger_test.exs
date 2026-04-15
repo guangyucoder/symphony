@@ -67,12 +67,5 @@ defmodule SymphonyElixir.LedgerTest do
       assert entry["event"] == "verify_passed"
       assert entry["payload"]["sha"] == "def456"
     end
-
-    test "doc_fix_required/2", %{workspace: ws} do
-      :ok = Ledger.doc_fix_required(ws, "architecture_doc_stale")
-      {:ok, [entry]} = Ledger.read(ws)
-      assert entry["event"] == "doc_fix_required"
-      assert entry["payload"]["reason"] == "architecture_doc_stale"
-    end
   end
 end

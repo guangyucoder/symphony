@@ -1319,13 +1319,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.max_concurrent_agents_for_state(:not_a_string) == 10
   end
 
-  test "workflow prompt is used when building base prompt" do
-    workflow_prompt = "Workflow prompt body used as codex instruction."
-
-    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
-    assert Config.workflow_prompt() == workflow_prompt
-  end
-
   defp create_cloned_git_workspace!(test_root, issue_identifier) do
     template_repo = Path.join(test_root, "source")
     workspace_root = Path.join(test_root, "workspaces")

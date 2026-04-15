@@ -111,9 +111,9 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp find_workpad_comment(comments) do
     case Enum.find(comments, fn c ->
-      body = c["body"] || ""
-      String.contains?(body, "## Codex Workpad") or String.contains?(body, "### Plan")
-    end) do
+           body = c["body"] || ""
+           String.contains?(body, "## Codex Workpad") or String.contains?(body, "### Plan")
+         end) do
       nil -> {:error, :workpad_not_found}
       comment -> {:ok, comment}
     end
@@ -121,6 +121,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   defp check_off_subtask(body, subtask_id) when is_binary(body) do
     pattern = ~r/- \[ \] \[#{Regex.escape(subtask_id)}\]/
+
     if Regex.match?(pattern, body) do
       {:ok, Regex.replace(pattern, body, "- [x] [#{subtask_id}]")}
     else

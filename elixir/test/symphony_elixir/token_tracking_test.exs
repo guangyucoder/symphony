@@ -28,12 +28,9 @@ defmodule SymphonyElixir.TokenTrackingTest do
       usage = extract_usage_from_message(msg)
 
       if is_map(usage) do
-        input = first_integer(usage, ["inputTokens", "input_tokens", "prompt_tokens",
-                                      :inputTokens, :input_tokens])
-        output = first_integer(usage, ["outputTokens", "output_tokens", "completion_tokens",
-                                       :outputTokens, :output_tokens])
-        total = first_integer(usage, ["totalTokens", "total_tokens", "total",
-                                      :totalTokens, :total_tokens, :total])
+        input = first_integer(usage, ["inputTokens", "input_tokens", "prompt_tokens", :inputTokens, :input_tokens])
+        output = first_integer(usage, ["outputTokens", "output_tokens", "completion_tokens", :outputTokens, :output_tokens])
+        total = first_integer(usage, ["totalTokens", "total_tokens", "total", :totalTokens, :total_tokens, :total])
 
         if is_integer(input) and input > 0, do: :counters.put(counter, 1, input)
         if is_integer(output) and output > 0, do: :counters.put(counter, 2, output)
@@ -58,12 +55,14 @@ defmodule SymphonyElixir.TokenTrackingTest do
   end
 
   defp dig(map, []) when is_map(map), do: map
+
   defp dig(map, [key | rest]) when is_map(map) do
     case Map.get(map, key) do
       nil -> nil
       val -> dig(val, rest)
     end
   end
+
   defp dig(_, _), do: nil
 
   defp first_integer(map, keys) when is_map(map) do
@@ -163,6 +162,7 @@ defmodule SymphonyElixir.TokenTrackingTest do
         raw: "{}",
         details: %{}
       }
+
       result = track_and_read([msg])
 
       # Should pick up the "total" breakdown
