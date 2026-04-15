@@ -96,6 +96,53 @@ defmodule SymphonyElixir.DispatchResolverTest do
       assert {:dispatch, %Unit{kind: :doc_fix}} = result
     end
 
+    test "ignores legacy doc_fix_required flag — pre-verify doc_fix is workpad-driven only" do
+      # Round-4 removed the DocImpact heuristic and the doc_fix_required flag.
+      # If a stale fixture or upgraded workspace still carries the flag, the
+      # resolver must not gate doc_fix dispatch on it; the only remaining
+      # trigger is "all checklist items done + last_accepted_unit isn't a
+      # post-implementation kind". This pin guards against silent re-introduction.
+      exec =
+        @default_exec
+        |> Map.merge(%{
+          "bootstrapped" => true,
+          "last_verified_sha" => nil,
+          "doc_fix_required" => true
+        })
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_all_done,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :doc_fix}} = result
+
+      # Mid-implementation (workpad has unchecked items): doc_fix must NOT
+      # fire even though doc_fix_required is true — the flag is dead.
+      mid_workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] One
+      - [ ] [plan-2] Two
+      """
+
+      result_mid =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: mid_workpad,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = result_mid
+    end
+
     test "dispatches verify after doc_fix when all subtasks done" do
       exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => nil, "last_accepted_unit" => %{"kind" => "doc_fix"}}
 

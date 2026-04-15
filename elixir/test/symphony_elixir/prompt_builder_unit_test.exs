@@ -309,6 +309,25 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       refute prompt =~ "</workpad>"
     end
 
+    test "verify-fix-* prompt instructs the agent to escalate via Linear comment on infra failures" do
+      # Pin the round-4 escalation paragraph: keep the verify-fix prompt
+      # honest about what closeout will do (replay until circuit breaker)
+      # so we don't quietly drift back to "edit code anyway".
+      unit = %Unit{
+        kind: :implement_subtask,
+        subtask_id: "verify-fix-1",
+        subtask_text: "test error output",
+        display_name: "implement_subtask:verify-fix-1"
+      }
+
+      prompt = PromptBuilder.build_unit_prompt(@issue, unit, workpad_text: @workpad_sample)
+
+      assert prompt =~ "When NOT to keep trying"
+      assert prompt =~ "infrastructure"
+      assert prompt =~ "Linear"
+      assert prompt =~ "circuit breaker"
+    end
+
     test "merge-sync-* does NOT receive workpad injection" do
       unit = %Unit{
         kind: :implement_subtask,

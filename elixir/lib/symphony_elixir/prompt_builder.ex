@@ -340,11 +340,13 @@ defmodule SymphonyElixir.PromptBuilder do
     that cannot be downloaded, a permission/billing/auth error from an
     external service, a network timeout — do NOT keep editing code. The
     environment, not the code, is broken, and "fix the env" is not your job
-    here. Instead: write a short summary of what you observed and why you
-    believe it is an infrastructure / human-ops issue, post it as a comment
-    on the Linear issue, and stop. The orchestrator will escalate to Human
-    Input Needed once you exit; a few wasted retries are far cheaper than
-    code damage from forcing edits onto a green codebase.
+    here. Instead: post a short Linear comment summarising what you observed
+    and why you believe it is an infrastructure / human-ops issue, then exit.
+    Closeout requires HEAD to advance before it will accept this unit, so
+    after exiting Symphony will replay the dispatch up to a few times; once
+    the circuit breaker trips on max attempts the orchestrator escalates to
+    Human Input Needed. Those replays are cheap compared to code damage from
+    forcing edits onto a green codebase.
     """
   end
 

@@ -34,6 +34,7 @@ defmodule SymphonyElixir.IssueExec do
     "rework_fix_applied" => false,
     "bootstrapped" => false,
     "plan_version" => 0,
+    "pending_workpad_mark" => nil,
     "verify_error" => nil,
     "verify_attempt" => 0,
     "verify_fix_count" => 0,
@@ -138,6 +139,22 @@ defmodule SymphonyElixir.IssueExec do
       "baseline_verify_failed" => false,
       "baseline_verify_output" => nil
     })
+  end
+
+  @doc """
+  Record that a regular plan-N subtask committed code but its Linear workpad
+  mark failed. Closeout uses this on the next dispatch to recover the mark
+  without requiring HEAD to advance again (the work is already in HEAD).
+  """
+  @spec set_pending_workpad_mark(Path.t(), String.t()) :: :ok | {:error, term()}
+  def set_pending_workpad_mark(workspace, subtask_id) when is_binary(subtask_id) do
+    update(workspace, %{"pending_workpad_mark" => subtask_id})
+  end
+
+  @doc "Clear the pending workpad mark sentinel after a successful retry."
+  @spec clear_pending_workpad_mark(Path.t()) :: :ok | {:error, term()}
+  def clear_pending_workpad_mark(workspace) do
+    update(workspace, %{"pending_workpad_mark" => nil})
   end
 
   @doc "Bump plan version."

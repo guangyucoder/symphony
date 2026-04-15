@@ -150,7 +150,6 @@ defmodule SymphonyElixir.FailurePathTest do
         "bootstrapped" => true,
         "plan_version" => 1,
         "last_verified_sha" => nil,
-        "doc_fix_required" => false,
         "rework_fix_applied" => false,
         "verify_error" => "test/foo_test.exs:12 assertion failed",
         "verify_attempt" => 1
@@ -192,7 +191,6 @@ defmodule SymphonyElixir.FailurePathTest do
       "last_accepted_unit" => nil,
       "last_commit_sha" => nil,
       "last_verified_sha" => nil,
-      "doc_fix_required" => false,
       "bootstrapped" => true,
       "plan_version" => 1
     }
@@ -512,7 +510,6 @@ defmodule SymphonyElixir.FailurePathTest do
         "bootstrapped" => true,
         "rework_fix_applied" => true,
         "last_verified_sha" => nil,
-        "doc_fix_required" => false,
         "plan_version" => 1
       }
 
@@ -547,7 +544,6 @@ defmodule SymphonyElixir.FailurePathTest do
       "last_accepted_unit" => nil,
       "last_commit_sha" => nil,
       "last_verified_sha" => nil,
-      "doc_fix_required" => false,
       "bootstrapped" => true,
       "plan_version" => 1
     }
@@ -653,8 +649,7 @@ defmodule SymphonyElixir.FailurePathTest do
       "mode" => "unit_lite",
       "phase" => "implementing",
       "bootstrapped" => true,
-      "plan_version" => 1,
-      "doc_fix_required" => false
+      "plan_version" => 1
     }
 
     test "stale handoff current_unit triggers :fresh with full reset" do
@@ -898,8 +893,7 @@ defmodule SymphonyElixir.FailurePathTest do
         "current_unit" => %{"kind" => "plan", "subtask_id" => nil, "attempt" => 1},
         "last_accepted_unit" => nil,
         "last_commit_sha" => nil,
-        "last_verified_sha" => nil,
-        "doc_fix_required" => false
+        "last_verified_sha" => nil
       }
 
       ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: nil, git_head: "abc"}

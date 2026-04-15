@@ -52,6 +52,20 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def write_workflow_file!(path, overrides \\ []) do
+    # Catch dead kwargs that don't correspond to any field this helper emits.
+    # Without this guard, callers can pass `execution_mode: ...` (or any other
+    # removed option) and the helper silently no-ops — the test then claims
+    # to exercise behaviour that production no longer supports.
+    unknown =
+      Enum.reject(Keyword.keys(overrides), fn key ->
+        Keyword.has_key?(workflow_content_defaults(), key)
+      end)
+
+    if unknown != [] do
+      raise ArgumentError,
+            "write_workflow_file!: unknown kwargs #{inspect(unknown)} (helper does not emit these — remove them or update the helper)"
+    end
+
     workflow = workflow_content(overrides)
     File.write!(path, workflow)
 
@@ -88,49 +102,49 @@ defmodule SymphonyElixir.TestSupport do
     end
   end
 
+  defp workflow_content_defaults do
+    [
+      tracker_kind: "linear",
+      tracker_endpoint: "https://api.linear.app/graphql",
+      tracker_api_token: "token",
+      tracker_project_slug: "project",
+      tracker_assignee: nil,
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      poll_interval_ms: 30_000,
+      workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+      max_concurrent_agents: 10,
+      max_retry_backoff_ms: 300_000,
+      max_concurrent_agents_by_state: %{},
+      max_unit_attempts: nil,
+      codex_command: "codex app-server",
+      codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
+      codex_thread_sandbox: "workspace-write",
+      codex_turn_sandbox_policy: nil,
+      codex_turn_timeout_ms: 3_600_000,
+      codex_read_timeout_ms: 5_000,
+      codex_stall_timeout_ms: 300_000,
+      verification_baseline_commands: nil,
+      verification_full_commands: nil,
+      verification_timeout_ms: nil,
+      verification_max_verify_attempts: nil,
+      verification_max_verify_fix_cycles: nil,
+      hook_after_create: nil,
+      hook_before_run: nil,
+      hook_after_run: nil,
+      hook_before_remove: nil,
+      hook_timeout_ms: 60_000,
+      observability_enabled: true,
+      observability_refresh_ms: 1_000,
+      observability_render_interval_ms: 16,
+      server_port: nil,
+      server_host: nil,
+      prompt: @workflow_prompt
+    ]
+  end
+
   defp workflow_content(overrides) do
-    config =
-      Keyword.merge(
-        [
-          tracker_kind: "linear",
-          tracker_endpoint: "https://api.linear.app/graphql",
-          tracker_api_token: "token",
-          tracker_project_slug: "project",
-          tracker_assignee: nil,
-          tracker_active_states: ["Todo", "In Progress"],
-          tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
-          poll_interval_ms: 30_000,
-          workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
-          max_concurrent_agents: 10,
-          max_retry_backoff_ms: 300_000,
-          max_concurrent_agents_by_state: %{},
-          max_unit_attempts: nil,
-          codex_command: "codex app-server",
-          codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
-          codex_thread_sandbox: "workspace-write",
-          codex_turn_sandbox_policy: nil,
-          codex_turn_timeout_ms: 3_600_000,
-          codex_read_timeout_ms: 5_000,
-          codex_stall_timeout_ms: 300_000,
-          verification_baseline_commands: nil,
-          verification_full_commands: nil,
-          verification_timeout_ms: nil,
-          verification_max_verify_attempts: nil,
-          verification_max_verify_fix_cycles: nil,
-          hook_after_create: nil,
-          hook_before_run: nil,
-          hook_after_run: nil,
-          hook_before_remove: nil,
-          hook_timeout_ms: 60_000,
-          observability_enabled: true,
-          observability_refresh_ms: 1_000,
-          observability_render_interval_ms: 16,
-          server_port: nil,
-          server_host: nil,
-          prompt: @workflow_prompt
-        ],
-        overrides
-      )
+    config = Keyword.merge(workflow_content_defaults(), overrides)
 
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)

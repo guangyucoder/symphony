@@ -17,7 +17,6 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        execution_mode: "unit_lite",
         hook_after_create: "git clone #{template_repo} .",
         hook_before_run: "test -f tracked.txt\necho call >> \"#{before_run_counter}\""
       )
@@ -61,7 +60,6 @@ defmodule SymphonyElixir.AgentRunnerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        execution_mode: "unit_lite",
         hook_after_create: "git clone #{template_repo} .",
         hook_before_run: "exit 1",
         hook_after_run: "echo call >> \"#{after_run_counter}\""

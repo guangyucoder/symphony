@@ -83,19 +83,34 @@ defmodule SymphonyElixir.Closeout do
         # Regular plan-N and merge-sync-* — require HEAD advance so uncommitted
         # work isn't silently destroyed by the next dispatch's workspace reset.
         # Parallel to the rework / verify-fix guards.
-        case commit_advancement_state(workspace, opts) do
-          :advanced ->
-            accept_implement_subtask(workspace, subtask_id, issue)
+        #
+        # First check pending_workpad_mark: if a prior attempt committed the work
+        # but its Linear mark failed, the new dispatch's dispatch_head is the
+        # post-commit HEAD and the agent will produce no further commit. Without
+        # this fast-path, the :unchanged guard would loop to the circuit breaker
+        # without ever retrying the mark.
+        case recover_pending_workpad_mark(workspace, subtask_id, issue) do
+          :recovered ->
+            post_accept_implement_subtask(workspace, subtask_id)
 
-          :unchanged ->
-            Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} produced no commit (HEAD unchanged since dispatch) — fix edits may be sitting as uncommitted WIP")
+          {:still_pending, reason} ->
+            {:retry, reason}
 
-            {:retry, "implement_subtask #{subtask_id || "(nil)"}: produced no commit (edits likely uncommitted WIP)"}
+          :no_pending ->
+            case commit_advancement_state(workspace, opts) do
+              :advanced ->
+                accept_implement_subtask(workspace, subtask_id, issue)
 
-          :cannot_verify ->
-            Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} cannot verify HEAD state (git lookup returned nil)")
+              :unchanged ->
+                Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} produced no commit (HEAD unchanged since dispatch) — fix edits may be sitting as uncommitted WIP")
 
-            {:retry, "implement_subtask #{subtask_id || "(nil)"}: cannot verify HEAD state"}
+                {:retry, "implement_subtask #{subtask_id || "(nil)"}: produced no commit (edits likely uncommitted WIP)"}
+
+              :cannot_verify ->
+                Logger.warning("Closeout: implement_subtask #{subtask_id || "(nil)"} cannot verify HEAD state (git lookup returned nil)")
+
+                {:retry, "implement_subtask #{subtask_id || "(nil)"}: cannot verify HEAD state"}
+            end
         end
     end
   end
@@ -367,7 +382,41 @@ defmodule SymphonyElixir.Closeout do
         post_accept_implement_subtask(workspace, subtask_id)
 
       {:retry, reason} ->
+        # The work is committed but the workpad mark failed. Persist a
+        # sentinel so the next closeout entry can retry the mark without
+        # requiring HEAD to advance again (no further commit is coming).
+        if regular_plan_subtask?(subtask_id) do
+          IssueExec.set_pending_workpad_mark(workspace, subtask_id)
+        end
+
         {:retry, reason}
+    end
+  end
+
+  # Fast-path: if a previous closeout already committed the work and only the
+  # Linear mark failed, retry the mark here. No HEAD advance is required.
+  # Returns :recovered (mark succeeded; caller should run post-accept),
+  # {:still_pending, reason} (mark still failing; caller should retry the unit),
+  # or :no_pending (no recovery applies; caller should run normal flow).
+  defp recover_pending_workpad_mark(workspace, subtask_id, issue) do
+    with true <- regular_plan_subtask?(subtask_id),
+         {:ok, exec} <- IssueExec.read(workspace),
+         pending when is_binary(pending) <- exec["pending_workpad_mark"],
+         true <- pending == subtask_id,
+         issue_id when is_binary(issue_id) <- issue_id(issue) do
+      case Adapter.mark_subtask_done(issue_id, subtask_id) do
+        :ok ->
+          IssueExec.clear_pending_workpad_mark(workspace)
+          Logger.info("Closeout: recovered pending Linear workpad mark for #{subtask_id}")
+          :recovered
+
+        {:error, reason} ->
+          Logger.warning("Closeout: pending workpad mark for #{subtask_id} still failing: #{inspect(reason)}")
+
+          {:still_pending, "implement_subtask #{subtask_id}: workpad sync still failing (#{inspect(reason)})"}
+      end
+    else
+      _ -> :no_pending
     end
   end
 
@@ -404,15 +453,23 @@ defmodule SymphonyElixir.Closeout do
     end
   end
 
+  # Whitelist on the workpad-derived "plan-N" prefix: every subtask Linear
+  # actually owns a checkbox for matches `plan-<integer>`. Any other shape
+  # (synthetic kinds rework-/verify-fix-/merge-sync-, future variants, empty
+  # strings, whitespace) is NOT a plan-N, so a Linear-mark failure is at most
+  # bookkeeping noise and must not promote to a unit retry — that would
+  # circuit-break a synthetic dispatch over a checkbox the workpad never had.
   defp regular_plan_subtask?(subtask_id) when is_binary(subtask_id) do
-    not String.starts_with?(subtask_id, "rework-") and
-      not String.starts_with?(subtask_id, "verify-fix-") and
-      not String.starts_with?(subtask_id, "merge-sync-")
+    Regex.match?(~r/^plan-\d+$/, subtask_id)
   end
 
   defp regular_plan_subtask?(_), do: false
 
   defp post_accept_implement_subtask(workspace, subtask_id) do
+    # 1a. Clear any pending workpad mark sentinel — by reaching post-accept the
+    # workpad is in sync (either via normal flow or recovered via fast-path).
+    IssueExec.clear_pending_workpad_mark(workspace)
+
     # 1b. Set rework_fix_applied flag for rework-* subtasks
     if is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") do
       IssueExec.update(workspace, %{"rework_fix_applied" => true})

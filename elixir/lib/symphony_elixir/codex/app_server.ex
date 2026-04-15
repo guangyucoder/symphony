@@ -10,7 +10,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @thread_resume_id 4
   @turn_start_id 3
-  @thread_compact_id 5
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -161,77 +160,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
-  end
-
-  @compact_timeout_ms 60_000
-
-  @spec compact_thread(session()) :: :ok | {:error, term()}
-  def compact_thread(%{port: port, thread_id: thread_id}) do
-    send_message(port, %{
-      "method" => "thread/compact/start",
-      "id" => @thread_compact_id,
-      "params" => %{
-        "threadId" => thread_id
-      }
-    })
-
-    # Two-phase wait: first the RPC response (acknowledgment), then the
-    # thread/compacted notification (actual completion).  The real compaction
-    # happens asynchronously — starting the next turn before thread/compacted
-    # means the first API call still sees the full uncompacted context.
-    with {:ok, _result} <- await_compact_ack(port),
-         :ok <- await_compact_done(port) do
-      Logger.info("Thread compact completed for thread_id=#{thread_id}")
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning("Thread compact failed for thread_id=#{thread_id}: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
-
-  # Phase 1: wait for the JSON-RPC response to thread/compact/start
-  defp await_compact_ack(port) do
-    compact_receive_loop(port, @compact_timeout_ms, "", :ack)
-  end
-
-  # Phase 2: wait for the thread/compacted notification
-  defp await_compact_done(port) do
-    compact_receive_loop(port, @compact_timeout_ms, "", :done)
-  end
-
-  defp compact_receive_loop(port, timeout_ms, pending_line, phase) do
-    receive do
-      {^port, {:data, {:eol, chunk}}} ->
-        complete_line = pending_line <> to_string(chunk)
-
-        case Jason.decode(complete_line) do
-          {:ok, %{"id" => @thread_compact_id, "result" => result}} when phase == :ack ->
-            {:ok, result}
-
-          {:ok, %{"id" => @thread_compact_id, "error" => error}} when phase == :ack ->
-            {:error, {:compact_error, error}}
-
-          {:ok, %{"method" => "thread/compacted"}} when phase == :done ->
-            :ok
-
-          {:ok, _other} ->
-            compact_receive_loop(port, timeout_ms, "", phase)
-
-          {:error, _} ->
-            compact_receive_loop(port, timeout_ms, "", phase)
-        end
-
-      {^port, {:data, {:noeol, chunk}}} ->
-        compact_receive_loop(port, timeout_ms, pending_line <> to_string(chunk), phase)
-
-      {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
-    after
-      timeout_ms ->
-        Logger.warning("Thread compact phase=#{phase} timed out after #{timeout_ms}ms")
-        {:error, :compact_timeout}
-    end
   end
 
   defp validate_workspace_cwd(workspace) when is_binary(workspace) do

@@ -41,7 +41,8 @@ Architecture constraints should be enforced by code, not by memory.
 - `Verifier` runs validation commands — agent can't skip
 - `DispatchResolver` enforces one-unit-per-session — agent can't self-escalate
 - `Closeout` enforces `last_verified_sha == HEAD` — stale verification blocks handoff
-- `DocImpact` detects doc staleness — agent must fix before next subtask
+- `Closeout` requires HEAD to advance for every mutation-bearing unit — uncommitted WIP gets retried, not silently destroyed
+- `doc_fix` runs once before verify as a mandatory pass — the agent reads AGENTS.md / docs/ and updates anything stale; clean tree on closeout is accepted as a no-op
 
 **The pattern:** When a review finding appears twice, promote it to an automated check.
 
@@ -58,17 +59,15 @@ When an agent gets stuck, don't just retry. Ask: what capability is missing?
 
 High-throughput environments generate entropy. Cleanup should be continuous, not periodic.
 
-- `DocImpact.check/2` runs after every code-changing unit
-- `doc_fix_required` flag blocks next subtask until docs are updated
-- Stale docs are treated as bugs, not tech debt
+- `doc_fix` is a mandatory pre-verify pass — the agent decides what (if anything) to update; a clean tree at closeout is accepted as a no-op
+- Stale docs are treated as bugs, not tech debt — keep `AGENTS.md` and `docs/` in sync with the code in the same PR that changes the code
 
 ### 6. Make the Application Legible
 
 Agents need programmable feedback loops, not "run it and see."
 
-- `mix test` — stable, fast test suite
+- `mix test` — stable, fast test suite (incl. integration scenarios with real git)
 - `mix compile --warnings-as-errors` — compiler as first reviewer
-- `scripts/verify_unit_lite.exs` — integration verification with real git
 - `ledger.jsonl` — structured audit trail, not opaque logs
 - `issue_exec.json` — machine-readable execution state
 
@@ -86,6 +85,6 @@ Agents need programmable feedback loops, not "run it and see."
 |---------|-----------|---------------------|
 | Agent skips validation | "Please run validate-app.sh" in prompt | `Verifier` runs it outside agent session |
 | Agent drifts in implement | "Only do this subtask" in prompt | `DispatchResolver` dispatches one subtask |
-| Context lost between sessions | Summary chain / anchor files | Keep `AGENTS.md` + `docs/` fresh via `DocImpact` |
+| Context lost between sessions | Summary chain / anchor files | Keep `AGENTS.md` + `docs/` fresh; `doc_fix` runs before every verify as a mandatory pre-verify pass |
 | Same review finding recurs | Remind in next review | Add test / lint rule / guardrail |
 | Agent doesn't know project structure | Longer prompt | Better `AGENTS.md` + `docs/ARCHITECTURE.md` |

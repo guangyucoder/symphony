@@ -2,12 +2,11 @@
 
 ## Project Overview
 
-Symphony — an Elixir/OTP service that orchestrates coding agents to execute Linear issues
-autonomously. Polls Linear, dispatches agents to isolated workspaces, handles retry/reconciliation.
-
-This fork adds **unit-lite mode**: instead of one long Codex session per issue, the orchestrator
-dispatches one small unit at a time (bootstrap, plan, implement_subtask, verify, handoff, etc.),
-each in a fresh session.
+Symphony — an Elixir/OTP service that orchestrates coding agents to execute Linear
+issues autonomously. Polls Linear, dispatches agents to isolated workspaces, handles
+retry / reconciliation. This fork runs **unit-lite mode**: instead of one long Codex
+session per issue, the orchestrator dispatches one small unit at a time (bootstrap,
+plan, implement_subtask, verify, handoff, etc.), each in a fresh session.
 
 ## Quick Start
 
@@ -15,43 +14,34 @@ each in a fresh session.
 cd elixir
 mix deps.get
 mix compile --warnings-as-errors
-mix test                           # full suite
-mix run --no-start -e 'Application.ensure_all_started(:jason); Code.require_file("scripts/verify_unit_lite.exs")'  # integration verification
+mix test                 # full suite
 ```
 
 ## Architecture
 
-### Two Execution Modes
+### Execution Model
 
-Controlled by `agent.execution_mode` in WORKFLOW.md front matter:
-
-- **`legacy`** (default): One Codex session per issue. Agent self-manages all phases. Current
-  upstream Symphony behavior.
-- **`unit_lite`**: Orchestrator dispatches one unit at a time. Each unit is a fresh Codex session.
-  Verification is orchestrator-owned. See [Unit-Lite Design](docs/design/symphony-gsd2-first-principles-lite.md).
+One mode only: **unit-lite**. The orchestrator dispatches one unit at a time and a
+fresh Codex session runs it. Verification is orchestrator-owned. See
+[Unit-Lite Design](docs/design/symphony-gsd2-first-principles-lite.md) for the
+underlying design rationale.
 
 ### Core Modules
 
 | Module | Purpose |
 |--------|---------|
-| `Orchestrator` | GenServer. Poll Linear, dispatch, reconcile, retry. Entry point for both modes |
-| `AgentRunner` | Executes Codex sessions. `run/3` for legacy, `run_unit_lite/3` for unit-lite |
-| `Config` | Reads WORKFLOW.md front matter via NimbleOptions. All config accessors |
-| `Workspace` | Per-issue directory lifecycle. Hooks, safety invariants, `.symphony/` dir |
-| `PromptBuilder` | Renders prompts. `build_prompt/2` (legacy), `build_unit_prompt/3` (unit-lite) |
-
-### Unit-Lite Modules (new)
-
-| Module | Purpose |
-|--------|---------|
+| `Orchestrator` | GenServer. Polls Linear, dispatches, reconciles, retries |
+| `AgentRunner` | Executes Codex sessions via `run_unit_lite/3` (the only entry) |
+| `Config` | Reads WORKFLOW.md front matter via NimbleOptions |
+| `Workspace` | Per-issue directory lifecycle. Hooks, safety invariants, `.symphony/` dir, `prepare_for_dispatch/2` |
+| `PromptBuilder` | Renders unit prompts via `build_unit_prompt/3` |
 | `DispatchResolver` | Rule-based dispatch: issue state + exec state + workpad → next unit |
 | `Unit` | Struct: `kind`, `subtask_id`, `display_name`, `attempt` |
-| `IssueExec` | Reads/writes `.symphony/issue_exec.json` — durable execution state per issue |
+| `IssueExec` | Reads/writes `.symphony/issue_exec.json` — durable per-issue state |
 | `Ledger` | Append-only `.symphony/ledger.jsonl` — event history for recovery + audit |
-| `WorkpadParser` | Parses `### Plan` checklist from Linear workpad comment |
-| `Closeout` | Post-unit acceptance: checks artifacts, runs doc-impact, updates state |
+| `WorkpadParser` | Parses `### Plan` checklist (with `touch:` / `accept:` continuation lines) from Linear workpad |
+| `Closeout` | Post-unit acceptance: HEAD-advance guard, workpad sync, state updates |
 | `Verifier` | Runs validation commands (orchestrator-owned, agent cannot bypass) |
-| `DocImpact` | Lightweight check: did this code change make docs stale? |
 
 ### Existing Modules
 
@@ -70,7 +60,7 @@ Controlled by `agent.execution_mode` in WORKFLOW.md front matter:
 ```
 Orchestrator → AgentRunner → {AppServer, PromptBuilder, Workspace}
             → DispatchResolver → {IssueExec, WorkpadParser, Unit}
-            → Closeout → {Verifier, DocImpact, IssueExec, Ledger}
+            → Closeout → {Verifier, IssueExec, Ledger, Linear.Adapter}
 Config ← (read by all modules, writes nothing)
 ```
 
@@ -78,7 +68,7 @@ Rules:
 - `Orchestrator` is the only module that spawns long-lived Tasks and monitors processes
 - `AgentRunner` never reads Linear state directly — Orchestrator passes issue data
 - `DispatchResolver` is pure: input → output, no side effects
-- `Closeout` may write to `IssueExec` and `Ledger` but never spawns processes
+- `Closeout` may write to `IssueExec` and `Ledger` and may call Linear `mark_subtask_done`, but never spawns processes
 - `Verifier` runs shell commands via short-lived Tasks (with timeout + shutdown) but never writes to Codex or Linear
 
 ## Key Files
@@ -88,55 +78,55 @@ Rules:
 | `SPEC.md` | Language-agnostic specification for Symphony |
 | `WORKFLOW.md` | Per-repo workflow contract (front matter + prompt template) |
 | `elixir/` | Elixir implementation |
-| `docs/design/` | Design docs (v3, v4, lite execution plan) |
-| `elixir/scripts/verify_unit_lite.exs` | Integration verification script |
+| `docs/design/` | Design docs (v3, v4, lite execution plan; v3/v4 describe rejected legacy directions) |
 
 ## Unit-Lite Dispatch Rules
 
 ```
-if Merging       → merge
-if current_unit  → replay (crash recovery, circuit breaker at 3 attempts)
-if done          → stop
-if Rework + workpad complete → rework_fix (skip re-plan)
-if Rework + stale  → plan (reset)
-if !bootstrapped → bootstrap
-if !checklist    → plan
-if doc_fix_required → doc_fix
-if pending subtask → implement_subtask(next)
-if all done + no doc_fix yet → doc_fix (once before verify)
-if unverified    → verify
-else             → handoff
+if Merging                                    → merge
+if current_unit                               → replay (crash recovery, circuit breaker at max_unit_attempts)
+if done                                       → stop
+if Rework + workpad complete                  → rework_fix (skip re-plan)
+if Rework + stale                             → plan (reset)
+if !bootstrapped                              → bootstrap
+if !checklist                                 → plan
+if pending subtask                            → implement_subtask(next)
+if all done + last_accepted_unit ∉ {doc_fix, verify, handoff} → doc_fix (mandatory pre-verify pass; clean no-op accepted)
+if unverified                                 → verify
+else                                          → handoff
 ```
 
 ## Unit-Lite Invariants
 
 1. **One unit per session.** Agent cannot self-decide "now I'll also do handoff."
 2. **One subtask per implement session.** No scope creep.
-3. **`last_verified_sha == HEAD` required for handoff.** Code changes invalidate verification.
-4. **Crash recovery replays current unit.** Circuit breaker at 3 attempts → escalate to Human Input Needed.
-5. **Doc fix runs once before verify, not per-subtask.** Prevents N×doc_fix token waste.
-6. **Orchestrator owns verification.** Agent prompt doesn't include validation commands.
-7. **Rework skips re-plan when workpad is complete.** `rework_fix_applied` flag prevents re-dispatch loops.
+3. **HEAD must advance for mutation-bearing units.** Closeout requires a commit since dispatch for `implement_subtask` (regular plan-N + synthetic kinds) and `doc_fix` (with the no-op-on-clean-tree exception). Uncommitted WIP gets retried so the next dispatch's reset doesn't silently destroy it.
+4. **`last_verified_sha == HEAD` required for handoff.** Code changes invalidate verification.
+5. **Crash recovery replays current unit.** Circuit breaker at `agent.max_unit_attempts` (default 3) → escalate to Human Input Needed.
+6. **doc_fix runs once before verify, not per subtask.** No external heuristic — the prompt asks the agent to read AGENTS.md and update anything stale; clean tree on closeout is accepted as a no-op.
+7. **Orchestrator owns verification.** Agent prompt doesn't include validation commands.
+8. **Rework skips re-plan when workpad is complete.** `rework_fix_applied` flag prevents re-dispatch loops.
+9. **Workpad sync is fatal for regular plan-N.** If `Adapter.mark_subtask_done` fails after a plan-N commit, closeout returns `{:retry, _}` and persists `pending_workpad_mark` so the next entry can recover the mark without requiring HEAD to advance again. Synthetic kinds (`rework-*`, `verify-fix-*`, `merge-sync-*`) are warn-only since their dispatch is not derived from the workpad checkbox.
 
 ## Testing
 
 ```bash
-mix test                                            # 73 unit tests
-mix run --no-start -e '...'                         # 9 integration scenarios (see Quick Start)
-mix compile --warnings-as-errors                    # zero warnings policy
+cd elixir
+mix compile --warnings-as-errors
+mix test
 ```
 
-Tests cover: WorkpadParser, IssueExec, Ledger, DispatchResolver, PromptBuilder, Closeout,
-DocImpact, and integration scenarios (full flow, doc-impact, crash recovery, HEAD invalidation,
-merging, rework).
+Tests cover: WorkpadParser, IssueExec, Ledger, DispatchResolver, PromptBuilder,
+Closeout (incl. baseline-clear / split-brain / pending-mark recovery), Workspace
+(incl. `prepare_for_dispatch/2`), AgentRunner unit-lite hook ordering, end-to-end
+integration scenarios.
 
 ## What NOT To Do
 
 - **Don't bypass the dispatch resolver** — always go through `DispatchResolver.resolve/1`
 - **Don't put validation in agent prompts** — validation is orchestrator-owned (`Verifier`)
 - **Don't write to `issue_exec.json` outside IssueExec module** — atomic writes only
-- **Don't use `run_unit_lite` in legacy mode** — check `Config.unit_lite?()` first
-- **Don't grow monolithic prompts** — each unit prompt should be < 2000 chars
+- **Don't grow monolithic prompts** — each unit prompt should stay focused
 - **Don't skip tests** — `mix compile --warnings-as-errors && mix test` before every commit
 - **Don't forget to rebuild the escript after code changes** — `mix escript.build`. The `bin/symphony` binary is a frozen snapshot; `mix compile` alone does NOT update it. A running Symphony process uses the escript it was started with, not the latest `.beam` files.
 
@@ -157,21 +147,26 @@ the OLD escript — your fix is not running. Always rebuild before restart.
 
 ## Configuration
 
-WORKFLOW.md front matter (unit-lite additions):
+WORKFLOW.md front matter (relevant sections):
 
 ```yaml
 agent:
-  execution_mode: unit_lite     # "legacy" | "unit_lite"
+  max_unit_attempts: 3            # circuit breaker for crash-replays per unit
+  max_concurrent_agents: 3
 
 verification:
   baseline_commands:
     - ./scripts/validate-app.sh --quick
   full_commands:
     - ./scripts/validate-app.sh
-
-docs:
-  doc_impact_command: null       # optional external command
+  max_verify_attempts: 3
+  max_verify_fix_cycles: 2
 ```
+
+> Stale keys removed in round-4 cleanup (`agent.execution_mode`, `agent.max_turns`,
+> `agent.compact_between_turns`, `docs.doc_impact_command`) are now ignored. Config
+> logs a warning when it sees them so operators notice instead of silently running
+> stripped-down behaviour.
 
 ## Further Reading
 

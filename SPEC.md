@@ -565,7 +565,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
-- `agent.max_turns`: integer, default `20`
+- `agent.max_unit_attempts`: integer, default `3` (circuit breaker for crash-replays per unit)
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -608,16 +608,20 @@ claim state.
 Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
-- The worker may continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker should start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn should use the full rendered task prompt.
-- Continuation turns should send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
-- Once the worker exits normally, the orchestrator still schedules a short continuation retry
-  (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+- One worker invocation runs **one unit** in **one fresh coding-agent session**:
+  the orchestrator decides which unit (bootstrap, plan, implement_subtask,
+  doc_fix, verify, handoff, merge, …) via `DispatchResolver`, builds the
+  per-unit prompt, runs it, and exits when the agent exits.
+- After each normal worker exit, the orchestrator re-checks the tracker issue
+  state and, if still active, dispatches the next unit (which may be another
+  `implement_subtask`, the mandatory pre-verify `doc_fix`, `verify`, etc.).
+- Crash recovery: if a worker exits abnormally with `current_unit` still set in
+  `issue_exec.json`, the orchestrator replays the same unit. Repeated replays
+  are bounded by `agent.max_unit_attempts` (the per-unit circuit breaker);
+  exceeding it escalates to Human Input Needed.
+- Once the worker exits normally, the orchestrator schedules a short
+  continuation retry (about 1 second) so it can re-check whether the issue
+  remains active and needs another dispatch.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -1804,7 +1808,7 @@ function dispatch_issue(issue, state, attempt):
   return state
 ```
 
-### 16.5 Worker Attempt (Workspace + Prompt + Agent)
+### 16.5 Worker Attempt (Workspace + Per-Unit Dispatch)
 
 ```text
 function run_agent_attempt(issue, attempt, orchestrator_channel):
@@ -1812,57 +1816,44 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if workspace failed:
     fail_worker("workspace error")
 
+  workspace_manager.prepare_for_dispatch(workspace.path)   # git fetch + reset + cache wipe
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
+  unit = dispatch_resolver.resolve(issue, exec_state, workpad)
+  if unit is :stop:
+    run_hook_best_effort("after_run", workspace.path)
+    exit_normal()
+
+  prompt = prompt_builder.build_unit_prompt(unit, issue, opts)
   session = app_server.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
 
-  max_turns = config.agent.max_turns
-  turn_number = 1
-
-  while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
-    if prompt failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("prompt error")
-
-    turn_result = app_server.run_turn(
-      session=session,
-      prompt=prompt,
-      issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
-    )
-
-    if turn_result failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("agent turn error")
-
-    refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
-    if refreshed_issue failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("issue state refresh error")
-
-    issue = refreshed_issue[0] or issue
-
-    if issue.state is not active:
-      break
-
-    if turn_number >= max_turns:
-      break
-
-    turn_number = turn_number + 1
+  turn_result = app_server.run_turn(
+    session=session,
+    prompt=prompt,
+    issue=issue,
+    on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+  )
 
   app_server.stop_session(session)
+
+  closeout_result = closeout.run(workspace.path, unit, issue, dispatch_head=head_at_dispatch)
+  match closeout_result:
+    :accepted -> issue_exec.accept_unit(workspace.path)
+    {:retry, reason} -> ledger.note(reason)         # current_unit stays set; replay next dispatch
+    {:fail, reason} -> escalate(issue, reason)
+
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()
 ```
+
+See [Unit-Lite Design](docs/design/symphony-gsd2-first-principles-lite.md) for
+the full per-unit closeout contract (HEAD-advance guard, workpad-mark recovery,
+baseline / verify-attempt counters, etc.).
 
 ### 16.6 Worker Exit and Retry Handling
 

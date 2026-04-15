@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.CloseoutTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{Closeout, IssueExec, Ledger, Workflow}
+  alias SymphonyElixir.{Closeout, IssueExec, Ledger, Verifier, Workflow}
 
   defmodule FakeLinearClient do
     def graphql(query, variables) do
@@ -246,10 +246,93 @@ defmodule SymphonyElixir.CloseoutTest do
       assert reason =~ "workpad sync failed"
     end
 
-    test "rework-* subtask: Linear mark failure does NOT trigger retry (warn-only)", %{workspace: ws} do
+    test "regular plan-N: pending workpad mark recovers without HEAD advance on retry", %{workspace: ws} do
+      # Regression guard for Codex round-5 finding: after a successful commit
+      # but a failed Linear mark, the next dispatch's dispatch_head is the
+      # post-commit HEAD. The agent has nothing to do and HEAD won't advance
+      # again. Without the pending_workpad_mark fast-path, the :unchanged
+      # guard would loop to the circuit breaker without ever retrying the
+      # mark.
+      previous = Application.get_env(:symphony_elixir, :linear_client_module)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:symphony_elixir, :linear_client_module, previous),
+          else: Application.delete_env(:symphony_elixir, :linear_client_module)
+      end)
+
+      defmodule FailingThenSuccessLinearClient do
+        # First attempt: simulate a transient network failure on comments
+        # fetch. Subsequent attempts: dispatch by variable shape — comments
+        # query takes %{issueId: _}, update takes %{commentId: _, body: _}.
+        @workpad_comment %{
+          "id" => "comment-workpad-1",
+          "body" => "## Codex Workpad\n\n### Plan\n- [ ] [plan-1] First\n",
+          "user" => %{"name" => "Symphony"},
+          "createdAt" => "2026-04-14T00:00:00.000Z"
+        }
+
+        def graphql(_query, %{issueId: _} = _vars) do
+          counter_key = {:closeout_test_linear_calls, self()}
+          n = (Process.get(counter_key) || 0) + 1
+          Process.put(counter_key, n)
+
+          if n == 1 do
+            {:error, :network_unreachable}
+          else
+            {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => [@workpad_comment]}}}}}
+          end
+        end
+
+        def graphql(_query, %{commentId: _, body: _}) do
+          {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+        end
+      end
+
+      Application.put_env(
+        :symphony_elixir, :linear_client_module, FailingThenSuccessLinearClient
+      )
+
+      {dispatch_head, _post_commit_head} = init_git_and_advance!(ws)
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      # First attempt: HEAD advanced, mark fails → {:retry, _}, sentinel set.
+      assert {:retry, _} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: dispatch_head
+               )
+
+      {:ok, exec_after_first} = IssueExec.read(ws)
+      assert exec_after_first["pending_workpad_mark"] == "plan-1"
+
+      # Second attempt: dispatch_head is the post-commit HEAD (HEAD will NOT
+      # advance again since no agent work is needed). Without the recovery
+      # path, this would hit :unchanged → retry → loop. With it: fast-path
+      # retries the mark, succeeds, accepts, and clears the sentinel.
+      post_commit_head = Verifier.current_head(ws)
+
+      assert :accepted =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: post_commit_head
+               )
+
+      {:ok, exec_after_second} = IssueExec.read(ws)
+      assert exec_after_second["pending_workpad_mark"] == nil
+    end
+
+    test "synthetic subtasks (rework-/verify-fix-/merge-sync-): Linear mark failure does NOT retry", %{workspace: ws} do
       # Synthetic subtask kinds (rework-* / verify-fix-* / merge-sync-*) are
       # not dispatched from the workpad checklist, so a workpad mark failure
-      # cannot create the same split-brain. They fall through to warn-only.
+      # cannot create the same split-brain that plan-N would. They fall
+      # through to warn-only across all three prefixes — guarding the
+      # `regular_plan_subtask?/1` whitelist boundary so a future regression
+      # cannot silently promote one prefix to fail-closed retry.
       previous = Application.get_env(:symphony_elixir, :linear_client_module)
 
       on_exit(fn ->
@@ -267,18 +350,25 @@ defmodule SymphonyElixir.CloseoutTest do
       {dispatch_head, _} = init_git_and_advance!(ws)
       issue = Map.put(@issue, :id, "issue-with-linear-id")
 
-      # rework-1 path: handle_rework_closeout requires linear_fetch_ok+context.
-      # Provide them so we get past the rework-specific gates and into
-      # accept_implement_subtask, where the Linear mark happens.
-      assert :accepted =
-               Closeout.run(
-                 ws,
-                 %{"kind" => "implement_subtask", "subtask_id" => "rework-1"},
-                 issue,
-                 dispatch_head: dispatch_head,
-                 linear_fetch_ok: true,
-                 rework_has_review_context: true
-               )
+      cases = [
+        # Each entry: subtask_id + extra opts (some prefixes have their own gates)
+        {"rework-1", [linear_fetch_ok: true, rework_has_review_context: true]},
+        {"verify-fix-1", []},
+        {"merge-sync-1", []}
+      ]
+
+      Enum.each(cases, fn {subtask_id, extra_opts} ->
+        opts = [dispatch_head: dispatch_head] ++ extra_opts
+
+        assert :accepted =
+                 Closeout.run(
+                   ws,
+                   %{"kind" => "implement_subtask", "subtask_id" => subtask_id},
+                   issue,
+                   opts
+                 ),
+               "expected synthetic subtask #{subtask_id} to be warn-only on Linear mark failure"
+      end)
     end
   end
 

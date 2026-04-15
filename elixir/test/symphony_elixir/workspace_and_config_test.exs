@@ -228,42 +228,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace session metadata can be saved, loaded, and invalidated" do
-    workspace_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-workspace-session-meta-#{System.unique_integer([:positive])}"
-      )
-
-    try do
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
-
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-SESSION")
-
-      meta = %{
-        thread_id: "thread-session",
-        dispatch_id: "dispatch-session",
-        cwd: Path.expand(workspace),
-        git_head: "abc123",
-        updated_at: ~U[2026-04-06 12:34:56Z]
-      }
-
-      assert :ok = Workspace.save_session_meta(workspace, meta)
-
-      assert {:ok, loaded_meta} = Workspace.load_session_meta(workspace)
-      assert loaded_meta.thread_id == "thread-session"
-      assert loaded_meta.dispatch_id == "dispatch-session"
-      assert loaded_meta.cwd == Path.expand(workspace)
-      assert loaded_meta.git_head == "abc123"
-      assert loaded_meta.updated_at == "2026-04-06T12:34:56Z"
-
-      assert :ok = Workspace.invalidate_session_meta(workspace)
-      assert {:error, :enoent} = Workspace.load_session_meta(workspace)
-    after
-      File.rm_rf(workspace_root)
-    end
-  end
-
   test "workspace removes all workspaces for a closed issue identifier" do
     workspace_root =
       Path.join(
@@ -702,12 +666,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       %{workspace: workspace} = create_cloned_git_workspace!(test_root, "MT-PREP-PRESERVE")
       symphony_state = Path.join([workspace, ".symphony", "state.json"])
       env_snapshot = Path.join(workspace, ".env.sh")
-      session_meta = Path.join(workspace, ".symphony_session.json")
 
       File.mkdir_p!(Path.dirname(symphony_state))
       File.write!(symphony_state, ~s({"status":"keep"}) <> "\n")
       File.write!(env_snapshot, "export KEEP=1\n")
-      File.write!(session_meta, ~s({"thread_id":"thread-preserve"}) <> "\n")
 
       log =
         capture_log(fn ->
@@ -717,7 +679,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert File.read!(symphony_state) == ~s({"status":"keep"}) <> "\n"
       assert File.read!(env_snapshot) == "export KEEP=1\n"
-      assert File.read!(session_meta) == ~s({"thread_id":"thread-preserve"}) <> "\n"
       assert log =~ ".env.sh is preserved and may be stale"
 
       assert length(Regex.scan(~r/\.env\.sh is preserved and may be stale/, log)) == 1

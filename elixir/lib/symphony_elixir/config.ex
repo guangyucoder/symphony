@@ -3,8 +3,22 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
+  require Logger
+
   alias NimbleOptions
   alias SymphonyElixir.Workflow
+
+  # Keys removed in the round-4 cleanup. Stale WORKFLOW.md files may still
+  # carry them. NimbleOptions only validates keys we extract, so silent
+  # acceptance is the failure mode without this guard. Warn once on each
+  # removed key so operators notice instead of silently running stripped-down
+  # behaviour.
+  @removed_workflow_keys [
+    {["agent", "execution_mode"], "agent.execution_mode (legacy mode was removed; unit-lite is the only mode)"},
+    {["agent", "max_turns"], "agent.max_turns (multi-turn loop was removed; one dispatch = one turn)"},
+    {["agent", "compact_between_turns"], "agent.compact_between_turns (no multi-turn loop to compact)"},
+    {["docs", "doc_impact_command"], "docs.doc_impact_command (DocImpact was removed; doc_fix runs unconditionally before verify)"}
+  ]
 
   @default_active_states ["Todo", "In Progress"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
@@ -470,9 +484,21 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validated_workflow_options do
-    workflow_config()
+    config = workflow_config()
+    warn_on_removed_keys(config)
+
+    config
     |> extract_workflow_options()
     |> NimbleOptions.validate!(@workflow_options_schema)
+  end
+
+  defp warn_on_removed_keys(config) do
+    Enum.each(@removed_workflow_keys, fn {path, label} ->
+      case get_in_path(config, path) do
+        :missing -> :ok
+        _ -> Logger.warning("Config: WORKFLOW.md still sets #{label}; this key has been removed and is now ignored")
+      end
+    end)
   end
 
   defp extract_workflow_options(config) do
