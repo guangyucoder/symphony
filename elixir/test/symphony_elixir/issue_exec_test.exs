@@ -18,7 +18,6 @@ defmodule SymphonyElixir.IssueExecTest do
       assert state["phase"] == "bootstrap"
       assert state["bootstrapped"] == false
       assert state["current_unit"] == nil
-      assert state["doc_fix_required"] == false
       assert state["plan_version"] == 0
       assert is_binary(state["updated_at"])
     end
@@ -39,7 +38,8 @@ defmodule SymphonyElixir.IssueExecTest do
       {:ok, state} = IssueExec.read(ws)
       assert state["bootstrapped"] == true
       assert state["phase"] == "planning"
-      assert state["mode"] == "unit_lite"  # preserved
+      # preserved
+      assert state["mode"] == "unit_lite"
     end
   end
 
@@ -66,25 +66,6 @@ defmodule SymphonyElixir.IssueExecTest do
     end
   end
 
-  describe "mark_doc_fix_required/1" do
-    test "sets flag", %{workspace: ws} do
-      :ok = IssueExec.init(ws)
-      :ok = IssueExec.mark_doc_fix_required(ws)
-      {:ok, state} = IssueExec.read(ws)
-      assert state["doc_fix_required"] == true
-    end
-  end
-
-  describe "clear_doc_fix_required/1" do
-    test "clears flag", %{workspace: ws} do
-      :ok = IssueExec.init(ws)
-      :ok = IssueExec.mark_doc_fix_required(ws)
-      :ok = IssueExec.clear_doc_fix_required(ws)
-      {:ok, state} = IssueExec.read(ws)
-      assert state["doc_fix_required"] == false
-    end
-  end
-
   describe "set_verified_sha/2" do
     test "updates last_verified_sha", %{workspace: ws} do
       :ok = IssueExec.init(ws)
@@ -104,7 +85,8 @@ defmodule SymphonyElixir.IssueExecTest do
       assert state["phase"] == "planning"
       assert state["current_unit"] == nil
       assert state["last_verified_sha"] == nil
-      assert state["bootstrapped"] == true  # preserved
+      # preserved
+      assert state["bootstrapped"] == true
     end
   end
 

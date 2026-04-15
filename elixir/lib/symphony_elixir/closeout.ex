@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Closeout do
     in `issue_exec.json`; downstream units can consume that signal.
   - `plan`: check workpad has parseable checklist, bump plan_version
   - `implement_subtask`: check subtask marked done, doc-impact check
-  - `doc_fix`: clear doc_fix_required flag
+  - `doc_fix`: mandatory pre-verify documentation pass; accept clean no-op
   - `verify`: run full verification, set last_verified_sha
   - `handoff`: check last_verified_sha == HEAD
   - `merge`: check PR actually merged on remote before marking done
@@ -113,7 +113,6 @@ defmodule SymphonyElixir.Closeout do
     # unchanged → acceptable no-op).
     case commit_advancement_state(workspace, opts) do
       :advanced ->
-        IssueExec.clear_doc_fix_required(workspace)
         :accepted
 
       :unchanged ->
@@ -125,7 +124,6 @@ defmodule SymphonyElixir.Closeout do
 
           false ->
             Logger.info("Closeout: doc_fix accepted as no-op (clean tree, no doc updates needed)")
-            IssueExec.clear_doc_fix_required(workspace)
             :accepted
         end
 
@@ -158,7 +156,14 @@ defmodule SymphonyElixir.Closeout do
           Ledger.verify_passed(workspace, head)
         end
 
-        # Reset all verify counters on success
+        # Reset all verify counters on success. Also clear any baseline
+        # failure flag/output: a passing full-verify implies the baseline
+        # red state from bootstrap is now repaired (or wasn't truly red).
+        # Without this, the flag becomes stale historical telemetry that
+        # could mislead future readers (e.g., a planner prompt added later
+        # that thinks the baseline is currently broken).
+        IssueExec.clear_baseline_verify_failure(workspace)
+
         IssueExec.update(workspace, %{
           "verify_attempt" => 0,
           "verify_error" => nil,
@@ -343,17 +348,71 @@ defmodule SymphonyElixir.Closeout do
   end
 
   defp accept_implement_subtask(workspace, subtask_id, issue) do
-    # 1. Mark subtask done on Linear workpad (orchestrator-owned, no agent compliance needed)
-    if subtask_id && issue_id(issue) do
-      case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
-        :ok ->
-          Logger.info("Closeout: marked #{subtask_id} done on Linear workpad")
+    # 1. Mark subtask done on Linear workpad (orchestrator-owned, no agent
+    # compliance needed). If this fails, retry the unit so the next dispatch
+    # gets another chance to sync — accepting locally would split-brain
+    # the workpad (Linear shows `[ ] [plan-N]`) from the code (already
+    # committed). Next dispatch would then re-derive plan-N as still pending,
+    # re-send the agent who has nothing to do, no commit advance, retry loop
+    # to circuit breaker. A few replay attempts via the circuit breaker is
+    # cheap; permanent split-brain is the failure mode we're avoiding.
+    #
+    # We only treat the marker call as fatal for "regular" plan-N subtasks
+    # whose dispatch is derived from the workpad checklist. The synthetic
+    # subtask kinds (rework-* / verify-fix-* / merge-sync-*) are not
+    # dispatched from the checklist, so their workpad mark is bookkeeping
+    # only and a failure does not create the same split-brain.
+    case maybe_mark_subtask_done(subtask_id, issue) do
+      :ok ->
+        post_accept_implement_subtask(workspace, subtask_id)
 
-        {:error, reason} ->
-          Logger.warning("Closeout: failed to mark #{subtask_id} on workpad: #{inspect(reason)}")
-      end
+      {:retry, reason} ->
+        {:retry, reason}
     end
+  end
 
+  defp maybe_mark_subtask_done(subtask_id, issue) do
+    cond do
+      not (is_binary(subtask_id) and is_binary(issue_id(issue))) ->
+        :ok
+
+      not regular_plan_subtask?(subtask_id) ->
+        # Best-effort for non-plan subtasks: log warning, do not fail closeout.
+        case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
+          :ok ->
+            Logger.info("Closeout: marked #{subtask_id} done on Linear workpad")
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Closeout: failed to mark non-plan #{subtask_id} on workpad: #{inspect(reason)} (continuing — next dispatch is not derived from this checkbox)")
+
+            :ok
+        end
+
+      true ->
+        # Regular plan-N: must succeed before local accept, else split-brain.
+        case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
+          :ok ->
+            Logger.info("Closeout: marked #{subtask_id} done on Linear workpad")
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Closeout: Linear workpad mark failed for #{subtask_id} (#{inspect(reason)}); returning {:retry,_} to avoid workpad/code split-brain")
+
+            {:retry, "implement_subtask #{subtask_id}: workpad sync failed (#{inspect(reason)})"}
+        end
+    end
+  end
+
+  defp regular_plan_subtask?(subtask_id) when is_binary(subtask_id) do
+    not String.starts_with?(subtask_id, "rework-") and
+      not String.starts_with?(subtask_id, "verify-fix-") and
+      not String.starts_with?(subtask_id, "merge-sync-")
+  end
+
+  defp regular_plan_subtask?(_), do: false
+
+  defp post_accept_implement_subtask(workspace, subtask_id) do
     # 1b. Set rework_fix_applied flag for rework-* subtasks
     if is_binary(subtask_id) and String.starts_with?(subtask_id, "rework-") do
       IssueExec.update(workspace, %{"rework_fix_applied" => true})
@@ -376,8 +435,6 @@ defmodule SymphonyElixir.Closeout do
       })
     end
 
-    # 2. Doc impact check deferred — runs once before verify, not after every subtask.
-    # This avoids N×doc_fix sessions for N subtasks (was burning ~1.5M tokens each).
     :accepted
   end
 

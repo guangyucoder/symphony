@@ -151,21 +151,13 @@ defmodule SymphonyElixir.CloseoutTest do
   end
 
   describe "doc_fix closeout" do
-    test "clears doc_fix_required flag when HEAD advanced", %{workspace: ws} do
-      IssueExec.mark_doc_fix_required(ws)
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["doc_fix_required"] == true
-
+    test "accepts when HEAD advanced (agent committed doc updates)", %{workspace: ws} do
       {dispatch_head, _} = init_git_and_advance!(ws)
 
       assert :accepted = Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
-
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["doc_fix_required"] == false
     end
 
     test "retries when HEAD unchanged AND tree is dirty — doc_fix forgot to commit", %{workspace: ws} do
-      IssueExec.mark_doc_fix_required(ws)
       dispatch_head = init_git_only!(ws)
 
       # Dirty the tree: an unstaged edit simulates "agent edited docs but
@@ -176,30 +168,117 @@ defmodule SymphonyElixir.CloseoutTest do
                Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
 
       assert reason =~ "doc_fix: produced no commit but tree is dirty"
-
-      # doc_fix_required must still be set so the dispatcher re-dispatches.
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["doc_fix_required"] == true
     end
 
     test "accepts no-op doc_fix (HEAD unchanged, tree clean — docs already up to date)", %{workspace: ws} do
-      # Regression guard for the Codex P1 finding: pre_verify_doc_check_rule
-      # dispatches doc_fix unconditionally before verify. If docs are already
-      # up to date, the agent legitimately produces no commit. A strict
-      # HEAD-advance guard would loop until circuit breaker — same failure
-      # mode as the bootstrap soft-accept bug. Accept the no-op only when
-      # tree is clean; dirty tree still triggers retry (see test above).
-      IssueExec.mark_doc_fix_required(ws)
+      # Regression guard: pre_verify_doc_check_rule dispatches doc_fix
+      # unconditionally before verify. If docs are already up to date, the
+      # agent legitimately produces no commit. A strict HEAD-advance guard
+      # would loop until circuit breaker — same failure mode as the bootstrap
+      # soft-accept bug. Accept the no-op only when tree is clean; dirty tree
+      # still triggers retry (see test above).
       dispatch_head = init_git_only!(ws)
 
       # No dirty edits. Working tree is clean after the seed commit.
       assert :accepted =
                Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
+    end
+  end
 
-      # doc_fix_required must be cleared so the dispatcher advances past
-      # the doc_fix rule on the next cycle.
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["doc_fix_required"] == false
+  describe "verify closeout — baseline_verify_failed clearing" do
+    test "verify pass clears stale baseline_verify_failed flag (regression guard for stale-state bug)", %{workspace: ws} do
+      # Simulate the chain: bootstrap soft-accept set the flag, and several
+      # implement units later verify finally passes. The flag must be cleared
+      # so future readers don't get a stale "baseline is broken" signal.
+      IssueExec.set_baseline_verify_failure(ws, "old failure output from bootstrap")
+      {:ok, exec_before} = IssueExec.read(ws)
+      assert exec_before["baseline_verify_failed"] == true
+      assert exec_before["baseline_verify_output"] != nil
+
+      # Need a real git repo so Verifier.current_head returns a sha.
+      System.cmd("git", ["init", "-q"], cd: ws)
+      System.cmd("git", ["config", "user.name", "Test"], cd: ws)
+      System.cmd("git", ["config", "user.email", "t@t.com"], cd: ws)
+      File.write!(Path.join(ws, "seed.txt"), "seed\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "init"], cd: ws)
+
+      assert :accepted = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["true"])
+
+      {:ok, exec_after} = IssueExec.read(ws)
+      assert exec_after["baseline_verify_failed"] == false
+      assert exec_after["baseline_verify_output"] == nil
+    end
+  end
+
+  describe "implement_subtask closeout — Linear workpad sync" do
+    test "regular plan-N: Linear mark failure → {:retry,_} (no split-brain)", %{workspace: ws} do
+      # Regression guard: if mark_subtask_done failed silently (warn + accept),
+      # the next dispatch would re-derive plan-1 from the unchanged workpad,
+      # send the agent who has nothing to do, fail HEAD-advance, and loop to
+      # the circuit breaker. Closeout must return {:retry, _} so the same
+      # unit is replayed and the marker has another chance to sync.
+      previous = Application.get_env(:symphony_elixir, :linear_client_module)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:symphony_elixir, :linear_client_module, previous),
+          else: Application.delete_env(:symphony_elixir, :linear_client_module)
+      end)
+
+      defmodule FailingLinearClient do
+        def graphql(_query, _variables), do: {:error, :network_unreachable}
+      end
+
+      Application.put_env(:symphony_elixir, :linear_client_module, FailingLinearClient)
+
+      {dispatch_head, _new_head} = init_git_and_advance!(ws)
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      assert {:retry, reason} =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "plan-1"},
+                 issue,
+                 dispatch_head: dispatch_head
+               )
+
+      assert reason =~ "workpad sync failed"
+    end
+
+    test "rework-* subtask: Linear mark failure does NOT trigger retry (warn-only)", %{workspace: ws} do
+      # Synthetic subtask kinds (rework-* / verify-fix-* / merge-sync-*) are
+      # not dispatched from the workpad checklist, so a workpad mark failure
+      # cannot create the same split-brain. They fall through to warn-only.
+      previous = Application.get_env(:symphony_elixir, :linear_client_module)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:symphony_elixir, :linear_client_module, previous),
+          else: Application.delete_env(:symphony_elixir, :linear_client_module)
+      end)
+
+      defmodule FailingLinearClient2 do
+        def graphql(_query, _variables), do: {:error, :network_unreachable}
+      end
+
+      Application.put_env(:symphony_elixir, :linear_client_module, FailingLinearClient2)
+
+      {dispatch_head, _} = init_git_and_advance!(ws)
+      issue = Map.put(@issue, :id, "issue-with-linear-id")
+
+      # rework-1 path: handle_rework_closeout requires linear_fetch_ok+context.
+      # Provide them so we get past the rework-specific gates and into
+      # accept_implement_subtask, where the Linear mark happens.
+      assert :accepted =
+               Closeout.run(
+                 ws,
+                 %{"kind" => "implement_subtask", "subtask_id" => "rework-1"},
+                 issue,
+                 dispatch_head: dispatch_head,
+                 linear_fetch_ok: true,
+                 rework_has_review_context: true
+               )
     end
   end
 

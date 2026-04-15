@@ -58,6 +58,7 @@ defmodule SymphonyElixir.ReasoningEffortTest do
 
       for unit <- units do
         map = Unit.to_map(unit)
+
         assert is_binary(map["reasoning_effort"]),
                "#{unit.kind} should have reasoning_effort in to_map"
       end
@@ -76,26 +77,32 @@ defmodule SymphonyElixir.ReasoningEffortTest do
       # Temporarily override codex command to simulate WORKFLOW.md config
       base = "codex --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server"
       # We test the regex logic directly since codex_command_with_effort reads from Config
-      replaced = Regex.replace(
-        ~r/model_reasoning_effort=\w+/,
-        base,
-        "model_reasoning_effort=low"
-      )
+      replaced =
+        Regex.replace(
+          ~r/model_reasoning_effort=\w+/,
+          base,
+          "model_reasoning_effort=low"
+        )
+
       assert replaced == "codex --config model_reasoning_effort=low --model gpt-5.3-codex app-server"
     end
 
     test "inserts reasoning effort when not present in base command" do
       base = "codex --model gpt-5.3-codex app-server"
-      result = String.replace(
-        base,
-        "app-server",
-        "--config model_reasoning_effort=medium app-server"
-      )
+
+      result =
+        String.replace(
+          base,
+          "app-server",
+          "--config model_reasoning_effort=medium app-server"
+        )
+
       assert result == "codex --model gpt-5.3-codex --config model_reasoning_effort=medium app-server"
     end
 
     test "effort levels match Codex valid values" do
       valid_efforts = ["low", "medium", "high", "xhigh"]
+
       units = [
         Unit.bootstrap(),
         Unit.plan(),

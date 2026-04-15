@@ -102,7 +102,6 @@ defmodule SymphonyElixir.TestSupport do
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           max_concurrent_agents: 10,
-          max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           max_unit_attempts: nil,
@@ -113,14 +112,11 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
-          codex_compact_between_turns: true,
-          execution_mode: nil,
           verification_baseline_commands: nil,
           verification_full_commands: nil,
           verification_timeout_ms: nil,
           verification_max_verify_attempts: nil,
           verification_max_verify_fix_cycles: nil,
-          doc_impact_command: nil,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -146,7 +142,6 @@ defmodule SymphonyElixir.TestSupport do
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
-    max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     max_unit_attempts = Keyword.get(config, :max_unit_attempts)
@@ -157,14 +152,11 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
-    codex_compact_between_turns = Keyword.get(config, :codex_compact_between_turns)
-    execution_mode = Keyword.get(config, :execution_mode)
     verification_baseline_commands = Keyword.get(config, :verification_baseline_commands)
     verification_full_commands = Keyword.get(config, :verification_full_commands)
     verification_timeout_ms = Keyword.get(config, :verification_timeout_ms)
     verification_max_verify_attempts = Keyword.get(config, :verification_max_verify_attempts)
     verification_max_verify_fix_cycles = Keyword.get(config, :verification_max_verify_fix_cycles)
-    doc_impact_command = Keyword.get(config, :doc_impact_command)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -194,11 +186,9 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
-        "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         max_unit_attempts_yaml(max_unit_attempts),
-        execution_mode_yaml(execution_mode),
         verification_yaml(
           verification_baseline_commands,
           verification_full_commands,
@@ -206,7 +196,6 @@ defmodule SymphonyElixir.TestSupport do
           verification_max_verify_attempts,
           verification_max_verify_fix_cycles
         ),
-        docs_yaml(doc_impact_command),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
@@ -215,7 +204,6 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
-        "  compact_between_turns: #{yaml_value(codex_compact_between_turns)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -286,9 +274,6 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp execution_mode_yaml(nil), do: nil
-  defp execution_mode_yaml(mode), do: "  execution_mode: #{yaml_value(mode)}"
-
   defp max_unit_attempts_yaml(nil), do: nil
   defp max_unit_attempts_yaml(value), do: "  max_unit_attempts: #{yaml_value(value)}"
 
@@ -303,9 +288,6 @@ defmodule SymphonyElixir.TestSupport do
     lines = if max_fix_cycles, do: lines ++ ["  max_verify_fix_cycles: #{yaml_value(max_fix_cycles)}"], else: lines
     Enum.join(lines, "\n")
   end
-
-  defp docs_yaml(nil), do: nil
-  defp docs_yaml(command), do: "docs:\n  doc_impact_command: #{yaml_value(command)}"
 
   defp hook_entry(_name, nil), do: nil
 

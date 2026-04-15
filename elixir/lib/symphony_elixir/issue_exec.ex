@@ -17,7 +17,6 @@ defmodule SymphonyElixir.IssueExec do
           last_verified_sha: String.t() | nil,
           baseline_verify_failed: boolean(),
           baseline_verify_output: String.t() | nil,
-          doc_fix_required: boolean(),
           bootstrapped: boolean(),
           plan_version: non_neg_integer(),
           updated_at: String.t()
@@ -32,7 +31,6 @@ defmodule SymphonyElixir.IssueExec do
     "last_verified_sha" => nil,
     "baseline_verify_failed" => false,
     "baseline_verify_output" => nil,
-    "doc_fix_required" => false,
     "rework_fix_applied" => false,
     "bootstrapped" => false,
     "plan_version" => 0,
@@ -106,18 +104,6 @@ defmodule SymphonyElixir.IssueExec do
     end
   end
 
-  @doc "Mark that doc_fix is required."
-  @spec mark_doc_fix_required(Path.t(), String.t()) :: :ok | {:error, term()}
-  def mark_doc_fix_required(workspace, _reason \\ "doc_impact_stale") do
-    update(workspace, %{"doc_fix_required" => true})
-  end
-
-  @doc "Clear doc_fix_required flag."
-  @spec clear_doc_fix_required(Path.t()) :: :ok | {:error, term()}
-  def clear_doc_fix_required(workspace) do
-    update(workspace, %{"doc_fix_required" => false})
-  end
-
   @doc "Set the last verified SHA."
   @spec set_verified_sha(Path.t(), String.t()) :: :ok | {:error, term()}
   def set_verified_sha(workspace, sha) do
@@ -182,7 +168,6 @@ defmodule SymphonyElixir.IssueExec do
       "current_unit" => nil,
       "last_accepted_unit" => nil,
       "last_verified_sha" => nil,
-      "doc_fix_required" => false,
       "verify_error" => nil,
       "verify_attempt" => 0,
       "verify_fix_count" => 0,

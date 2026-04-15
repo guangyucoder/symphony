@@ -37,11 +37,12 @@ defmodule SymphonyElixir.UnitLog do
   @doc "Write closeout result."
   @spec log_closeout(Path.t(), atom() | tuple(), map()) :: :ok
   def log_closeout(path, result, token_stats) do
-    result_str = case result do
-      :accepted -> "accepted"
-      {:retry, reason} -> "retry: #{reason}"
-      {:fail, reason} -> "fail: #{reason}"
-    end
+    result_str =
+      case result do
+        :accepted -> "accepted"
+        {:retry, reason} -> "retry: #{reason}"
+        {:fail, reason} -> "fail: #{reason}"
+      end
 
     append(path, "closeout", %{
       result: result_str,
@@ -80,19 +81,23 @@ defmodule SymphonyElixir.UnitLog do
 
   defp classify_event(%{event: :tool_call_completed} = msg) do
     params = get_in_path(msg, [:payload, "params"]) || %{}
-    {:tool_call, %{
-      name: tool_name(params),
-      args: truncate(inspect(tool_args(params)), 200)
-    }}
+
+    {:tool_call,
+     %{
+       name: tool_name(params),
+       args: truncate(inspect(tool_args(params)), 200)
+     }}
   end
 
   defp classify_event(%{event: :tool_call_failed} = msg) do
     params = get_in_path(msg, [:payload, "params"]) || %{}
-    {:tool_call, %{
-      name: tool_name(params),
-      args: truncate(inspect(tool_args(params)), 200),
-      failed: true
-    }}
+
+    {:tool_call,
+     %{
+       name: tool_name(params),
+       args: truncate(inspect(tool_args(params)), 200),
+       failed: true
+     }}
   end
 
   defp classify_event(%{event: :approval_auto_approved} = msg) do
@@ -102,9 +107,12 @@ defmodule SymphonyElixir.UnitLog do
     cond do
       String.contains?(method, "commandExecution") ->
         params = payload["params"] || %{}
-        cmd = get_in_path(params, ["command", "command"]) ||
-              get_in_path(params, ["commandLine"]) ||
-              inspect(params)
+
+        cmd =
+          get_in_path(params, ["command", "command"]) ||
+            get_in_path(params, ["commandLine"]) ||
+            inspect(params)
+
         {:command, %{cmd: truncate(to_string(cmd), 500)}}
 
       String.contains?(method, "fileChange") ->
@@ -126,8 +134,10 @@ defmodule SymphonyElixir.UnitLog do
   defp classify_event(%{payload: %{"method" => method}} = msg)
        when method in ["item/reasoning/summaryPartAdded"] do
     params = get_in_path(msg, [:payload, "params"]) || %{}
-    text = get_in_path(params, ["part", "text"]) ||
-           get_in_path(params, ["text"]) || ""
+
+    text =
+      get_in_path(params, ["part", "text"]) ||
+        get_in_path(params, ["text"]) || ""
 
     if byte_size(text) > 10 do
       {:reasoning, %{summary: truncate(text, 500)}}
@@ -141,16 +151,19 @@ defmodule SymphonyElixir.UnitLog do
   # --- Helpers ---
 
   defp append(path, event_type, data) do
-    entry = %{
-      ts: DateTime.utc_now() |> DateTime.to_iso8601(),
-      type: event_type
-    }
-    |> Map.merge(data)
+    entry =
+      %{
+        ts: DateTime.utc_now() |> DateTime.to_iso8601(),
+        type: event_type
+      }
+      |> Map.merge(data)
 
     line = Jason.encode!(entry) <> "\n"
 
     case File.write(path, line, [:append, :utf8]) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, reason} ->
         Logger.debug("UnitLog: write failed #{reason}")
         :ok
@@ -170,12 +183,14 @@ defmodule SymphonyElixir.UnitLog do
   defp tool_args(_), do: %{}
 
   defp get_in_path(map, []) when is_map(map), do: map
+
   defp get_in_path(map, [key | rest]) when is_map(map) do
     case Map.get(map, key) do
       nil -> nil
       val -> get_in_path(val, rest)
     end
   end
+
   defp get_in_path(_, _), do: nil
 
   defp truncate(text, max) when is_binary(text) do
