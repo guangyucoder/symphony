@@ -188,7 +188,16 @@ defmodule SymphonyElixir.IssueExec do
     update(workspace, %{"verify_error" => nil})
   end
 
-  @doc "Reset for rework: clear subtask progress, keep bootstrapped."
+  @doc """
+  Reset for rework: clear subtask progress, keep bootstrapped.
+
+  Currently has no production caller — `DispatchResolver.rework_reset_rule/1`
+  drives a fresh `Unit.plan()` dispatch instead. The function is retained as
+  a tested scaffold so when/if the rework flow is wired through it, the field
+  list (especially `pending_workpad_mark`) is already correct. Until then,
+  the sentinel-clear here is forward-defensive only; the same protection is
+  enforced inside `recover_pending_workpad_mark/3` via the HEAD-pin guard.
+  """
   @spec reset_for_rework(Path.t()) :: :ok | {:error, term()}
   def reset_for_rework(workspace) do
     update(workspace, %{

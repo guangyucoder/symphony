@@ -47,6 +47,10 @@ defmodule SymphonyElixir.IssueExecTest do
 
       {:ok, state} = IssueExec.read(ws)
 
+      # Map.has_key? is the actual merge-direction guard: if `Map.merge(@default_state, state)`
+      # were deleted, the key would simply be absent (and `state["..."]` returns nil for
+      # missing string keys, so the value-only assertion below would pass vacuously).
+      assert Map.has_key?(state, "pending_workpad_mark")
       assert state["pending_workpad_mark"] == nil
       assert state["baseline_verify_failed"] == false
       assert state["verify_attempt"] == 0

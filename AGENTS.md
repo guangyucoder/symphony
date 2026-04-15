@@ -106,7 +106,7 @@ else                                          → handoff
 6. **doc_fix runs once before verify, not per subtask.** No external heuristic — the prompt asks the agent to read AGENTS.md and update anything stale; clean tree on closeout is accepted as a no-op.
 7. **Orchestrator owns verification.** Agent prompt doesn't include validation commands.
 8. **Rework skips re-plan when workpad is complete.** `rework_fix_applied` flag prevents re-dispatch loops.
-9. **Workpad sync is fatal for regular plan-N.** If `Adapter.mark_subtask_done` fails after a plan-N commit, closeout returns `{:retry, _}` and persists `pending_workpad_mark` so the next entry can recover the mark without requiring HEAD to advance again. Synthetic kinds (`rework-*`, `verify-fix-*`, `merge-sync-*`) are warn-only since their dispatch is not derived from the workpad checkbox.
+9. **Workpad sync is fatal for regular plan-N.** If `Adapter.mark_subtask_done` fails after a plan-N commit, closeout returns `{:retry, _}` and persists `pending_workpad_mark` as `%{subtask_id, committed_sha}` (the post-commit HEAD) so the next entry can recover the mark without requiring HEAD to advance again. Recovery requires current HEAD to still equal `committed_sha`: if HEAD has moved past it (e.g., a replan re-emitted plan-N with new content), the stale sentinel is cleared and the normal HEAD-advance check decides; if HEAD is unreadable, recovery is deferred (sentinel preserved). Synthetic kinds (`rework-*`, `verify-fix-*`, `merge-sync-*`) are warn-only since their dispatch is not derived from the workpad checkbox.
 
 ## Testing
 

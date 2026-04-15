@@ -418,18 +418,23 @@ defmodule SymphonyElixir.Closeout do
   defp recover_pending_workpad_mark(workspace, subtask_id, issue) do
     with true <- regular_plan_subtask?(subtask_id),
          {:ok, exec} <- IssueExec.read(workspace),
+         pending = exec["pending_workpad_mark"],
+         :ok <- maybe_clear_legacy_sentinel(workspace, pending),
          %{"subtask_id" => pending_id, "committed_sha" => pending_sha} when is_binary(pending_id) and is_binary(pending_sha) <-
-           exec["pending_workpad_mark"],
+           pending,
          true <- pending_id == subtask_id,
          issue_id when is_binary(issue_id) <- issue_id(issue) do
-      cond do
-        Verifier.current_head(workspace) != pending_sha ->
-          Logger.info("Closeout: clearing stale pending workpad mark for #{subtask_id} (HEAD has moved since sentinel was set)")
+      # Distinguish "git lookup failed" (nil HEAD — defer recovery, sentinel
+      # still valid) from "HEAD moved past the captured sha" (sentinel stale —
+      # clear it, fall through). Mirrors the is_binary(sha) guard at sentinel
+      # set time, where we refuse to write a sentinel we can't validate.
+      case Verifier.current_head(workspace) do
+        nil ->
+          Logger.warning("Closeout: cannot read HEAD to validate pending workpad mark for #{subtask_id}; deferring recovery")
 
-          IssueExec.clear_pending_workpad_mark(workspace)
-          :no_pending
+          {:still_pending, "implement_subtask #{subtask_id}: cannot validate sentinel (git HEAD unavailable)"}
 
-        true ->
+        ^pending_sha ->
           case Adapter.mark_subtask_done(issue_id, subtask_id) do
             :ok ->
               IssueExec.clear_pending_workpad_mark(workspace)
@@ -441,11 +446,33 @@ defmodule SymphonyElixir.Closeout do
 
               {:still_pending, "implement_subtask #{subtask_id}: workpad sync still failing (#{inspect(reason)})"}
           end
+
+        _other_sha ->
+          Logger.info("Closeout: clearing stale pending workpad mark for #{subtask_id} (HEAD has moved past the captured commit)")
+
+          IssueExec.clear_pending_workpad_mark(workspace)
+          :no_pending
       end
     else
       _ -> :no_pending
     end
   end
+
+  # The round-5 sentinel was a bare binary subtask_id. Round-5b switched to a
+  # `%{subtask_id, committed_sha}` map so recovery can pin against HEAD. An
+  # in-flight workspace upgraded across releases may still have the old shape
+  # on disk — clear it and log once, otherwise the next dispatch silently
+  # falls through to `:no_pending` and burns a retry attempt before the next
+  # writer overwrites the field. Returning :ok lets the with-chain continue;
+  # the cleared sentinel will then fail the map-shape match below as a no-op.
+  defp maybe_clear_legacy_sentinel(workspace, pending) when is_binary(pending) do
+    Logger.info("Closeout: discarding legacy-shape pending_workpad_mark sentinel (binary #{inspect(pending)}); upgrade in progress")
+
+    IssueExec.clear_pending_workpad_mark(workspace)
+    :ok
+  end
+
+  defp maybe_clear_legacy_sentinel(_workspace, _pending), do: :ok
 
   defp maybe_mark_subtask_done(subtask_id, issue) do
     cond do

@@ -1420,7 +1420,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
           end
         end)
 
-      max_turns_warnings = Regex.scan(~r/agent\.max_turns/, log) |> length()
+      # Anchor to the full warning prefix so this counts warning EVENTS, not
+      # incidental occurrences of the key substring (e.g., a future label that
+      # mentions the key twice in one line).
+      max_turns_warnings =
+        Regex.scan(~r/Config: WORKFLOW\.md still sets agent\.max_turns/, log) |> length()
+
       assert max_turns_warnings == 1, "expected exactly one warning for agent.max_turns, got #{max_turns_warnings}"
     end
 
