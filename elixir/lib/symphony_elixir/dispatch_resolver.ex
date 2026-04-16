@@ -280,12 +280,7 @@ defmodule SymphonyElixir.DispatchResolver do
   # Verify fix: if verify_error is set, dispatch implement_subtask to fix the code
   # rather than blindly retrying verify against the same broken code.
   defp verify_fix_rule(%{exec: %{"verify_error" => error}}) when is_binary(error) do
-    prompt_error =
-      if String.length(error) > 1500,
-        do: String.slice(error, 0, 1500) <> "\n... (truncated)",
-        else: error
-
-    {:dispatch, Unit.implement_subtask("verify-fix-1", prompt_error)}
+    {:dispatch, Unit.implement_subtask("verify-fix-1", error)}
   end
 
   defp verify_fix_rule(_), do: nil

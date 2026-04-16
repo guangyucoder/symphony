@@ -233,9 +233,9 @@ defmodule SymphonyElixir.Verifier do
         :pass
 
       {:ok, {output, status}} ->
-        truncated = truncate(output, 4096)
+        binary = IO.iodata_to_binary(output)
         Logger.warning("Verifier: `#{command}` failed (exit #{status})")
-        {:fail, "Command `#{command}` failed (exit #{status}):\n#{truncated}"}
+        {:fail, "Command `#{command}` failed (exit #{status}):\n#{binary}"}
 
       nil ->
         Logger.warning("Verifier: `#{command}` timed out after #{timeout_ms}ms")
@@ -269,13 +269,4 @@ defmodule SymphonyElixir.Verifier do
     end
   end
 
-  defp truncate(text, max_chars) do
-    binary = IO.iodata_to_binary(text)
-
-    if String.length(binary) <= max_chars do
-      binary
-    else
-      String.slice(binary, 0, max_chars) <> "\n... (truncated)"
-    end
-  end
 end

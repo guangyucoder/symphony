@@ -43,9 +43,8 @@ defmodule SymphonyElixir.Closeout do
         :accepted
 
       {:fail, output} ->
-        truncated_output = truncate(output, 2048)
         Logger.warning("Closeout: baseline verification failed")
-        IssueExec.set_baseline_verify_failure(workspace, truncated_output)
+        IssueExec.set_baseline_verify_failure(workspace, output)
         # Mark bootstrapped even on baseline failure. Without this, the
         # dispatcher's bootstrap_rule (matches on bootstrapped==false) keeps
         # re-firing forever on an :accepted unit that clears current_unit,
@@ -53,8 +52,8 @@ defmodule SymphonyElixir.Closeout do
         # baseline_verify_failed / baseline_verify_output; downstream units
         # read those to decide whether to fix the baseline before their own work.
         IssueExec.mark_bootstrapped(workspace)
-        Ledger.append(workspace, :baseline_verify_failed, %{"output" => truncated_output})
-        Ledger.append(workspace, :baseline_accepted_despite_failure, %{"output" => truncated_output})
+        Ledger.append(workspace, :baseline_verify_failed, %{"output" => output})
+        Ledger.append(workspace, :baseline_accepted_despite_failure, %{"output" => output})
         :accepted
     end
   end
@@ -194,7 +193,7 @@ defmodule SymphonyElixir.Closeout do
 
         Ledger.append(workspace, :verify_exhausted, %{
           "attempt" => attempt,
-          "last_error" => truncate(output, 512)
+          "last_error" => output
         })
 
         issue_id = issue_id(issue)
@@ -202,14 +201,14 @@ defmodule SymphonyElixir.Closeout do
         if is_binary(issue_id) do
           Adapter.create_comment(
             issue_id,
-            "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{truncate(output, 256)}\n\nEscalating — code will NOT proceed to handoff."
+            "**Verification failed**: exhausted #{attempt} attempts.\nLast error: #{output}\n\nEscalating — code will NOT proceed to handoff."
           )
         end
 
         # Clear verify_error but keep current_unit set so replay_current_unit_rule
         # increments the attempt and triggers circuit_breaker → escalation.
         IssueExec.update(workspace, %{"verify_error" => nil})
-        {:fail, "Verification exhausted #{attempt} attempts: #{truncate(output, 512)}"}
+        {:fail, "Verification exhausted #{attempt} attempts: #{output}"}
 
       {:fail, output} ->
         # Dispatch verify-fix if we haven't exhausted fix cycles.
@@ -218,8 +217,7 @@ defmodule SymphonyElixir.Closeout do
         fix_count = exec_state["verify_fix_count"] || 0
 
         if fix_count < max_verify_fix_cycles do
-          truncated_error = truncate(output, 1500)
-          IssueExec.set_verify_error(workspace, truncated_error)
+          IssueExec.set_verify_error(workspace, output)
 
           IssueExec.update(workspace, %{
             "current_unit" => nil,
@@ -229,13 +227,13 @@ defmodule SymphonyElixir.Closeout do
           Ledger.append(workspace, :verify_failed_will_fix, %{
             "attempt" => attempt,
             "fix_cycle" => fix_count + 1,
-            "error" => truncate(output, 512)
+            "error" => output
           })
 
-          {:retry, "Verification failed (verify-fix ##{fix_count + 1} will be dispatched): #{truncate(output, 1024)}"}
+          {:retry, "Verification failed (verify-fix ##{fix_count + 1} will be dispatched): #{output}"}
         else
           # No more fix cycles — plain retry, will exhaust on next attempt
-          {:retry, "Verification failed (fix cycles exhausted): #{truncate(output, 1024)}"}
+          {:retry, "Verification failed (fix cycles exhausted): #{output}"}
         end
     end
   end
@@ -574,12 +572,6 @@ defmodule SymphonyElixir.Closeout do
         :cannot_verify
     end
   end
-
-  defp truncate(text, max) when is_binary(text) do
-    if String.length(text) <= max, do: text, else: String.slice(text, 0, max) <> "..."
-  end
-
-  defp truncate(text, max), do: truncate(IO.iodata_to_binary(text), max)
 
   defp issue_id(%{id: id}) when is_binary(id), do: id
   defp issue_id(%{"id" => id}) when is_binary(id), do: id
