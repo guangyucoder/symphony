@@ -14,12 +14,39 @@ defmodule SymphonyElixir.PromptBuilder do
   def build_unit_prompt(issue, %Unit{} = unit, opts \\ []) do
     [
       unit_header(issue, unit),
+      retry_preamble(unit, opts),
       unit_context(unit, opts),
       unit_instructions(unit, opts),
       unit_guardrails(unit)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n\n")
+  end
+
+  # When the prior dispatch's closeout returned `{:retry, reason}`, the resumed
+  # agent MUST see the reason verbatim — otherwise it acts on the base prompt's
+  # default framing and repeats the rejected behavior. code_review handles retry
+  # internally via `code_review_retry_prefix/1`; other kinds get this preamble.
+  defp retry_preamble(%Unit{kind: :code_review}, _opts), do: nil
+
+  defp retry_preamble(_unit, opts) do
+    case Keyword.get(opts, :retry_reason) do
+      reason when is_binary(reason) and reason != "" ->
+        """
+        ## Previous attempt rejected
+
+        The orchestrator rejected your prior turn:
+
+            #{reason}
+
+        Address this rejection directly before anything else. If the rejection
+        is about missing / malformed output (e.g. no commit, no workpad mark),
+        fix the output — do not start over from scratch.
+        """
+
+      _ ->
+        nil
+    end
   end
 
   # Orchestrator-injected context for rework-* subtasks: Linear comments on
@@ -48,6 +75,36 @@ defmodule SymphonyElixir.PromptBuilder do
   defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _}, _opts), do: nil
   defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "merge-sync-" <> _}, _opts), do: nil
 
+  # review-fix-N: the review thread and the implement thread are DIFFERENT
+  # persistent Codex threads, so the implement agent cannot see findings via
+  # its own conversation history even when resumed. Always inject the LATEST
+  # `### Code Review` findings — small enough (1-3KB) to not defeat warm
+  # discipline; load-bearing because "what to fix" is the whole point.
+  #
+  # On cold-fallback (resume failed), additionally inject the full workpad so
+  # the memory-less agent also sees plan/notes.
+  defp unit_context(%Unit{kind: :implement_subtask, subtask_id: "review-fix-" <> _}, opts) do
+    if Keyword.get(opts, :is_resumed_session, false) do
+      render_findings_delta(Keyword.get(opts, :workpad_text))
+    else
+      render_workpad_context(Keyword.get(opts, :workpad_text))
+    end
+  end
+
+  # code_review on a resumed session: same principle — reviewer already has
+  # conversation context, don't re-inject.
+  # Cold code_review needs workpad context (Plan + prior Notes) so the reviewer
+  # understands what the implement sessions were aiming at. Resumed sessions
+  # already have that context in conversation history — skipping the re-inject
+  # keeps resumed turns small (warm-session delta discipline).
+  defp unit_context(%Unit{kind: :code_review}, opts) do
+    if Keyword.get(opts, :is_resumed_session, false) do
+      nil
+    else
+      render_workpad_context(Keyword.get(opts, :workpad_text))
+    end
+  end
+
   # Regular implement_subtask: inject the current Codex Workpad comment so the
   # agent sees sibling subtasks' status, prior continuation notes, and the
   # overall plan shape without having to make a Linear API call at turn start.
@@ -58,6 +115,54 @@ defmodule SymphonyElixir.PromptBuilder do
   end
 
   defp unit_context(_unit, _opts), do: nil
+
+  # Inject just the latest `### Code Review` section as findings context —
+  # used on warm review-fix-N dispatch since findings come from a different
+  # thread than the one we're resuming.
+  defp render_findings_delta(workpad_text) when is_binary(workpad_text) do
+    case SymphonyElixir.WorkpadParser.latest_code_review_section(workpad_text) do
+      nil ->
+        nil
+
+      section ->
+        """
+        <review_findings>
+        ### Code Review
+        #{sanitize_findings_body(section)}
+        </review_findings>
+        """
+    end
+  end
+
+  defp render_findings_delta(_), do: nil
+
+  # Defense-in-depth against a review thread writing `</review_findings>` in
+  # the section body and breaking out of the wrapper to inject top-level
+  # instructions into the implement thread's prompt. Neutralize the wrapper
+  # tags including whitespace + case variants.
+  defp sanitize_findings_body(body) when is_binary(body) do
+    body
+    |> neutralize_wrapper_tag("review_findings")
+    |> neutralize_wrapper_tag("workpad")
+  end
+
+  defp sanitize_findings_body(_), do: ""
+
+  # Generic tag neutralizer — matches `<tag...>` or `</tag ...>` with
+  # arbitrary whitespace/attributes and ANY case (LLMs love case variants).
+  # Replaces with `<tag_filtered...>` / `</tag_filtered ...>`. Safer than
+  # the plain String.replace-exact-literal pattern, which was bypassable
+  # by `</review_findings >` (trailing space), `</WORKPAD>`, etc.
+  defp neutralize_wrapper_tag(body, tag) when is_binary(body) and is_binary(tag) do
+    # Match `</TAG...>` (closing) — case-insensitive, any attrs/whitespace.
+    close_re = ~r/<\/(#{Regex.escape(tag)})([^>]*)>/i
+    # Match `<TAG...>` or `<TAG ...>` (opening).
+    open_re = ~r/<(#{Regex.escape(tag)})(\s[^>]*|)>/i
+
+    body
+    |> then(&Regex.replace(close_re, &1, "</\\1_filtered\\2>"))
+    |> then(&Regex.replace(open_re, &1, "<\\1_filtered\\2>"))
+  end
 
   # Cap in BYTES (not graphemes — CJK content would ~3× a grapheme cap and
   # blow the prompt budget). Real-world workpads on this project sit at
@@ -72,13 +177,11 @@ defmodule SymphonyElixir.PromptBuilder do
     if trimmed == "" do
       nil
     else
-      rendered =
-        if byte_size(trimmed) > @max_workpad_bytes do
-          head = take_head_bytes(trimmed, @max_workpad_bytes)
-          "#{head}\n…(workpad truncated to fit prompt budget — fetch the full `## Codex Workpad` comment from Linear if you need content past this point)"
-        else
-          trimmed
-        end
+      # Section-aware truncation: protects `### Plan` + latest `### Code Review`
+      # from head-cut, drops oldest Notes continuations first. The naive head
+      # cut used previously could silently slice the latest review findings
+      # mid-line, blinding a resumed implement session to what it must fix.
+      rendered = SymphonyElixir.WorkpadParser.truncate_preserving_sections(trimmed, @max_workpad_bytes)
 
       """
       <workpad>
@@ -90,9 +193,8 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp render_workpad_context(_), do: nil
 
-  # Cut a binary prefix at byte_cap and strip any trailing partial UTF-8
-  # code point so the result is always a valid string. O(byte_cap) upper
-  # bound on the trim walk; in practice at most a 3-byte continuation run.
+  # Still used for non-section content (e.g., ticket description) where the
+  # simpler head-cut is fine because there's no internal structure to protect.
   defp take_head_bytes(text, byte_cap) when byte_size(text) <= byte_cap, do: text
 
   defp take_head_bytes(text, byte_cap) do
@@ -111,11 +213,10 @@ defmodule SymphonyElixir.PromptBuilder do
 
   # The workpad is Symphony's own artifact, but humans and agents edit it over
   # time and it may contain user-pasted content in Notes. Defense-in-depth:
-  # neutralize any literal `</workpad>` so the block can't be closed early.
+  # neutralize any literal `</workpad>` (including whitespace / case variants)
+  # so the block can't be closed early.
   defp sanitize_workpad_body(body) do
-    body
-    |> String.replace("</workpad>", "</workpad_filtered>")
-    |> String.replace("<workpad>", "<workpad_filtered>")
+    neutralize_wrapper_tag(body, "workpad")
   end
 
   # Size budget: total ticket_comments block is capped at 10KB, and on overflow
@@ -128,7 +229,12 @@ defmodule SymphonyElixir.PromptBuilder do
   # routinely run 5-8KB, so a previous 2KB per-comment cap was slicing the
   # actionable tail — see ENT-171 round 4 where the `scan-workbench.test.ts`
   # file:line references were cut mid-enumeration and silently missed.
-  @max_comment_body_chars 9_216
+  # Per-comment cap is in BYTES to match @max_ticket_comments_bytes — otherwise
+  # CJK-heavy bodies (3 bytes/char) could inflate a nominally "9K" comment to
+  # ~27KB, overflow the total cap, and get wholesale-skipped by the reducer
+  # below. Must stay just below the total so a single huge comment still fits
+  # with a truncation marker rather than being silently dropped.
+  @max_comment_body_bytes 9_216
   @max_ticket_comments_bytes 10_240
 
   defp render_ticket_comments(comments) do
@@ -180,23 +286,21 @@ defmodule SymphonyElixir.PromptBuilder do
   # tag and injecting top-level instructions. Replace (not drop) so the agent
   # can still see that something was there — avoids silent content loss.
   defp sanitize_body(body) when is_binary(body) do
-    # Use String.length / String.slice (grapheme-based) consistently to avoid
-    # the byte_size vs grapheme mismatch — truncating by byte count while
-    # checking by graphemes (or vice versa) lets UTF-8 multi-byte bodies drift
-    # past their nominal cap. The total-size cap upstream is still in bytes,
-    # which bounds overall prompt size regardless of individual-body drift.
+    # Use BYTE-based cap (matching @max_ticket_comments_bytes) — CJK bodies at
+    # a grapheme cap could inflate to 3× the byte cap and get wholesale-
+    # skipped by the total-bytes reducer in render_ticket_comments/1.
+    # take_head_bytes trims at the last valid UTF-8 boundary so the output is
+    # always valid UTF-8.
     truncated =
-      if String.length(body) > @max_comment_body_chars do
-        String.slice(body, 0, @max_comment_body_chars) <> "\n…(comment body truncated)"
+      if byte_size(body) > @max_comment_body_bytes do
+        take_head_bytes(body, @max_comment_body_bytes) <> "\n…(comment body truncated)"
       else
         body
       end
 
     truncated
-    |> String.replace("</ticket_comments>", "</ticket_comments_filtered>")
-    |> String.replace("<ticket_comments>", "<ticket_comments_filtered>")
-    |> String.replace("</comment>", "</comment_filtered>")
-    |> String.replace("<comment ", "<comment_filtered ")
+    |> neutralize_wrapper_tag("ticket_comments")
+    |> neutralize_wrapper_tag("comment")
   end
 
   defp sanitize_body(_), do: ""
@@ -382,6 +486,55 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
+  # Warm-session review loop: reviewer (session B) wrote findings into the
+  # workpad's latest `### Code Review` section. This dispatch resumes session
+  # A (implement thread) — or, if resume failed, a fresh cold session — and
+  # tells the agent to apply those findings. The two branches only differ in
+  # what the agent can be assumed to remember.
+  defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "review-fix-" <> _ = id}, opts) do
+    if Keyword.get(opts, :is_resumed_session, false) do
+      """
+      ## Implement review fix `#{id}`
+
+      The reviewer (running in a SEPARATE persistent thread) just posted
+      findings. They appear verbatim in the `<review_findings>` block above
+      — the implement thread never sees review history on its own, so that
+      block is the canonical source. Apply the MEDIUM+ fixes, keep tests
+      green, and commit. Plan / prior continuation notes are in your own
+      conversation history — no need to re-read those.
+
+      **Done when**
+      - every MEDIUM-or-higher finding from the latest Code Review round is fixed
+      - `./scripts/verify-changed.sh` exits green
+      - a commit references `#{id}` in its message
+
+      Leave LOW findings if fixing them would balloon scope; note the choice in
+      the commit message.
+
+      NEVER force-push. NEVER commit while verification is red.
+      """
+    else
+      """
+      ## Implement review fix `#{id}` (cold session — no prior memory)
+
+      Resume failed or the implement thread expired, so you are starting with
+      no conversation history. The workpad above contains the full `### Plan`,
+      `### Notes` continuations, and the latest `### Code Review` section with
+      the findings to fix. Read all three before writing code.
+
+      **Done when**
+      - every MEDIUM-or-higher finding from the latest Code Review round is fixed
+      - `./scripts/verify-changed.sh` exits green
+      - a commit references `#{id}` in its message
+
+      Leave LOW findings if fixing them would balloon scope; note the choice in
+      the commit message.
+
+      NEVER force-push. NEVER commit while verification is red.
+      """
+    end
+  end
+
   defp unit_instructions(%Unit{kind: :implement_subtask, subtask_id: "rework-" <> _, subtask_text: _text}, _opts) do
     """
     ## Instructions — Rework Fix
@@ -481,17 +634,56 @@ defmodule SymphonyElixir.PromptBuilder do
     """
   end
 
+  # Two-branch routing (post-Iter-10 simplification):
+  #
+  #   retry_reason !is present → prepend as prefix, agent reads reason +
+  #                              uses the base prompt to decide what to do.
+  #
+  #   base prompt is cold OR resumed based on whether we have a baseline:
+  #     is_resumed AND last_reviewed_sha is a binary → resumed prompt
+  #     else                                         → cold prompt
+  #
+  # The previous 5-branch cond table was the source of three HIGH regressions
+  # across Iter 6/7/9 (findings→clean flip, cold-fallback reporting framing,
+  # skill-not-invoked bypass). Trusting the agent to read the rejection
+  # reason + base prompt and figure out the right action is fewer moving
+  # parts and fewer edges. Closeout-level guards (reviewer_committed?,
+  # findings→clean rejection, SHA match) are the hard stops regardless.
+  defp unit_instructions(%Unit{kind: :code_review}, opts) do
+    last_reviewed_sha = Keyword.get(opts, :last_reviewed_sha)
+    is_resumed = Keyword.get(opts, :is_resumed_session, false)
+
+    base =
+      if is_resumed and is_binary(last_reviewed_sha) do
+        code_review_resumed_prompt(last_reviewed_sha)
+      else
+        code_review_cold_prompt()
+      end
+
+    code_review_retry_prefix(Keyword.get(opts, :retry_reason)) <> base
+  end
+
+  # If the prior dispatch was rejected by closeout, prepend a short block
+  # naming the exact rejection. The base prompt underneath (cold or resumed)
+  # tells the agent WHAT to do; this prefix tells them WHY they're re-running.
+  # Defined after the unit_instructions clause block below (Elixir warns on
+  # interrupted same-name/arity defps).
+
   # Handoff: goal-oriented, low-effort unit
   defp unit_instructions(%Unit{kind: :handoff}, _opts) do
     """
     ## Instructions — Handoff
     Deliver the completed work for human review. Your goal:
     - Write `## Results` comment on the Linear issue with deliverables summary.
+      Include a one-line pointer to the workpad's `### Code Review` section
+      (the orchestrator dispatched a `code_review` unit before this one, so
+      that section already exists — just reference it).
     - Push branch and create/update PR via `push` skill.
     - Attach PR URL to the issue.
     - Move issue to `Human Review`.
 
     Do NOT write new functional code — all implementation is complete at this point.
+    Do NOT re-run `$code-review` — it already ran in the previous unit.
     """
   end
 
@@ -508,6 +700,142 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp unit_instructions(_unit, _opts) do
     "Follow the instructions for this unit."
+  end
+
+  # --- code_review prompts (moved here so the unit_instructions/2 clauses
+  # above stay contiguous — Elixir warns on same-name/arity defps interrupted
+  # by other definitions) ---
+
+  # Retry prefix — prepended onto cold/resumed when prior dispatch was
+  # rejected. Agent reads reason + base prompt and picks the right action.
+  defp code_review_retry_prefix(reason) when is_binary(reason) and reason != "" do
+    """
+    ## Previous attempt rejected
+
+    The orchestrator's closeout rejected the previous turn:
+
+        #{reason}
+
+    Use the instructions below to address the rejection. If the rejection
+    says the skill was not invoked, run `$code-review` before writing the
+    workpad section. If it says the Reviewed SHA was stale or the workpad
+    was not updated since last accepted review, re-examine the current HEAD
+    — do not just edit the SHA to match. If it says the Verdict line was
+    malformed, fix the line (do NOT re-run the skill; your findings from
+    the previous turn are in this session's history, assuming the session
+    is warm; cold-fallback sessions should re-run the skill).
+
+    """
+  end
+
+  defp code_review_retry_prefix(_), do: ""
+
+  # First (cold) dispatch of the review session B. Carry full context — the
+  # reviewer has no conversation history yet.
+  defp code_review_cold_prompt do
+    """
+    ## Code Review
+
+    Run the `$code-review` skill on this branch, then — when the diff touches
+    web UI — also run `$visual-review` on fresh screenshots. Record the
+    combined outcome in the workpad.
+
+    **Step 1: Code review (review-only — do NOT commit fixes)**
+    - `$code-review` executed per `.codex/skills/code-review/SKILL.md` (use the
+      skill's protocol; do NOT substitute `codex exec review`).
+    - Record EVERY MEDIUM-or-higher finding in the workpad section below.
+      Do NOT commit fixes from this unit — the implement thread runs them as
+      `review-fix-N` next dispatch, where `./scripts/verify-changed.sh` is a
+      mandatory gate. A reviewer-committed fix would bypass that gate and
+      ship unverified code behind a "clean" verdict.
+    - LOW findings may be skipped — note the choice in the workpad section.
+
+    **Step 2: Visual review (web UI only)**
+    - Detect UI changes on the branch range. Resolve the branch base first
+      and FAIL LOUDLY on missing ref — don't let `|| true` mask a missing
+      `origin/main` / non-`main` default branch, otherwise an empty `ui`
+      means "base lookup broke", not "no UI files", and visual review
+      silently skips on a real UI diff:
+      ```
+      base=$(git merge-base HEAD @{upstream} 2>/dev/null || \
+             git merge-base HEAD origin/HEAD 2>/dev/null || \
+             git merge-base HEAD origin/main 2>/dev/null)
+      if [ -z "$base" ]; then
+        echo "[visual] SKIPPED: could not resolve branch base (try: git fetch origin)"
+        # Write Verdict: findings — fail closed.
+      else
+        ui=$(git diff --name-only "$base"..HEAD | \
+          grep -E '^apps/web/(app|components)/.*\\.(tsx|jsx|css|scss)$|^apps/web/app/.*layout\\.tsx$|^apps/web/(theme|tokens|styles|design-system)/' || true)
+      fi
+      ```
+    - If `$ui` is empty AND base resolved → skip Step 2 (no UI files).
+    - Else: start `pnpm --dir apps/web dev &`, record `DEV_PID=$!`, `trap 'kill $DEV_PID 2>/dev/null' EXIT`
+      so cleanup can't be skipped. Poll `http://localhost:3100` up to 90s.
+      Timeout → log `[visual] SKIPPED: dev server did not start` and write
+      `Verdict: findings`. Otherwise capture routes inferred from
+      `apps/web/app/**/page.tsx` into `/tmp/visual-review-<sha>/` (desktop
+      1440x900 + mobile 390x844; reference patterns in
+      `apps/web/scripts/capture-board-redesign.mjs`), run `$visual-review` on
+      the PNGs. Do NOT use `lsof | kill -9 tcp:3100` — that kills whatever
+      happens to hold the port, not just your own dev server.
+
+    **Step 3: Write workpad**
+    Append a `### Code Review` section to the `## Codex Workpad` comment with:
+    - `Reviewed SHA:` the final HEAD you reviewed (after any fix commits)
+    - `Findings:` counts by severity, or `none`
+    - `Verdict:` `clean` when no MEDIUM+ remain; otherwise `findings`
+    - Tagged findings list, one per line:
+      - `[code] <severity> <file>:<line> <summary>`
+      - `[visual] <severity> <route> <summary>`
+    - If Step 2 was skipped because no UI files changed, note:
+      `[visual] N/A — no UI files in diff`
+    - If Step 2 was attempted but SKIPPED due to infra failure, the Verdict
+      MUST be `findings` (fail closed; the orchestrator will re-dispatch).
+
+    Do NOT do handoff. The orchestrator dispatches handoff only after the
+    `Verdict: clean` line appears.
+
+    NEVER force-push. NEVER silently skip the skill — missing workpad section
+    causes the orchestrator to re-dispatch you.
+    """
+  end
+
+  # Resumed dispatch of review session B. Neutral framing — works for
+  # happy-path re-review (implement just pushed fixes), for retry-after-
+  # stale-SHA (closeout flagged the prior section), and for retry-after-
+  # malformed-Verdict (agent fixes the reporting without re-running the
+  # skill — session history has the findings, assuming thread is warm).
+  #
+  # Caller guards ensure last_reviewed_sha is always a binary.
+  defp code_review_resumed_prompt(last_reviewed_sha) when is_binary(last_reviewed_sha) do
+    """
+    ## Code Review (resumed turn)
+
+    Examine the diff since the last accepted review:
+
+        git diff #{last_reviewed_sha}..HEAD
+
+    Your prior review context is in this thread's history. If the diff is
+    empty and no rejection reason above tells you otherwise, flag no new
+    findings and append a new round confirming the prior state. If the
+    retry prefix above says the skill was not invoked, run `$code-review`
+    on the full branch BEFORE writing findings.
+
+    **Done when**
+    - each prior MEDIUM+ finding is confirmed resolved or still flagged
+    - any new issues introduced by commits in the diff are flagged
+    - if the diff touches web UI surfaces (tsx/jsx/css/scss in
+      `apps/web/app|components`, `apps/web/app/*/layout.tsx`, or
+      `apps/web/{theme,tokens,styles,design-system}/**`), re-run the visual
+      review flow from your first turn: start dev server, capture fresh
+      screenshots, run `$visual-review`, merge findings
+    - a new round is appended to `### Code Review` in the workpad with updated
+      `Reviewed SHA:`, `Findings:`, and `Verdict:` lines (do not rewrite prior
+      rounds — append only), using the same `[code]` / `[visual]` tagging
+
+    Do NOT commit code fixes from this unit — fixes go through `review-fix-N`
+    on the implement thread, which has the `./scripts/verify-changed.sh` gate.
+    """
   end
 
   defp render_subtask_contract(%{touch: touch, accept: accept}) do
@@ -556,9 +884,7 @@ defmodule SymphonyElixir.PromptBuilder do
   # Defense-in-depth: plan authors can paste arbitrary text into continuation
   # lines, so neutralize literal wrapper tags before rendering the block.
   defp sanitize_contract_body(body) do
-    body
-    |> String.replace("</subtask_contract>", "</subtask_contract_filtered>")
-    |> String.replace("<subtask_contract>", "<subtask_contract_filtered>")
+    neutralize_wrapper_tag(body, "subtask_contract")
   end
 
   # "Do NOT expand scope" was removed here: for plan-N subtasks it was

@@ -3,22 +3,34 @@ defmodule SymphonyElixir.Closeout do
   Post-unit acceptance logic. Called by the orchestrator after a worker
   exits normally. Determines whether the unit is accepted or needs retry.
 
-  Closeout behavior per unit kind:
+  Closeout behavior per unit kind (warm-session review loop):
   - `bootstrap`: run baseline verify; mark bootstrapped either way so the
     dispatcher advances past bootstrap_rule. Baseline pass/fail is carried
     separately by `baseline_verify_failed` / `baseline_verify_output` fields
     in `issue_exec.json`; downstream units can consume that signal.
   - `plan`: check workpad has parseable checklist, bump plan_version
-  - `implement_subtask`: check subtask marked done, doc-impact check
-  - `doc_fix`: mandatory pre-verify documentation pass; accept clean no-op
-  - `verify`: run full verification, set last_verified_sha
-  - `handoff`: check last_verified_sha == HEAD
-  - `merge`: check PR actually merged on remote before marking done
+  - `implement_subtask` (plan-N / review-fix-N / rework-N): check subtask
+    marked done, HEAD advanced, workpad sync, doc-impact. Verification runs
+    inside the implement session (`./scripts/verify-changed.sh`) so no
+    separate verify dispatch is required in the normal flow.
+  - `code_review`: re-fetch workpad from Linear (post-turn, not the
+    pre-dispatch snapshot), parse latest `### Code Review` section, verify
+    `Reviewed SHA:` matches current HEAD (stale-section guard), atomically
+    set `review_verdict` + `last_reviewed_sha` + bump `review_round`.
+  - `doc_fix`: pre-handoff documentation sweep; accept clean no-op; sets
+    `doc_fix_applied = true` so `pre_handoff_doc_fix_rule` doesn't re-fire
+    after a post-doc_fix re-review flips last_accepted_unit.
+  - `verify`: only in the `:merging` flow now — full verification of the
+    merged tree, sets `verify_error` on failure so `verify_fix_rule` can
+    dispatch a repair subtask.
+  - `handoff`: check `review_verdict == "clean"` AND `last_reviewed_sha ==
+    HEAD` (the reviewed-HEAD invariant) AND `doc_fix_applied` true.
+  - `merge`: check PR actually merged on remote before marking done.
   """
 
   require Logger
 
-  alias SymphonyElixir.{Config, IssueExec, Ledger, Linear.Adapter, Verifier}
+  alias SymphonyElixir.{Config, IssueExec, Ledger, Linear.Adapter, Verifier, WorkpadParser}
 
   @type result :: :accepted | {:retry, String.t()} | {:fail, String.t()}
 
@@ -127,6 +139,11 @@ defmodule SymphonyElixir.Closeout do
     # unchanged → acceptable no-op).
     case commit_advancement_state(workspace, opts) do
       :advanced ->
+        # Mark doc_fix as run for THIS review cycle so pre_handoff_doc_fix_rule
+        # doesn't re-fire after the re-review that the doc commit triggers
+        # (re-review moves last_accepted_unit from "doc_fix" to "code_review",
+        # which would otherwise make a scraping-based gate think doc_fix never ran).
+        IssueExec.update(workspace, %{"doc_fix_applied" => true})
         :accepted
 
       :unchanged ->
@@ -138,6 +155,7 @@ defmodule SymphonyElixir.Closeout do
 
           false ->
             Logger.info("Closeout: doc_fix accepted as no-op (clean tree, no doc updates needed)")
+            IssueExec.update(workspace, %{"doc_fix_applied" => true})
             :accepted
         end
 
@@ -238,15 +256,98 @@ defmodule SymphonyElixir.Closeout do
     end
   end
 
+  # code_review closeout (warm-session loop gate). Accept only if the workpad
+  # now carries a `### Code Review` section with a parseable `Verdict:` line
+  # (the agent's structured output) AND we can snapshot HEAD. On accept:
+  #   - review_verdict is updated to "clean" | "findings"
+  #   - review_round is bumped (this dispatch counts as one round)
+  #   - last_reviewed_sha is pinned to current HEAD — dispatch resolver uses
+  #     this to detect "agent committed fixes; reviewer should re-look"
+  #
+  # Workpad is re-fetched from Linear rather than using opts[:workpad_text]
+  # because the snapshot was captured pre-dispatch, before the agent wrote the
+  # section. A Linear fetch failure fails closed (retry) so a network blip
+  # cannot silently unlock the handoff gate. See
+  # docs/design/warm-session-review-loop.md.
+  defp do_closeout("code_review", workspace, _unit, issue, opts) do
+    fetcher = Keyword.get(opts, :workpad_fetcher, &Adapter.fetch_workpad_text/1)
+    dispatch_head = Keyword.get(opts, :dispatch_head)
+    issue_id = issue_id(issue)
+
+    cond do
+      not is_binary(issue_id) ->
+        {:fail, "code_review: issue id missing"}
+
+      # Machine gate: the reviewer must NOT commit code — fixes belong to
+      # `review-fix-N` on the implement thread (where `verify-changed.sh`
+      # gates every commit). If HEAD advanced during the review turn the
+      # reviewer wrote code that never went through verification. Reject
+      # with a concrete message so the ledger shows why.
+      reviewer_committed?(workspace, dispatch_head) ->
+        Logger.warning("Closeout: code_review reviewer committed during the turn — rejecting, fixes must go through review-fix-N")
+
+        {:fail,
+         "code_review: reviewer committed code during the review turn (HEAD advanced) — review units are review-only; record findings instead and let the implement thread fix via review-fix-N"}
+
+      true ->
+        case fetcher.(issue_id) do
+          {:ok, fresh_workpad} ->
+            case WorkpadParser.code_review_verdict(fresh_workpad) do
+              verdict when verdict in ["clean", "findings"] ->
+                # Verify the workpad section claims to have reviewed the CURRENT
+                # HEAD. Without this, a stale section left over from a prior
+                # round (round 1 said "findings" against SHA A; implement committed
+                # B; review turn did nothing) would bless B as reviewed. That
+                # breaks the "handoff only on reviewed HEAD" invariant.
+                accept_review_if_fresh(workspace, verdict, fresh_workpad)
+
+              :missing ->
+                Logger.warning("Closeout: code_review produced no `### Code Review` workpad section — agent likely skipped the skill")
+
+                {:retry, "code_review: workpad has no `### Code Review` section (skill not invoked or findings not recorded)"}
+
+              :invalid ->
+                Logger.warning("Closeout: code_review section present but Verdict: line is missing or unrecognized")
+
+                {:retry, "code_review: `### Code Review` section has no parseable `Verdict:` line (expected `Verdict: clean` or `Verdict: findings`)"}
+            end
+
+          {:error, reason} ->
+            Logger.warning("Closeout: code_review workpad fetch failed: #{inspect(reason)}")
+
+            {:retry, "code_review: workpad fetch failed (#{inspect(reason)})"}
+        end
+    end
+  end
+
   defp do_closeout("handoff", workspace, _unit, _issue, _opts) do
     case IssueExec.read(workspace) do
       {:ok, exec} ->
         head = Verifier.current_head(workspace)
+        verdict = exec["review_verdict"]
+        reviewed_sha = exec["last_reviewed_sha"]
+        doc_fix_applied = exec["doc_fix_applied"] == true
 
-        if exec["last_verified_sha"] == head and head != nil do
-          :accepted
-        else
-          {:fail, "Handoff rejected: last_verified_sha (#{exec["last_verified_sha"]}) != HEAD (#{head})"}
+        cond do
+          is_nil(head) ->
+            {:fail, "Handoff rejected: cannot read current HEAD"}
+
+          verdict != "clean" ->
+            {:fail, "Handoff rejected: review_verdict is #{inspect(verdict)} (expected \"clean\")"}
+
+          reviewed_sha != head ->
+            {:fail, "Handoff rejected: last_reviewed_sha (#{reviewed_sha}) != HEAD (#{head}) — new commits since last review"}
+
+          # Symmetry with `handoff_rule` in DispatchResolver: both gates must
+          # check the same invariant. Without this, a crash-replay or a stale
+          # `current_unit=handoff` could skip the pre-handoff doc sweep even
+          # when resolver already short-circuited doc_fix on `doc_fix_applied`
+          # from a PRIOR cycle (pre-rework state leak).
+          not doc_fix_applied ->
+            {:fail, "Handoff rejected: doc_fix_applied is false — pre-handoff doc sweep has not run in this cycle"}
+
+          true ->
+            :accepted
         end
 
       {:error, reason} ->
@@ -283,6 +384,101 @@ defmodule SymphonyElixir.Closeout do
   defp do_closeout(kind, _workspace, _unit, _issue, _opts) do
     Logger.warning("Closeout: unknown unit kind #{kind}")
     {:fail, "unknown unit kind: #{kind}"}
+  end
+
+  # --- code_review closeout helpers (moved here so the do_closeout/5 clauses
+  # above stay contiguous; Elixir warns on interrupted same-name/arity
+  # defps) ---
+
+  # True when HEAD advanced between dispatch and closeout — a reviewer that
+  # committed code during the turn. Returns false when dispatch_head is nil
+  # (upgrade path / tests that don't pass it): we err on letting the turn
+  # through rather than breaking legacy code, and accept_review_if_fresh
+  # is the backup SHA-match gate.
+  defp reviewer_committed?(workspace, dispatch_head) when is_binary(dispatch_head) do
+    case Verifier.current_head(workspace) do
+      head when is_binary(head) -> head != dispatch_head
+      _ -> false
+    end
+  end
+
+  defp reviewer_committed?(_workspace, _dispatch_head), do: false
+
+  # Cross-check the workpad's `Reviewed SHA:` against current git HEAD and the
+  # prior `exec.last_reviewed_sha`. The review MUST name the HEAD it reviewed,
+  # and that HEAD must match what's actually checked out — otherwise the
+  # section is stale and closeout would silently mark unreviewed code as "ok".
+  defp accept_review_if_fresh(workspace, verdict, workpad) do
+    current_head = Verifier.current_head(workspace)
+    claimed_sha = WorkpadParser.code_review_reviewed_sha(workpad)
+    {:ok, exec} = IssueExec.read(workspace)
+
+    cond do
+      not is_binary(current_head) ->
+        Logger.warning("Closeout: code_review cannot read HEAD to pin last_reviewed_sha")
+        {:retry, "code_review: cannot verify HEAD state"}
+
+      claimed_sha == :invalid or claimed_sha == :missing ->
+        {:retry, "code_review: `### Code Review` section missing `Reviewed SHA:` line (can't verify the review actually ran on current HEAD)"}
+
+      not heads_match?(claimed_sha, current_head) ->
+        Logger.warning("Closeout: code_review section claims SHA #{inspect(claimed_sha)} but HEAD is #{inspect(current_head)} — likely a stale section")
+        {:retry, "code_review: `Reviewed SHA: #{claimed_sha}` does not match current HEAD #{String.slice(current_head, 0, 12)} (stale section or agent reviewed the wrong HEAD)"}
+
+      exec["last_reviewed_sha"] == current_head and exec["review_verdict"] == verdict ->
+        # Nothing advanced — no HEAD change and the verdict matches what was
+        # already accepted. This would re-bump `review_round` for no reason
+        # and can livelock the review loop.
+        {:retry, "code_review: workpad not updated since last accepted review (same HEAD, same verdict)"}
+
+      exec["last_reviewed_sha"] == current_head and
+        exec["review_verdict"] == "findings" and verdict == "clean" ->
+        # Hard invariant: once a HEAD was accepted as `findings`, it CANNOT
+        # later be blessed as `clean` at the same HEAD without at least one
+        # commit in between. This prevents the "agent runs an empty-diff
+        # review, concludes all-clean, flips the verdict" bypass — the
+        # findings-to-clean flip must be paid for with actual fix commits.
+        Logger.warning("Closeout: code_review attempted findings→clean flip at unchanged HEAD — rejecting to preserve reviewed-HEAD invariant")
+
+        {:fail, "code_review: cannot flip verdict from findings to clean at the same HEAD (#{String.slice(current_head, 0, 12)}) — fix findings on review-fix-N first so HEAD advances"}
+
+      true ->
+        commit_review_result(workspace, verdict, current_head)
+    end
+  end
+
+  # Accept full SHA or any common abbreviation (>= 7 chars) by prefix match.
+  defp heads_match?(claimed, current) do
+    claimed = String.downcase(String.trim(claimed))
+    current = String.downcase(current)
+    byte_size(claimed) >= 7 and String.starts_with?(current, claimed)
+  end
+
+  # Single atomic write so a mid-sequence failure can't leave verdict=findings
+  # with last_reviewed_sha=nil (which would disable the HEAD-advance guard in
+  # review_findings_implement_rule and livelock the review loop).
+  defp commit_review_result(workspace, verdict, sha) when is_binary(sha) do
+    {:ok, exec} = IssueExec.read(workspace)
+    next_round = (exec["review_round"] || 0) + 1
+
+    case IssueExec.update(workspace, %{
+           "review_verdict" => verdict,
+           "last_reviewed_sha" => sha,
+           "review_round" => next_round
+         }) do
+      :ok ->
+        Ledger.append(workspace, :code_review_accepted, %{
+          "verdict" => verdict,
+          "sha" => sha,
+          "round" => next_round
+        })
+
+        :accepted
+
+      {:error, reason} ->
+        Logger.warning("Closeout: code_review exec write failed: #{inspect(reason)}")
+        {:retry, "code_review: exec write failed (#{inspect(reason)})"}
+    end
   end
 
   # --- Helpers ---
@@ -477,6 +673,12 @@ defmodule SymphonyElixir.Closeout do
       not (is_binary(subtask_id) and is_binary(issue_id(issue))) ->
         :ok
 
+      synthetic_subtask_no_workpad_checkbox?(subtask_id) ->
+        # Synthetic subtasks the workpad never has a checkbox for. Skip the
+        # Linear API call entirely — every previous `mark_subtask_done` on
+        # these produced a failure log + wasted round-trip per dispatch.
+        :ok
+
       not regular_plan_subtask?(subtask_id) ->
         # Best-effort for non-plan subtasks: log warning, do not fail closeout.
         case Adapter.mark_subtask_done(issue_id(issue), subtask_id) do
@@ -524,6 +726,19 @@ defmodule SymphonyElixir.Closeout do
   end
 
   defp regular_plan_subtask?(_), do: false
+
+  # Subtasks the workpad never emits a checkbox for — skip the Linear
+  # mark_subtask_done call entirely to avoid guaranteed-404 round-trips +
+  # noise logs. `rework-*` / `verify-fix-*` / `merge-sync-*` / `review-fix-*`
+  # are all planner-never-emits kinds.
+  defp synthetic_subtask_no_workpad_checkbox?(subtask_id) when is_binary(subtask_id) do
+    String.starts_with?(subtask_id, "rework-") or
+      String.starts_with?(subtask_id, "verify-fix-") or
+      String.starts_with?(subtask_id, "merge-sync-") or
+      String.starts_with?(subtask_id, "review-fix-")
+  end
+
+  defp synthetic_subtask_no_workpad_checkbox?(_), do: false
 
   defp post_accept_implement_subtask(workspace, subtask_id) do
     # 1a. Clear any pending workpad mark sentinel — by reaching post-accept the

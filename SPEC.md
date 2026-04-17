@@ -608,13 +608,18 @@ claim state.
 Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
-- One worker invocation runs **one unit** in **one fresh coding-agent session**:
-  the orchestrator decides which unit (bootstrap, plan, implement_subtask,
-  doc_fix, verify, handoff, merge, …) via `DispatchResolver`, builds the
-  per-unit prompt, runs it, and exits when the agent exits.
+- One worker invocation runs **one unit**. Under the warm-session review loop,
+  the orchestrator keeps two persistent Codex threads (one for implementing,
+  one for reviewing) that survive across dispatches; `AppServer.resume_session/3`
+  resumes them on each round. Dispatched unit kinds are: bootstrap, plan,
+  implement_subtask (plan-N / rework-N / review-fix-N), code_review, doc_fix,
+  handoff, merge. `verify` is kept only for the post-merge sub-path (with
+  `verify-fix-*` as its repair subtask); the normal flow folds verification
+  into the warm implement session via `./scripts/verify-changed.sh`.
 - After each normal worker exit, the orchestrator re-checks the tracker issue
-  state and, if still active, dispatches the next unit (which may be another
-  `implement_subtask`, the mandatory pre-verify `doc_fix`, `verify`, etc.).
+  state and, if still active, dispatches the next unit (e.g., another
+  `implement_subtask`, `code_review` on plan completion or after a HEAD
+  advance, the pre-handoff `doc_fix` after a clean verdict, then `handoff`).
 - Crash recovery: if a worker exits abnormally with `current_unit` still set in
   `issue_exec.json`, the orchestrator replays the same unit. Repeated replays
   are bounded by `agent.max_unit_attempts` (the per-unit circuit breaker);

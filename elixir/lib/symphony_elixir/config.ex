@@ -35,6 +35,12 @@ defmodule SymphonyElixir.Config do
   @default_max_unit_attempts 3
   @default_max_verify_attempts 3
   @default_max_verify_fix_cycles 2
+  # Warm-session review loop: how many implement↔review cycles before
+  # bailing to Human Input Needed. Each round is a full code_review
+  # dispatch (~30-90s) + an implement fix dispatch (~minutes). 5 rounds
+  # covers realistic "reviewer flagged things, agent fixed them, reviewer
+  # found new things in the fix" cases without burning tokens forever.
+  @default_max_review_rounds 5
   @default_codex_command "codex app-server"
   @default_codex_turn_timeout_ms 3_600_000
   @default_codex_read_timeout_ms 5_000
@@ -104,6 +110,20 @@ defmodule SymphonyElixir.Config do
                                  max_unit_attempts: [
                                    type: :pos_integer,
                                    default: @default_max_unit_attempts
+                                 ]
+                               ]
+                             ],
+                             review: [
+                               type: :map,
+                               default: %{},
+                               keys: [
+                                 # Max findings-fix cycles in the warm-session
+                                 # review loop. When review_round strictly
+                                 # exceeds this, `review_exhausted_rule`
+                                 # escalates to Human Input Needed.
+                                 max_review_rounds: [
+                                   type: :pos_integer,
+                                   default: @default_max_review_rounds
                                  ]
                                ]
                              ],
@@ -312,6 +332,12 @@ defmodule SymphonyElixir.Config do
   def max_verify_fix_cycles do
     get_in(validated_workflow_options(), [:verification, :max_verify_fix_cycles]) ||
       @default_max_verify_fix_cycles
+  end
+
+  @spec max_review_rounds() :: pos_integer()
+  def max_review_rounds do
+    get_in(validated_workflow_options(), [:review, :max_review_rounds]) ||
+      @default_max_review_rounds
   end
 
   @spec max_concurrent_agents() :: pos_integer()

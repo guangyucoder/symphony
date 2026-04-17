@@ -155,6 +155,14 @@ defmodule SymphonyElixir.CloseoutTest do
       {dispatch_head, _} = init_git_and_advance!(ws)
 
       assert :accepted = Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
+
+      # doc_fix_applied flag must be set so pre_handoff_doc_fix_rule doesn't
+      # re-fire after the post-doc_fix re-review shifts last_accepted_unit
+      # back to "code_review". Deleting the `IssueExec.update(doc_fix_applied)`
+      # write inside closeout would pass all integration tests that manually
+      # set the flag — this is the only direct gate.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["doc_fix_applied"] == true
     end
 
     test "retries when HEAD unchanged AND tree is dirty — doc_fix forgot to commit", %{workspace: ws} do
@@ -168,20 +176,29 @@ defmodule SymphonyElixir.CloseoutTest do
                Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
 
       assert reason =~ "doc_fix: produced no commit but tree is dirty"
+
+      # Retry path must NOT mark doc_fix_applied — that would let
+      # pre_handoff_doc_fix_rule mis-bypass a subsequent real doc_fix.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["doc_fix_applied"] == false
     end
 
     test "accepts no-op doc_fix (HEAD unchanged, tree clean — docs already up to date)", %{workspace: ws} do
-      # Regression guard: pre_verify_doc_check_rule dispatches doc_fix
-      # unconditionally before verify. If docs are already up to date, the
-      # agent legitimately produces no commit. A strict HEAD-advance guard
-      # would loop until circuit breaker — same failure mode as the bootstrap
-      # soft-accept bug. Accept the no-op only when tree is clean; dirty tree
-      # still triggers retry (see test above).
+      # Regression guard: pre_handoff_doc_fix_rule dispatches doc_fix.
+      # If docs are already up to date, the agent legitimately produces no
+      # commit. A strict HEAD-advance guard would loop until circuit breaker —
+      # same failure mode as the bootstrap soft-accept bug. Accept the no-op
+      # only when tree is clean; dirty tree still triggers retry (see test above).
       dispatch_head = init_git_only!(ws)
 
       # No dirty edits. Working tree is clean after the seed commit.
       assert :accepted =
                Closeout.run(ws, %{"kind" => "doc_fix"}, @issue, dispatch_head: dispatch_head)
+
+      # Even the no-op accept must set doc_fix_applied — the cycle needs the
+      # signal that "we checked docs, no changes needed" so handoff can fire.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["doc_fix_applied"] == true
     end
   end
 
@@ -507,18 +524,335 @@ defmodule SymphonyElixir.CloseoutTest do
     end
   end
 
-  describe "handoff closeout" do
-    test "accepts when verified sha matches HEAD", %{workspace: ws} do
-      # Simulate verified state — we can't run real git here, so test the rejection path
-      IssueExec.set_verified_sha(ws, "abc123")
-      # HEAD will be nil (no git repo in temp dir) -> fail
-      assert {:fail, _reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
+  describe "code_review closeout — warm-session loop" do
+    # The closeout reads the workpad's `### Code Review` section, extracts
+    # the Verdict: line, and updates exec state to drive the dispatcher's
+    # next decision (loop back to implement on findings; doc_fix → handoff
+    # on clean). Missing / malformed section → retry, never silent accept.
+
+    @workpad_without_section """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] Done
+    """
+
+    @workpad_section_no_verdict """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] Done
+
+    ### Code Review
+    - Reviewed the diff. Looks fine.
+    """
+
+    @workpad_verdict_clean """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] Done
+
+    ### Code Review
+    - Reviewed SHA: abc123
+    - Findings: none
+    - Verdict: clean
+    """
+
+    @workpad_verdict_findings """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] Done
+
+    ### Code Review
+    - Reviewed SHA: abc123
+    - Findings: 2 HIGH (see below)
+    - Verdict: findings
+    """
+
+    test "retries when the workpad has no Code Review section", %{workspace: ws} do
+      _ = init_git_only!(ws)
+      fetcher = fn _issue_id -> {:ok, @workpad_without_section} end
+
+      result =
+        Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+          workpad_fetcher: fetcher
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "no `### Code Review`"
+
+      {:ok, exec} = IssueExec.read(ws)
+      # Gate stays shut: no verdict, no round bump, no reviewed sha.
+      assert is_nil(exec["review_verdict"])
+      assert exec["review_round"] == 0
+      assert is_nil(exec["last_reviewed_sha"])
     end
 
-    test "rejects when verified sha doesn't match HEAD", %{workspace: ws} do
-      IssueExec.set_verified_sha(ws, "old_sha")
+    test "retries when the section exists but the Verdict: line is missing", %{workspace: ws} do
+      _ = init_git_only!(ws)
+      fetcher = fn _issue_id -> {:ok, @workpad_section_no_verdict} end
+
+      result =
+        Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+          workpad_fetcher: fetcher
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "no parseable `Verdict:` line"
+    end
+
+    test "accepts `Verdict: clean` — sets review_verdict, bumps round, pins sha", %{workspace: ws} do
+      new_head = init_git_only!(ws)
+      # Workpad must claim the current HEAD — closeout rejects a stale
+      # section that names a different SHA (Iter3 fix: stale-review bypass).
+      workpad = workpad_with_verdict(new_head, "clean")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert :accepted =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher
+               )
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["review_verdict"] == "clean"
+      assert exec["review_round"] == 1
+      assert exec["last_reviewed_sha"] == new_head
+      assert ledger_events(ws) |> Enum.member?("code_review_accepted")
+    end
+
+    test "accepts `Verdict: findings` — sets verdict to findings, same round-bump semantics", %{workspace: ws} do
+      new_head = init_git_only!(ws)
+      workpad = workpad_with_verdict(new_head, "findings")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert :accepted =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher
+               )
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["review_verdict"] == "findings"
+      assert exec["review_round"] == 1
+      assert exec["last_reviewed_sha"] == new_head
+    end
+
+    test "retries with 'not updated' reason when HEAD + verdict unchanged since last accept (anti-livelock)", %{workspace: ws} do
+      # Iter5 Lens2 HIGH: the `accept_review_if_fresh` same-HEAD/same-verdict
+      # guard was unreachable from tests. This pins the anti-livelock: a review
+      # session that didn't actually move anything (no new commits, verdict
+      # repeats) must NOT re-bump review_round — otherwise the review loop
+      # burns tokens in a no-op cycle until max_review_rounds escalates.
+      new_head = init_git_only!(ws)
+      IssueExec.update(ws, %{
+        "review_verdict" => "findings",
+        "last_reviewed_sha" => new_head,
+        "review_round" => 2
+      })
+
+      workpad = workpad_with_verdict(new_head, "findings")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert {:retry, reason} =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher
+               )
+
+      assert reason =~ "not updated"
+
+      # No spurious round bump. Deleting the same-HEAD/same-verdict guard in
+      # closeout would let round advance to 3 here; this assertion catches it.
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["review_round"] == 2
+    end
+
+    test "rejects when reviewer committed during the turn (dispatch_head != current HEAD)", %{workspace: ws} do
+      # Iter8 Codex HIGH: code_review is review-only. A reviewer that commits
+      # fixes during the turn bypasses the `./scripts/verify-changed.sh` gate
+      # on `review-fix-N`. Closeout's reviewer_committed? guard rejects that.
+      # Without dispatch_head getting snapshotted for code_review units, this
+      # guard is dead — test pins the `dispatch_head` wiring end-to-end.
+      dispatch_sha = init_git_only!(ws)
+
+      # Simulate reviewer committing code mid-turn: advance HEAD after dispatch.
+      File.write!(Path.join(ws, "reviewer_fix.txt"), "reviewer patched this\n")
+      System.cmd("git", ["add", "."], cd: ws)
+      System.cmd("git", ["commit", "-q", "-m", "reviewer fix"], cd: ws)
+
+      {new_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: ws)
+      new_head = String.trim(new_head)
+      workpad = workpad_with_verdict(new_head, "clean")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert {:fail, reason} =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher,
+                 dispatch_head: dispatch_sha
+               )
+
+      assert reason =~ "reviewer committed"
+
+      # Verdict must NOT be persisted.
+      {:ok, exec} = IssueExec.read(ws)
+      assert is_nil(exec["review_verdict"])
+    end
+
+    test "rejects findings→clean flip at same HEAD (no commit between verdicts)", %{workspace: ws} do
+      # Iter8 Lens1 HIGH: once findings accepted at HEAD X, cannot flip to
+      # clean at the same HEAD without an intervening commit. Protects
+      # against the agent running an empty-diff review and concluding
+      # "nothing to flag, verdict: clean".
+      head = init_git_only!(ws)
+      IssueExec.update(ws, %{
+        "review_verdict" => "findings",
+        "last_reviewed_sha" => head,
+        "review_round" => 1
+      })
+
+      # Agent now writes a clean verdict for the same HEAD.
+      workpad = workpad_with_verdict(head, "clean")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert {:fail, reason} =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher,
+                 dispatch_head: head
+               )
+
+      assert reason =~ "cannot flip verdict from findings to clean"
+
+      {:ok, exec} = IssueExec.read(ws)
+      # Prior findings verdict must survive.
+      assert exec["review_verdict"] == "findings"
+    end
+
+    test "retries when workpad Reviewed SHA does not match current HEAD (stale section)", %{workspace: ws} do
+      # Iter3 Codex HIGH: a workpad section left over from a prior round
+      # (with an older Reviewed SHA) must NOT bless the new HEAD.
+      new_head = init_git_only!(ws)
+      stale_workpad = workpad_with_verdict("aaaaaaabbbbbbbccccccc", "clean")
+      fetcher = fn _issue_id -> {:ok, stale_workpad} end
+
+      assert {:retry, reason} =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher
+               )
+
+      assert reason =~ "does not match current HEAD"
+
+      {:ok, exec} = IssueExec.read(ws)
+      # Gate must stay shut — no verdict persisted despite parseable section.
+      assert is_nil(exec["review_verdict"])
+      assert exec["last_reviewed_sha"] != new_head
+    end
+
+    test "bumps review_round on each accepted review (multi-round regression guard)", %{workspace: ws} do
+      new_head = init_git_only!(ws)
+      IssueExec.update(ws, %{"review_round" => 2})
+      workpad = workpad_with_verdict(new_head, "findings")
+      fetcher = fn _issue_id -> {:ok, workpad} end
+
+      assert :accepted =
+               Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+                 workpad_fetcher: fetcher
+               )
+
+      {:ok, exec} = IssueExec.read(ws)
+      assert exec["review_round"] == 3
+      assert exec["last_reviewed_sha"] == new_head
+    end
+
+    test "retries when the workpad fetch fails (network blip must not unlock the gate)", %{workspace: ws} do
+      _ = init_git_only!(ws)
+      # Pre-seed non-default round and verdict so an accidental spurious bump
+      # inside the fetch-error branch is detectable. Without this, a regression
+      # that called commit_review_result before the verdict-parse step would
+      # land round=1 and verdict=nil (both the defaults for init) — test would
+      # still pass.
+      :ok = IssueExec.update(ws, %{"review_round" => 2, "review_verdict" => "findings", "last_reviewed_sha" => "preseed-sha"})
+
+      fetcher = fn _issue_id -> {:error, :network_timeout} end
+
+      result =
+        Closeout.run(ws, %{"kind" => "code_review"}, Map.put(@issue, :id, "issue-42"),
+          workpad_fetcher: fetcher
+        )
+
+      assert {:retry, reason} = result
+      assert reason =~ "workpad fetch failed"
+
+      {:ok, exec} = IssueExec.read(ws)
+      # Nothing the fetch-error branch touches should have changed.
+      assert exec["review_verdict"] == "findings", "verdict must NOT be mutated on fetch failure"
+      assert exec["review_round"] == 2, "review_round must NOT bump on fetch failure"
+      assert exec["last_reviewed_sha"] == "preseed-sha"
+    end
+
+    test "fails when the issue has no id", %{workspace: ws} do
+      assert {:fail, reason} =
+               Closeout.run(ws, %{"kind" => "code_review"}, @issue,
+                 workpad_fetcher: fn _ -> {:ok, @workpad_verdict_clean} end
+               )
+
+      assert reason =~ "issue id missing"
+    end
+  end
+
+  describe "handoff closeout — warm-session gate" do
+    # Handoff accepts only when (a) a reviewer accepted the current HEAD with
+    # Verdict: clean, and (b) HEAD hasn't advanced since. Any drift means the
+    # reviewer's "clean" no longer refers to what would be pushed.
+
+    test "rejects when review_verdict is not clean (e.g. findings lingering from unfinished loop)", %{workspace: ws} do
+      head = init_git_only!(ws)
+      IssueExec.update(ws, %{"review_verdict" => "findings", "last_reviewed_sha" => head})
+
       assert {:fail, reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
-      assert reason =~ "last_verified_sha"
+      assert reason =~ "review_verdict"
+    end
+
+    test "rejects when last_reviewed_sha doesn't match HEAD (new commits since review)", %{workspace: ws} do
+      _ = init_git_only!(ws)
+      IssueExec.update(ws, %{"review_verdict" => "clean", "last_reviewed_sha" => "stale-sha"})
+
+      assert {:fail, reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
+      assert reason =~ "last_reviewed_sha"
+      assert reason =~ "new commits since last review"
+    end
+
+    test "rejects when doc_fix_applied is false (symmetry with handoff_rule gate)", %{workspace: ws} do
+      # Iter5 Codex HIGH: the Closeout moduledoc promises the handoff gate
+      # checks `doc_fix_applied`, same as the resolver's handoff_rule. If
+      # this check isn't here, a crash-replay or a stale `current_unit=handoff`
+      # could bypass the pre-handoff doc sweep. Test pins the invariant AND
+      # catches regressions where the gate is silently removed.
+      head = init_git_only!(ws)
+      IssueExec.update(ws, %{"review_verdict" => "clean", "last_reviewed_sha" => head})
+      # doc_fix_applied is the default false — handoff must refuse.
+
+      assert {:fail, reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
+      assert reason =~ "doc_fix_applied"
+    end
+
+    test "accepts when verdict=clean, sha matches HEAD, AND doc_fix_applied=true", %{workspace: ws} do
+      head = init_git_only!(ws)
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => head,
+        "doc_fix_applied" => true
+      })
+
+      assert :accepted = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
+    end
+
+    test "rejects when HEAD is unreadable (empty workspace, no git repo)", %{workspace: ws} do
+      # No init_git_only! — Verifier.current_head returns nil. Even if verdict
+      # were clean, we can't confirm last_reviewed_sha matches HEAD, so fail.
+      IssueExec.update(ws, %{"review_verdict" => "clean", "last_reviewed_sha" => "some-sha"})
+
+      assert {:fail, reason} = Closeout.run(ws, %{"kind" => "handoff"}, @issue)
+      assert reason =~ "cannot read current HEAD"
     end
   end
 
@@ -568,6 +902,24 @@ defmodule SymphonyElixir.CloseoutTest do
   defp ledger_events(workspace) do
     {:ok, entries} = Ledger.read(workspace)
     Enum.map(entries, & &1["event"])
+  end
+
+  # Build a workpad with a `### Code Review` section whose Reviewed SHA
+  # matches the provided sha. Closeout's stale-section guard rejects reviews
+  # whose Reviewed SHA doesn't match current HEAD, so tests must construct
+  # fixtures with the runtime-generated HEAD.
+  defp workpad_with_verdict(sha, verdict) when is_binary(sha) and verdict in ["clean", "findings"] do
+    """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] Done
+
+    ### Code Review
+    - Reviewed SHA: #{sha}
+    - Findings: #{if verdict == "clean", do: "none", else: "2 HIGH"}
+    - Verdict: #{verdict}
+    """
   end
 
   # Init a git repo with one initial commit. Returns the initial HEAD sha

@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Unit do
           | :implement_subtask
           | :doc_fix
           | :verify
+          | :code_review
           | :handoff
           | :merge
 
@@ -49,6 +50,7 @@ defmodule SymphonyElixir.Unit do
 
   def doc_fix, do: %__MODULE__{kind: :doc_fix, display_name: "doc_fix", reasoning_effort: "medium"}
   def verify, do: %__MODULE__{kind: :verify, display_name: "verify", reasoning_effort: "medium"}
+  def code_review, do: %__MODULE__{kind: :code_review, display_name: "code_review", reasoning_effort: "high"}
   def handoff, do: %__MODULE__{kind: :handoff, display_name: "handoff", reasoning_effort: "low"}
   def merge, do: %__MODULE__{kind: :merge, display_name: "merge", reasoning_effort: "low"}
 

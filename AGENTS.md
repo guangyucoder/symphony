@@ -4,9 +4,12 @@
 
 Symphony — an Elixir/OTP service that orchestrates coding agents to execute Linear
 issues autonomously. Polls Linear, dispatches agents to isolated workspaces, handles
-retry / reconciliation. This fork runs **unit-lite mode**: instead of one long Codex
-session per issue, the orchestrator dispatches one small unit at a time (bootstrap,
-plan, implement_subtask, verify, handoff, etc.), each in a fresh session.
+retry / reconciliation. This fork runs **unit-lite mode** with a **warm-session
+review loop**: the orchestrator dispatches one small unit at a time (bootstrap,
+plan, implement_subtask, code_review, doc_fix, handoff, …). Two persistent Codex
+threads survive across dispatches — one for implementing, one for reviewing —
+resumed via `AppServer.resume_session/2` on each round. `verify` is still a unit
+but only in the merge flow; normal-flow tests run inside the implement session.
 
 ## Quick Start
 
@@ -80,10 +83,10 @@ Rules:
 | `elixir/` | Elixir implementation |
 | `docs/design/` | Design docs (v3, v4, lite execution plan; v3/v4 describe rejected legacy directions) |
 
-## Unit-Lite Dispatch Rules
+## Unit-Lite Dispatch Rules (warm-session review loop)
 
 ```
-if Merging                                    → merge
+if Merging                                    → merge (with verify-fix sub-path on verify failure)
 if current_unit                               → replay (crash recovery, circuit breaker at max_unit_attempts)
 if done                                       → stop
 if Rework + workpad complete                  → rework_fix (skip re-plan)
@@ -91,9 +94,11 @@ if Rework + stale                             → plan (reset)
 if !bootstrapped                              → bootstrap
 if !checklist                                 → plan
 if pending subtask                            → implement_subtask(next)
-if all done + last_accepted_unit ∉ {doc_fix, verify, handoff} and last subtask_id is not "verify-fix-*" → doc_fix (mandatory pre-verify pass; clean no-op accepted)
-if unverified                                 → verify
-else                                          → handoff
+if review_round > max_review_rounds + verdict=findings  → {:stop, :review_exhausted} (Human Input Needed)
+if verdict=findings + HEAD==last_reviewed_sha → implement_subtask(review-fix-N) (resume implement thread)
+if all done + (no verdict OR HEAD advanced)   → code_review (first round or re-review; bundles $code-review + $visual-review on web UI)
+if verdict=clean + !doc_fix_applied           → doc_fix (pre-handoff sweep; re-opens review if it commits)
+if verdict=clean + doc_fix_applied + HEAD==last_reviewed_sha → handoff
 ```
 
 ## Unit-Lite Invariants
@@ -101,12 +106,15 @@ else                                          → handoff
 1. **One unit per session.** Agent cannot self-decide "now I'll also do handoff."
 2. **One subtask per implement session.** No scope creep.
 3. **HEAD must advance for mutation-bearing units.** Closeout requires a commit since dispatch for `implement_subtask` (regular plan-N + synthetic kinds) and `doc_fix` (with the no-op-on-clean-tree exception). Uncommitted WIP gets retried so the next dispatch's reset doesn't silently destroy it.
-4. **`last_verified_sha == HEAD` required for handoff.** Code changes invalidate verification.
-5. **Crash recovery replays current unit.** Circuit breaker at `agent.max_unit_attempts` (default 3) → escalate to Human Input Needed.
-6. **doc_fix runs once before verify, not per subtask.** No external heuristic — the prompt asks the agent to read AGENTS.md and update anything stale; clean tree on closeout is accepted as a no-op.
-7. **Orchestrator owns verification.** Agent prompt doesn't include validation commands.
-8. **Rework skips re-plan when workpad is complete.** `rework_fix_applied` flag prevents re-dispatch loops.
-9. **Workpad sync is fatal for regular plan-N.** If `Adapter.mark_subtask_done` fails after a plan-N commit, closeout returns `{:retry, _}` and persists `pending_workpad_mark` as `%{subtask_id, committed_sha}` (the post-commit HEAD) so the next entry can recover the mark without requiring HEAD to advance again. Recovery requires current HEAD to still equal `committed_sha`: if HEAD has moved past it (e.g., a replan re-emitted plan-N with new content), the stale sentinel is cleared and the normal HEAD-advance check decides; if HEAD is unreadable, recovery is deferred (sentinel preserved). Synthetic kinds (`rework-*`, `verify-fix-*`, `merge-sync-*`) are warn-only since their dispatch is not derived from the workpad checkbox.
+4. **`last_reviewed_sha == HEAD` required for handoff.** Any commit after the last review (e.g., a doc_fix that really updated docs) invalidates the verdict and re-fires `code_review`.
+5. **Verification lives inside the warm implement session.** `./scripts/verify-changed.sh` runs as part of each subtask's turn; the orchestrator no longer dispatches a separate `verify` unit in the normal flow (merge path still uses one).
+6. **Crash recovery replays current unit.** Circuit breaker at `agent.max_unit_attempts` (default 3) → escalate to Human Input Needed.
+7. **Review rounds are capped.** `review_round > max_review_rounds` with a findings verdict escalates to Human Input Needed instead of burning tokens forever.
+8. **doc_fix runs once per review cycle.** `doc_fix_applied` flag (set by closeout, cleared on rework/escalation) prevents re-firing after a post-doc_fix re-review flips `last_accepted_unit` back to `code_review`.
+9. **Orchestrator owns verdict parsing.** Agent must append `Verdict: clean` or `Verdict: findings` to the workpad's `### Code Review` section; closeout re-fetches from Linear (post-turn, not pre-dispatch snapshot) and fails closed on missing/invalid/fetch-error.
+10. **Rework skips re-plan when workpad is complete.** `rework_fix_applied` flag prevents re-dispatch loops.
+11. **Rework entry clears warm-session state.** `plan_rework_entry_cleanup/1` calls `IssueExec.rework_reset_updates/0`; the same field set is used by `reset_for_rework/1` and `escalate_to_human/3` so no call site drifts.
+12. **Workpad sync is fatal for regular plan-N.** If `Adapter.mark_subtask_done` fails after a plan-N commit, closeout returns `{:retry, _}` and persists `pending_workpad_mark` as `%{subtask_id, committed_sha}` (the post-commit HEAD) so the next entry can recover the mark without requiring HEAD to advance again. Recovery requires current HEAD to still equal `committed_sha`: if HEAD has moved past it (e.g., a replan re-emitted plan-N with new content), the stale sentinel is cleared and the normal HEAD-advance check decides; if HEAD is unreadable, recovery is deferred (sentinel preserved). Synthetic kinds (`rework-*`, `verify-fix-*`, `merge-sync-*`) are warn-only since their dispatch is not derived from the workpad checkbox.
 
 ## Testing
 
@@ -154,7 +162,14 @@ agent:
   max_unit_attempts: 3            # circuit breaker for crash-replays per unit
   max_concurrent_agents: 3
 
+review:
+  max_review_rounds: 5            # strict ceiling on findings-fix cycles before
+                                  # escalating to Human Input Needed (warm-session)
+
 verification:
+  # NOTE: verification.* applies only to the merge-time verify subpath now.
+  # Normal-flow tests run inside the warm implement session via
+  # ./scripts/verify-changed.sh — no separate verify unit dispatch.
   baseline_commands:
     - ./scripts/validate-app.sh --quick
   full_commands:

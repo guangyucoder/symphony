@@ -165,6 +165,22 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.warning("unit_lite: no matching rule for #{issue_context(issue)} — possible infrastructure issue (git_head=nil?)")
         escalate_to_human(workspace, issue, "No matching dispatch rule — check workspace git state")
 
+      {:stop, :review_exhausted} ->
+        Logger.warning("unit_lite: review-round cap reached for #{issue_context(issue)} — escalating to human")
+        escalate_to_human(
+          workspace,
+          issue,
+          "Code review exhausted #{Config.max_review_rounds()} rounds without converging on clean verdict — human needs to unblock"
+        )
+
+      {:stop, :already_escalated} ->
+        # Escalation sentinel is set; ticket is waiting for explicit human
+        # action (move to Rework to retry). Log quietly and do nothing — the
+        # poller will call us again next tick but we keep short-circuiting
+        # until the sentinel clears.
+        Logger.info("unit_lite: escalated sentinel set for #{issue_context(issue)} — waiting for human to move ticket to Rework")
+        :ok
+
       {:stop, reason} ->
         Logger.info("unit_lite: stopping for #{issue_context(issue)} reason=#{inspect(reason)}")
         :ok
@@ -228,17 +244,42 @@ defmodule SymphonyElixir.AgentRunner do
       reasoning_effort: unit.reasoning_effort
     })
 
-    # For rework-* and verify-fix-* subtasks: snapshot HEAD (for closeout
-    # zero-commit guard). For rework-* additionally fetch all Linear comments
-    # (for prompt injection). Orchestrator-owned ingestion — do not rely on
-    # the agent to fetch review context or self-report commit state.
-    # Route through the public seam so tests can pin the full opts→prompt
-    # pipeline. If a future merge accidentally drops one of the enrichment
-    # steps (as happened with PR #4's --ours resolution that silently deleted
-    # the contract-attach step), the seam test fails. The seam also returns
-    # the enriched opts so downstream closeout still sees :dispatch_head and
-    # friends.
-    {prompt, opts} = build_unit_prompt_for_dispatch(workspace, issue, unit, opts)
+    # Warm-session review loop (docs/design/warm-session-review-loop.md):
+    # decide whether to resume a persistent Codex thread or spin a cold
+    # session. The decision flows into both the session-open path and the
+    # prompt builder — resumed prompts carry only the delta (new findings /
+    # new diff) rather than re-injecting the full workpad.
+    {:ok, pre_exec} = IssueExec.read(workspace)
+    session_decision = session_decision_for_unit(unit, pre_exec)
+
+    # Open the session FIRST so `opts[:is_resumed_session]` reflects the
+    # actual session state (warm vs cold) rather than the intended decision.
+    # If resume fails and we fall back to cold, the agent has no conversation
+    # history — rendering a delta-only "resumed" prompt into it leaves the
+    # agent blind. `actual_opened` drives both the prompt flag and the
+    # thread-id persist decision below.
+    {session_result, actual_opened} =
+      case session_decision do
+        {:resume, thread_id} ->
+          # Thread reasoning_effort through resume too — otherwise warm sessions
+          # silently fall back to Codex's default effort after round 1, which
+          # is a silent quality regression especially for code_review (high).
+          case AppServer.resume_session(workspace, thread_id, reasoning_effort: unit.reasoning_effort) do
+            {:ok, _} = ok ->
+              Logger.info("unit_lite: resumed thread #{String.slice(thread_id, 0, 12)} for #{unit.display_name}")
+              {ok, :resumed}
+
+            {:error, reason} ->
+              Logger.warning("unit_lite: resume failed for #{unit.display_name} (#{inspect(reason)}) — falling back to cold start")
+              fallback = AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort)
+              {fallback, :cold_fallback}
+          end
+
+        :start_cold ->
+          {AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort), :cold}
+      end
+
+    {prompt, opts} = build_dispatch_prompt(workspace, issue, unit, pre_exec, actual_opened, opts)
 
     # Per-unit debug log
     {:ok, unit_log_path} = UnitLog.open(workspace, unit)
@@ -257,8 +298,20 @@ defmodule SymphonyElixir.AgentRunner do
       UnitLog.log_codex_event(unit_log_path, message)
     end
 
-    case AppServer.start_session(workspace, reasoning_effort: unit.reasoning_effort) do
+    case session_result do
       {:ok, session} ->
+        # Record the new thread_id for any freshly-started session AND for
+        # resumed sessions that came back with a different thread_id than
+        # the one we asked for (some AppServer versions return a fresh id
+        # after merging/forking). Without persisting, the next dispatch
+        # keeps re-sending a dead id and warm-session savings are lost.
+        # :cold and :cold_fallback always need persist; :resumed needs it
+        # only if the id changed.
+        if actual_opened in [:cold, :cold_fallback] or
+             (actual_opened == :resumed and resumed_thread_id_changed?(pre_exec, unit, session)) do
+          persist_thread_id_for_unit(workspace, unit, session)
+        end
+
         try do
           case AppServer.run_turn(
                  session,
@@ -277,7 +330,14 @@ defmodule SymphonyElixir.AgentRunner do
                   :workpad_text,
                   :dispatch_head,
                   :linear_fetch_ok,
-                  :rework_has_review_context
+                  :rework_has_review_context,
+                  # code_review closeout uses :workpad_fetcher to re-fetch the
+                  # workpad post-turn (the snapshot at dispatch time is stale).
+                  # Without forwarding it, production would fall back to the
+                  # default `Adapter.fetch_workpad_text/1` — the desired path —
+                  # but tests that pass a stub fetcher can't exercise closeout
+                  # through run_unit_lite. Forwarding keeps the test contract.
+                  :workpad_fetcher
                 ])
 
               unit_map = Unit.to_map(unit)
@@ -291,6 +351,9 @@ defmodule SymphonyElixir.AgentRunner do
                 :accepted ->
                   commit_sha = current_git_head(workspace)
                   IssueExec.accept_unit(workspace)
+                  # Clear any prior closeout-rejection reason so the next
+                  # dispatch's prompt doesn't re-surface a stale message.
+                  IssueExec.clear_last_retry_reason(workspace)
 
                   if commit_sha do
                     IssueExec.set_commit_sha(workspace, commit_sha)
@@ -316,6 +379,9 @@ defmodule SymphonyElixir.AgentRunner do
                 {:retry, reason} ->
                   Logger.warning("unit_lite: closeout retry for #{unit.display_name}: #{reason}")
                   Ledger.unit_failed(workspace, unit_map, reason)
+                  # Persist the exact rejection reason so the next dispatch
+                  # can surface it in the resumed agent's prompt.
+                  IssueExec.set_last_retry_reason(workspace, reason)
 
                   send_codex_update(codex_update_recipient, issue, %{
                     event: :unit_completed,
@@ -332,6 +398,10 @@ defmodule SymphonyElixir.AgentRunner do
                 {:fail, reason} ->
                   Logger.error("unit_lite: closeout rejected #{unit.display_name}: #{reason}")
                   Ledger.unit_failed(workspace, unit_map, reason)
+                  # Fail paths escape this unit's retry loop; clear the stale
+                  # rejection reason so it doesn't leak into whatever unit
+                  # runs next (escalation reset, merge fallback, etc.).
+                  IssueExec.clear_last_retry_reason(workspace)
 
                   send_codex_update(codex_update_recipient, issue, %{
                     event: :unit_completed,
@@ -498,7 +568,18 @@ defmodule SymphonyElixir.AgentRunner do
         if fix_count < max_fix_cycles do
           ci_output = ci_output_getter.(workspace)
           IssueExec.set_verify_error(workspace, ci_output)
-          IssueExec.update(workspace, %{"current_unit" => nil, "verify_fix_count" => fix_count + 1})
+          # `verify_fix_rule` is gated on `merge_needs_verify == true` to
+          # distinguish an active merge-verify cycle from a stale pre-warm-
+          # session `verify_error` sentinel. A live CI failure during merge
+          # IS an active cycle: set the flag so the gate opens. Without this
+          # the verify-fix dispatch never happens; merge_rule retries the
+          # merge itself, CI fails again, and we exhaust `verify_fix_count`
+          # without ever running a repair subtask. (Iter7 Lens3 HIGH.)
+          IssueExec.update(workspace, %{
+            "current_unit" => nil,
+            "verify_fix_count" => fix_count + 1,
+            "merge_needs_verify" => true
+          })
 
           Ledger.append(workspace, :ci_failed_will_fix, %{
             "fix_cycle" => fix_count + 1,
@@ -726,20 +807,19 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
 
-    # Reset exec state so when a human moves the ticket back to active,
-    # dispatch starts fresh — rework_fix_rule fires, verify counters are clean,
-    # and circuit breaker is cleared.
-    IssueExec.update(workspace, %{
-      "current_unit" => nil,
-      "rework_fix_applied" => false,
-      "verify_error" => nil,
-      "verify_attempt" => 0,
-      "verify_fix_count" => 0,
-      "merge_conflict" => false,
-      "merge_sync_count" => 0,
-      "mergeability_unknown_count" => 0,
-      "merge_needs_verify" => false
-    })
+    # Reset exec state AND set the escalated sentinel in one write.
+    # The sentinel is critical: if `Adapter.update_issue_state` above failed
+    # (Linear API blip), the ticket is still in its active Linear state, the
+    # poller will dispatch this workspace again on the next tick, and without
+    # the sentinel the orchestrator would re-run the same work from scratch
+    # (review_round reset to 0 → code_review fires round 1 again → 5 more
+    # rounds → escalate → reset → loop). The sentinel makes DispatchResolver
+    # stop silently until the human explicitly moves the ticket to Rework
+    # (which clears it via rework_reset_updates/0).
+    IssueExec.update(
+      workspace,
+      Map.put(IssueExec.rework_reset_updates(), "escalated", true)
+    )
 
     Ledger.append(workspace, :escalated_to_human, %{"reason" => reason})
     :ok
@@ -897,10 +977,26 @@ defmodule SymphonyElixir.AgentRunner do
     rework_cycle_unit? =
       current != nil and
         case current["kind"] do
-          k when k in ["verify", "doc_fix"] ->
+          # `verify` stays here for the merge flow (no Rework transitions in
+          # :merging). `code_review` / `doc_fix` were previously here but a
+          # human-triggered rework move while code_review or doc_fix is
+          # in-flight is by definition a NEW cycle — preserving the current
+          # code_review unit meant replay_current_unit_rule would replay the
+          # stale review (prior cycle's warm thread + context) and could
+          # emit a bogus clean verdict on rejected code. They must reset.
+          "verify" ->
             true
 
           "implement_subtask" ->
+            # Only `rework-*` is a true mid-rework-cycle unit whose state
+            # must be preserved across replays. `review-fix-*` was formerly
+            # here — but review-fix-N is dispatched in BOTH :normal and
+            # :rework flows; if a human moves a ticket to Rework mid-normal-
+            # review-fix, keeping current_unit preserved means replay runs
+            # review-fix-N against stale (pre-rework) warm-session threads.
+            # Let it fall through to :stale so `rework_reset_updates/0`
+            # re-runs — the small cost of re-dispatching review-fix is
+            # dwarfed by the cost of reviewing the rejected code.
             is_binary(current["subtask_id"]) and
               String.starts_with?(current["subtask_id"], "rework-")
 
@@ -909,33 +1005,31 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
     stale? = current != nil and not rework_cycle_unit? and not fresh_rework?
+    escalated_resume? = exec_check["escalated"] == true
 
     cond do
       fresh_rework? ->
-        %{
-          action: :fresh,
-          updates: %{
-            "current_unit" => nil,
-            "rework_fix_applied" => false,
-            "last_verified_sha" => nil,
-            "verify_error" => nil,
-            "verify_attempt" => 0,
-            "verify_fix_count" => 0,
-            "merge_conflict" => false,
-            "merge_sync_count" => 0,
-            "mergeability_unknown_count" => 0,
-            "merge_needs_verify" => false
-          }
-        }
+        # Single source of truth for the field set: IssueExec.rework_reset_updates/0.
+        # A human-triggered rework invalidates the prior implement↔review threads
+        # and their verdict; without full reset, a stale "clean" verdict survives
+        # and handoff_rule either mis-dispatches against a stale SHA or freezes
+        # at :no_matching_rule.
+        %{action: :fresh, updates: IssueExec.rework_reset_updates()}
 
       stale? ->
-        %{
-          action: :stale,
-          updates: %{
-            "current_unit" => nil,
-            "last_verified_sha" => nil
-          }
-        }
+        # Stale `current_unit` at Rework entry means the prior cycle was
+        # interrupted at an unexpected spot — safest to reset everything the
+        # :fresh branch would, so the warm-session threads / verdict / flags
+        # from the prior cycle can't poison the new one.
+        %{action: :stale, updates: IssueExec.rework_reset_updates()}
+
+      escalated_resume? ->
+        # Ticket was escalated (current_unit / last_accepted_unit both
+        # cleared by escalate_to_human/3). Human moving it back to Rework IS
+        # the unblock signal — without this branch, fresh_rework? can't fire
+        # (last_accepted_unit was nulled) and the escalated sentinel stays
+        # true forever, permanently wedging the ticket.
+        %{action: :fresh, updates: IssueExec.rework_reset_updates()}
 
       true ->
         %{action: :none, updates: %{}}
@@ -1043,6 +1137,20 @@ defmodule SymphonyElixir.AgentRunner do
     Keyword.put_new(opts, :dispatch_head, current_git_head(workspace))
   end
 
+  # code_review is REVIEW-ONLY: closeout's `reviewer_committed?` gate compares
+  # `dispatch_head` to HEAD at closeout time and rejects if HEAD advanced
+  # (reviewer committed code). Without snapshotting dispatch_head here, that
+  # gate silently short-circuits to false and the review-only invariant is
+  # unenforced. See `Closeout.do_closeout("code_review", ...)`.
+  defp enrich_opts_for_commit_guarded_subtask(
+         workspace,
+         _issue,
+         %Unit{kind: :code_review},
+         opts
+       ) do
+    Keyword.put_new(opts, :dispatch_head, current_git_head(workspace))
+  end
+
   defp enrich_opts_for_commit_guarded_subtask(_workspace, _issue, _unit, opts), do: opts
 
   # Public seam for the full opts→prompt pipeline used by execute_unit.
@@ -1063,6 +1171,28 @@ defmodule SymphonyElixir.AgentRunner do
     opts = maybe_attach_current_subtask_contract(unit, opts)
     prompt = PromptBuilder.build_unit_prompt(issue, unit, opts)
     {prompt, opts}
+  end
+
+  @doc """
+  Full dispatch-prompt pipeline: read exec, apply session-outcome wiring
+  (`dispatch_opts_from_exec/3`), enrich, render prompt. This is the function
+  `execute_unit/5` uses, and the one tests must exercise — NOT
+  `build_unit_prompt_for_dispatch/4` directly, because that skips the exec→opts
+  wiring which is where retry_reason / last_reviewed_sha / is_resumed_session
+  actually flow from the persisted state into the prompt.
+
+  Named as a public seam so that:
+    (a) a missing or renamed `Keyword.put(:retry_reason, ...)` in the wiring
+        surfaces here rather than hiding behind production-only code paths;
+    (b) future changes to execute_unit cannot drop the wiring step without
+        this function losing its contract — tests pin "exec retry_reason →
+        prompt shows reason" via this one call.
+  """
+  @spec build_dispatch_prompt(Path.t(), map(), Unit.t(), map(), :resumed | :cold | :cold_fallback, keyword()) ::
+          {String.t(), keyword()}
+  def build_dispatch_prompt(workspace, issue, %Unit{} = unit, exec, actual_opened, base_opts \\ []) do
+    opts = dispatch_opts_from_exec(base_opts, exec, actual_opened)
+    build_unit_prompt_for_dispatch(workspace, issue, unit, opts)
   end
 
   # Parse the workpad once here (workpad_text is already fetched by the
@@ -1097,10 +1227,117 @@ defmodule SymphonyElixir.AgentRunner do
   defp regular_implement_subtask_id?(subtask_id) when is_binary(subtask_id) do
     not String.starts_with?(subtask_id, "rework-") and
       not String.starts_with?(subtask_id, "verify-fix-") and
-      not String.starts_with?(subtask_id, "merge-sync-")
+      not String.starts_with?(subtask_id, "merge-sync-") and
+      not String.starts_with?(subtask_id, "review-fix-")
   end
 
   defp regular_implement_subtask_id?(_), do: false
+
+  # --- Warm-session review loop: session decision ---
+  #
+  # Pure function that decides whether a dispatch should resume a persistent
+  # Codex thread (warm context, fast re-entry) or spin a cold session. Kept
+  # separate from AppServer I/O so callers can test it without stubbing the
+  # JSON-RPC port protocol.
+  #
+  # See docs/design/warm-session-review-loop.md.
+  @doc """
+  Thread exec-state into the PromptBuilder opts. Named (vs inlined in
+  execute_unit) so tests can pin the wiring contract — a renamed exec key or
+  a silently-dropped Keyword.put is caught by failing assertions on the
+  helper's output rather than being invisible behind a whole dispatch.
+  """
+  @spec dispatch_opts_from_exec(keyword(), map(), :resumed | :cold | :cold_fallback) :: keyword()
+  def dispatch_opts_from_exec(opts, exec, actual_opened) when is_map(exec) do
+    opts
+    |> Keyword.put(:is_resumed_session, actual_opened == :resumed)
+    |> Keyword.put(:last_reviewed_sha, exec["last_reviewed_sha"])
+    # retry_reason is non-nil when the prior dispatch's closeout returned
+    # {:retry, reason}. PromptBuilder routes retry-aware prompts so the
+    # agent addresses the rejection instead of acting on stale framing.
+    |> Keyword.put(:retry_reason, exec["last_retry_reason"])
+  end
+
+  @doc false
+  @spec session_decision_for_unit(Unit.t(), map()) :: :start_cold | {:resume, String.t()}
+  def session_decision_for_unit(%Unit{} = unit, exec) when is_map(exec) do
+    case target_thread_key(unit) do
+      nil ->
+        :start_cold
+
+      key ->
+        case Map.get(exec, key) do
+          thread_id when is_binary(thread_id) and byte_size(thread_id) > 0 ->
+            {:resume, thread_id}
+
+          _ ->
+            :start_cold
+        end
+    end
+  end
+
+  # Which persistent thread does this unit live in?
+  #   - code_review → review_thread_id (session B)
+  #   - implement_subtask (plan-N, review-fix-*, rework-*) → implement_thread_id (session A)
+  #   - verify-fix-*, merge-sync-* → nil (one-shot, cold)
+  #   - everything else (bootstrap, plan, doc_fix, handoff, merge) → nil
+  defp target_thread_key(%Unit{kind: :code_review}), do: "review_thread_id"
+
+  defp target_thread_key(%Unit{kind: :implement_subtask, subtask_id: id}) when is_binary(id) do
+    cond do
+      String.starts_with?(id, "verify-fix-") -> nil
+      String.starts_with?(id, "merge-sync-") -> nil
+      # plan-N, review-fix-N, rework-N all ride on the implement session
+      true -> "implement_thread_id"
+    end
+  end
+
+  defp target_thread_key(_), do: nil
+
+  # Has a successful resume_session returned a DIFFERENT thread_id than what
+  # we stored? Some AppServer paths (thread merge, version forks, transient
+  # resumption that produces a new logical thread) return a fresh id. If we
+  # don't re-persist, every future dispatch re-sends the stale id and resume
+  # either fails or wastes a round trip.
+  defp resumed_thread_id_changed?(pre_exec, unit, session) do
+    key = target_thread_key(unit)
+
+    with true <- is_binary(key),
+         id when is_binary(id) <- Map.get(session, :thread_id),
+         stored <- Map.get(pre_exec, key) do
+      stored != id
+    else
+      _ -> false
+    end
+  end
+
+  # After a cold session starts, record its thread_id so the next dispatch
+  # targeting the same persistent role can resume instead of going cold.
+  # Resumed sessions already share the stored id, so this is a no-op for them.
+  defp persist_thread_id_for_unit(workspace, unit, session) do
+    case target_thread_key(unit) do
+      nil ->
+        :ok
+
+      "implement_thread_id" ->
+        case session.thread_id do
+          id when is_binary(id) ->
+            IssueExec.set_implement_thread_id(workspace, id)
+
+          _ ->
+            :ok
+        end
+
+      "review_thread_id" ->
+        case session.thread_id do
+          id when is_binary(id) ->
+            IssueExec.set_review_thread_id(workspace, id)
+
+          _ ->
+            :ok
+        end
+    end
+  end
 
   defp enrich_opts_for_rework(workspace, issue, %Unit{subtask_id: "rework-" <> _}, opts) do
     dispatch_head = current_git_head(workspace)

@@ -40,9 +40,9 @@ Architecture constraints should be enforced by code, not by memory.
 - `mix compile --warnings-as-errors` — no warnings policy
 - `Verifier` runs validation commands — agent can't skip
 - `DispatchResolver` enforces one-unit-per-session — agent can't self-escalate
-- `Closeout` enforces `last_verified_sha == HEAD` — stale verification blocks handoff
+- `Closeout` enforces `last_reviewed_sha == HEAD` AND `doc_fix_applied == true` for handoff — stale review or unrun doc-sweep blocks handoff (warm-session review loop)
 - `Closeout` requires HEAD to advance for every mutation-bearing unit — uncommitted WIP gets retried, not silently destroyed
-- `doc_fix` runs once before verify as a mandatory pass — the agent reads AGENTS.md / docs/ and updates anything stale; clean tree on closeout is accepted as a no-op
+- `doc_fix` runs once after a clean `code_review` as the pre-handoff sweep — the agent reads AGENTS.md / docs/ and updates anything stale; clean tree on closeout is accepted as a no-op; `doc_fix_applied` flag prevents re-fire after a post-doc_fix re-review
 
 **The pattern:** When a review finding appears twice, promote it to an automated check.
 
@@ -85,6 +85,6 @@ Agents need programmable feedback loops, not "run it and see."
 |---------|-----------|---------------------|
 | Agent skips validation | "Please run validate-app.sh" in prompt | `Verifier` runs it outside agent session |
 | Agent drifts in implement | "Only do this subtask" in prompt | `DispatchResolver` dispatches one subtask |
-| Context lost between sessions | Summary chain / anchor files | Keep `AGENTS.md` + `docs/` fresh; `doc_fix` runs before every verify as a mandatory pre-verify pass |
+| Context lost between sessions | Summary chain / anchor files | Keep `AGENTS.md` + `docs/` fresh; `doc_fix` runs once per cycle as the pre-handoff sweep (after a clean `code_review`) |
 | Same review finding recurs | Remind in next review | Add test / lint rule / guardrail |
 | Agent doesn't know project structure | Longer prompt | Better `AGENTS.md` + `docs/ARCHITECTURE.md` |

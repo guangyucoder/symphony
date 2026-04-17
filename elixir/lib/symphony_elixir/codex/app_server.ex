@@ -56,11 +56,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec resume_session(Path.t(), String.t()) :: {:ok, session()} | {:error, term()}
-  def resume_session(workspace, thread_id)
+  @spec resume_session(Path.t(), String.t(), keyword()) :: {:ok, session()} | {:error, term()}
+  def resume_session(workspace, thread_id, opts \\ [])
       when is_binary(workspace) and is_binary(thread_id) do
+    reasoning_effort = Keyword.get(opts, :reasoning_effort)
+
     with :ok <- validate_workspace_cwd(workspace),
-         {:ok, port} <- start_port(workspace) do
+         {:ok, port} <- start_port(workspace, reasoning_effort) do
       metadata = port_metadata(port)
       expanded_workspace = Path.expand(workspace)
 
@@ -180,7 +182,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, reasoning_effort \\ nil) do
+  defp start_port(workspace, reasoning_effort) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do

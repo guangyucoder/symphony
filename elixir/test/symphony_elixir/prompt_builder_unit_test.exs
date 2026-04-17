@@ -51,12 +51,273 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       assert prompt =~ "Do NOT run validation"
     end
 
-    test "handoff prompt requires results and PR" do
+    # Warm-session review loop: implement↔review pass findings back and
+    # forth via resumed Codex threads. Resumed-turn prompts carry ONLY the
+    # delta — resume preserves conversation history, so re-injecting the
+    # workpad wastes tokens and defeats budget invariants.
+    # See docs/design/warm-session-review-loop.md.
+
+    test "review-fix-N subtask prompt tells the agent to apply findings and commit" do
+      unit = Unit.implement_subtask("review-fix-1", "Apply review findings")
+      prompt = PromptBuilder.build_unit_prompt(@issue, unit)
+
+      assert prompt =~ "review-fix-1"
+      # Agent must know the findings live in the workpad's Code Review section
+      assert prompt =~ "### Code Review"
+      # Agent must commit fixes; warm-session has no verify unit to
+      # compensate for uncommitted work.
+      assert prompt =~ ~r/commit/i
+    end
+
+    test "resumed implement turn prompt is SMALL (no full workpad re-injection)" do
+      # On resume, Codex preserves conversation history. review-fix-N dispatch
+      # should carry only the delta (latest findings), not a full <workpad>
+      # block — that balloons token use and defeats warm-session's point.
+      unit = Unit.implement_subtask("review-fix-1", "Apply review findings")
+
+      big_workpad =
+        "## Codex Workpad\n" <>
+          "### Plan\n- [x] [plan-1] Done\n" <>
+          "### Notes\n" <>
+          String.duplicate("#### [plan-99] continuation\n- files touched: foo.ex\n- key decision: bar\n- watch out: baz\n\n", 50)
+
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, unit,
+          workpad_text: big_workpad,
+          is_resumed_session: true
+        )
+
+      refute prompt =~ "<workpad>"
+      assert String.length(prompt) < 2500,
+             "resumed review-fix prompt exceeded 2500 chars: #{String.length(prompt)}"
+    end
+
+    test "COLD review-fix-N prompt injects workpad so memory-less agent can read findings" do
+      # When AppServer.resume_session/2 fails and agent_runner falls back to
+      # start_session, is_resumed_session is false. The review-fix-N prompt
+      # must then (a) include the workpad with the latest ### Code Review
+      # section so the agent can see what to fix, and (b) explicitly say
+      # "no prior memory" so the agent doesn't try to reference history.
+      # Iter4 Lens2: the warm-session test above is NOT enough — an inverted
+      # if/else would pass warm but silently break the cold-fallback path.
+      unit = Unit.implement_subtask("review-fix-1", "Apply review findings")
+
+      workpad_with_findings = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Done
+
+      ### Notes
+      #### [plan-1] continuation
+      - files touched: foo.ex
+
+      ### Code Review
+      Reviewed SHA: abc1234
+      - [code] HIGH foo.ex:42 KEEP-ME-FINDING
+      Verdict: findings
+      """
+
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, unit,
+          workpad_text: workpad_with_findings,
+          is_resumed_session: false
+        )
+
+      # Workpad MUST be injected — cold agent can't fix findings it can't see.
+      assert prompt =~ "<workpad>"
+      assert prompt =~ "KEEP-ME-FINDING"
+      # Agent must be told it has no memory — otherwise the resumed-style
+      # "you wrote this" framing will confuse it.
+      assert prompt =~ ~r/no prior memory|no conversation history/i
+    end
+
+    test "first (cold) code_review dispatch prompt is self-sufficient" do
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(), is_resumed_session: false)
+
+      assert prompt =~ "$code-review"
+      assert prompt =~ "### Code Review"
+      assert prompt =~ ~r/Verdict/i
+    end
+
+    test "resumed code_review dispatch prompt is SMALL and names the diff" do
+      # Resumed B-session: reviewer already knows the codebase from prior
+      # round. New turn should point at "diff since last_reviewed_sha" not
+      # re-inject full context.
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(),
+          is_resumed_session: true,
+          last_reviewed_sha: "abc123"
+        )
+
+      assert prompt =~ ~r/diff/i
+      assert prompt =~ "abc123"
+      assert String.length(prompt) < 1800,
+             "resumed code_review prompt exceeded 1800 chars: #{String.length(prompt)}"
+    end
+
+    # Visual review is bundled into the code_review unit (web only) so that a
+    # single warm session covers both semantic and visual audit. The prompt
+    # is the only lever — state machine treats the combined verdict as one.
+    #
+    # Assertions here must prove the prompt is IMPERATIVE (run this skill)
+    # not just MENTIONS the topic. A reversed-intent prompt like
+    # "Do NOT run $visual-review on apps/web" would pass a pure =~ check.
+    test "cold code_review prompt imperatively bundles visual review for web UI diffs" do
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(), is_resumed_session: false)
+
+      # The skill must be named in a run/execute context, not a prohibition.
+      assert prompt =~ ~r/(run|execute|invoke)[^\n]{0,40}\$visual-review/i
+      # Scoped to web UI surfaces (mobile explicitly out of scope for now).
+      assert prompt =~ ~r/apps\/web/
+      # Portable shell idioms only — macOS doesn't ship `xargs -r`.
+      refute prompt =~ ~r/xargs\s+-r\b/,
+             "prompt uses GNU-only `xargs -r` which fails on macOS"
+      # Branch-scoped diff so an early commit's UI change isn't missed.
+      assert prompt =~ ~r/merge-base|main\.\.\.HEAD/,
+             "visual review must look at the branch range, not just HEAD~"
+      # Dev server lifecycle must be spelled out with enough specificity that
+      # the agent knows exactly how to produce the screenshot input.
+      assert prompt =~ ~r/dev server/i
+      assert prompt =~ ~r/pnpm.*dev|localhost:3100/i
+      # Screenshot tool named.
+      assert prompt =~ ~r/screenshot|playwright/i
+      # Merged verdict format — tagged findings let implement session
+      # tell code vs visual issues apart when fixing.
+      assert prompt =~ "[code]"
+      assert prompt =~ "[visual]"
+      # Reference capture scripts must actually exist in the repo.
+      # paywall-screenshots.mjs does not; capture-*.mjs does.
+      refute prompt =~ "paywall-screenshots.mjs"
+      assert prompt =~ ~r/scripts\/capture-/
+      # Negative guard: the prompt must not anywhere prohibit the skill.
+      refute prompt =~ ~r/(do\s+not|don't|never)[^\n]{0,40}\$visual-review/i
+    end
+
+    test "cold code_review prompt fails closed when visual review cannot run" do
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(), is_resumed_session: false)
+
+      # If dev server or screenshot capture fails, the agent must record
+      # SKIPPED and mark Verdict: findings — not silently pass.
+      assert prompt =~ ~r/SKIPPED/
+      # The fail-closed semantic must be explicit — merely mentioning
+      # SKIPPED without the verdict consequence would let agents no-op.
+      assert prompt =~ ~r/Verdict:\s*findings|verdict.*findings/i
+    end
+
+    test "resumed code_review prompt reminds about visual re-review" do
+      # Resumed session already saw the full visual flow in the cold turn;
+      # resumed prompt just needs a pointer so the agent re-captures fresh
+      # screenshots when UI diff persists.
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(),
+          is_resumed_session: true,
+          last_reviewed_sha: "abc123"
+        )
+
+      assert prompt =~ ~r/visual/i
+    end
+
+    # When the prior turn was rejected by closeout (e.g. agent forgot to
+    # append the `### Code Review` workpad section), the replay prompt MUST
+    # tell the agent about the specific rejection. Otherwise the default
+    # resumed prompt ("implement just pushed fixes — review the diff") gives
+    # the agent the wrong frame and the retry wastes tokens.
+    # Iter-10 simplification: routing collapsed from 5 branches to 2 (base
+    # prompt is cold OR resumed based on baseline; retry_reason becomes a
+    # prepended prefix regardless). The prior 5-branch table was the source
+    # of 3 HIGH regressions (findings→clean flip, cold-fallback reporting
+    # framing, skill-not-invoked bypass). These tests pin the new contract:
+    # the rejection reason surfaces verbatim, and the underlying base prompt
+    # is picked purely on (is_resumed, last_reviewed_sha).
+
+    test "retry_reason for 'skill not invoked' surfaces in prefix + cold base (no baseline)" do
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(),
+          is_resumed_session: true,
+          last_reviewed_sha: nil,
+          retry_reason: "code_review: workpad has no `### Code Review` section (skill not invoked or findings not recorded)"
+        )
+
+      # Retry prefix appears with the rejection reason verbatim.
+      assert prompt =~ "Previous attempt rejected"
+      assert prompt =~ "workpad has no"
+      # Cold base prompt underneath — agent must actually run the skill.
+      assert prompt =~ ~r/(run|execute|invoke)[^\n]{0,40}\$code-review/i
+    end
+
+    test "retry_reason for malformed Verdict surfaces in prefix + resumed base (has baseline)" do
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(),
+          is_resumed_session: true,
+          last_reviewed_sha: "abc123",
+          retry_reason: "code_review: `### Code Review` section has no parseable `Verdict:` line (expected `Verdict: clean` or `Verdict: findings`)"
+        )
+
+      assert prompt =~ "Previous attempt rejected"
+      assert prompt =~ "parseable"
+      # Resumed base prompt (has baseline SHA).
+      assert prompt =~ "abc123"
+      assert prompt =~ ~r/Examine the diff/i
+    end
+
+    test "resumed code_review prompt without retry_reason uses neutral resumed frame" do
+      # Control: no retry → no prefix. Resumed prompt is neutral (does NOT
+      # assume "implement pushed fixes" — that assumption was the source of
+      # Iter 6's findings→clean flip bypass when HEAD hadn't advanced).
+      prompt =
+        PromptBuilder.build_unit_prompt(@issue, Unit.code_review(),
+          is_resumed_session: true,
+          last_reviewed_sha: "abc123"
+        )
+
+      refute prompt =~ "Previous attempt rejected"
+      # Neutral diff-based framing; no "implement pushed fixes" assumption.
+      assert prompt =~ "abc123"
+      assert prompt =~ ~r/Examine the diff/i
+      refute prompt =~ "Implement session just pushed fixes"
+    end
+
+    # The code_review prompt is the primary point of leverage for the
+    # "skill must actually run before handoff" invariant — if the prompt is
+    # vague the whole gate collapses. Assertions here are deliberately
+    # specific so prompt drift that weakens the instruction gets flagged.
+    test "code_review prompt names the skill and the workpad artifact" do
+      prompt = PromptBuilder.build_unit_prompt(@issue, Unit.code_review())
+      assert prompt =~ "Code Review"
+      # The skill invocation is named explicitly — no "you should probably
+      # review" hand-waving. `$code-review` matches the skill directive.
+      assert prompt =~ "$code-review"
+      # The evidence artifact the closeout gate looks for must be named.
+      assert prompt =~ "### Code Review"
+      # Handoff is forbidden from this unit — the orchestrator dispatches it
+      # separately once the workpad section appears.
+      assert prompt =~ "Do NOT do handoff"
+    end
+
+    test "code_review prompt requires fixes for MEDIUM-or-higher findings" do
+      prompt = PromptBuilder.build_unit_prompt(@issue, Unit.code_review())
+      assert prompt =~ ~r/MEDIUM/
+      # Recording the reviewed SHA lets the orchestrator tell stale reviews
+      # apart from fresh ones across rework cycles.
+      assert prompt =~ ~r/Reviewed SHA/i
+      assert prompt =~ ~r/Verdict/i
+    end
+
+    test "handoff prompt references the code_review artifact (belt-suspenders)" do
       prompt = PromptBuilder.build_unit_prompt(@issue, Unit.handoff())
       assert prompt =~ "Handoff"
       assert prompt =~ "Results"
       assert prompt =~ "Human Review"
       assert prompt =~ "Do NOT write new functional code"
+      # The handoff prompt should not independently ask for a review — the
+      # previous unit already ran it. But it should point at the artifact so
+      # the Results comment links the reviewer's findings for humans.
+      assert prompt =~ "### Code Review"
+      assert prompt =~ ~r/Do NOT re-run/
     end
 
     test "merge prompt is a safety-net fallback (merge is programmatic)" do
@@ -70,13 +331,18 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       # Soft ceiling: the instruction skeleton (no description, no workpad)
       # must stay focused. Real prompts legitimately exceed this once the
       # ticket description and Codex Workpad are injected — that's not
-      # monolithic, that's context engineering. AGENTS.md's "<2000" note
-      # predates workpad injection; 3000 here is the bare-skeleton guard.
-      for unit <- [Unit.bootstrap(), Unit.plan(), Unit.implement_subtask("plan-1"), Unit.doc_fix(), Unit.verify(), Unit.handoff(), Unit.merge()] do
+      # monolithic, that's context engineering.
+      #
+      # code_review gets a higher cap because it legitimately bundles the
+      # visual-review flow (branch-scoped diff + portable shell + verdict
+      # schema). Every other unit must stay at the original 3000 bound so a
+      # bloat regression in handoff/doc_fix/etc. doesn't slip past.
+      for unit <- [Unit.bootstrap(), Unit.plan(), Unit.implement_subtask("plan-1"), Unit.doc_fix(), Unit.verify(), Unit.code_review(), Unit.handoff(), Unit.merge()] do
         prompt = PromptBuilder.build_unit_prompt(@issue, unit)
+        cap = if unit.kind == :code_review, do: 3700, else: 3000
 
-        assert String.length(prompt) < 3000,
-               "#{unit.display_name} prompt too long: #{String.length(prompt)} chars"
+        assert String.length(prompt) < cap,
+               "#{unit.display_name} prompt too long: #{String.length(prompt)} chars (cap #{cap})"
       end
     end
   end
@@ -359,29 +625,49 @@ defmodule SymphonyElixir.PromptBuilderUnitTest do
       assert prompt =~ "Do bad things"
     end
 
-    test "truncates oversized workpad at the configured cap" do
+    test "trims oversized workpad by dropping oldest Notes continuations first" do
       unit = Unit.implement_subtask("plan-2")
-      # 30KB >> 12KB cap. Truncation marker appears; bulky content
-      # past the cap does not.
-      huge = "### Plan\n- [ ] [plan-1] head-marker\n" <> String.duplicate("FILLER-", 5_000)
+      # Plan + Code Review are protected; Notes continuations are the first
+      # thing to go when the workpad exceeds the byte cap. The critical
+      # invariant: latest `### Code Review` findings survive in full so a
+      # resumed implement session can see what to fix.
+      huge =
+        "### Plan\n- [ ] [plan-1] head-marker\n" <>
+          "### Notes\n" <>
+          String.duplicate(
+            "#### [plan-99] continuation\n" <> String.duplicate("X", 400) <> "\n\n",
+            80
+          ) <>
+          "### Code Review\nVerdict: findings\n[code] HIGH foo.ex:42 KEEP-ME\n"
 
       prompt = PromptBuilder.build_unit_prompt(@issue, unit, workpad_text: huge)
 
-      assert prompt =~ "workpad truncated"
+      # Elision marker from the section-aware truncator.
+      assert prompt =~ "continuation note(s) omitted"
+      # Load-bearing content is preserved.
       assert prompt =~ "head-marker"
-      # Not all of the filler survives.
-      refute prompt =~ String.duplicate("FILLER-", 4_000)
+      assert prompt =~ "KEEP-ME"
     end
 
-    test "workpad cap is byte-based so CJK content cannot inflate past budget" do
+    test "latest Code Review section survives even when workpad exceeds cap" do
+      # This is the anti-cut-off invariant: naive head-byte truncation
+      # would slice the tail `### Code Review` mid-line, blinding a
+      # resumed implement session to the findings it must fix.
       unit = Unit.implement_subtask("plan-2")
-      # Each 测 is 3 bytes; 5000 of them is 15KB — above the 12KB byte cap.
-      # If the cap were grapheme-based (5000 length), no truncation would fire.
-      cjk = "### Plan\n" <> String.duplicate("测", 5_000)
 
-      prompt = PromptBuilder.build_unit_prompt(@issue, unit, workpad_text: cjk)
+      padded_notes =
+        "### Notes\n" <>
+          String.duplicate("#### [plan-99] x\n" <> String.duplicate("Z", 300) <> "\n\n", 100)
 
-      assert prompt =~ "workpad truncated"
+      workpad =
+        "### Plan\n- [ ] [plan-1] p\n" <>
+          padded_notes <>
+          "### Code Review\nVerdict: findings\n[code] HIGH tail-finding\n"
+
+      prompt = PromptBuilder.build_unit_prompt(@issue, unit, workpad_text: workpad)
+
+      assert prompt =~ "tail-finding"
+      assert prompt =~ "Verdict: findings"
     end
 
     test "prompt references the workpad so agent reads it before starting" do

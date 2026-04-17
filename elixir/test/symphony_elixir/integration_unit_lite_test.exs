@@ -84,18 +84,15 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     :ok
   end
 
-  describe "Scenario A: normal ticket full flow" do
-    test "bootstrap → plan → implement × 2 → verify → handoff", %{workspace: ws} do
+  describe "Scenario A: normal ticket full flow (warm-session)" do
+    test "bootstrap → plan → implement × 2 → code_review (clean) → doc_fix → handoff", %{workspace: ws} do
       # Step 1: resolve → bootstrap
       assert {:dispatch, %Unit{kind: :bootstrap}} = resolve(ws, @issue)
-
-      # Simulate bootstrap complete
       assert :accepted = simulate_unit_complete(ws, %{"kind" => "bootstrap"}, @issue)
 
       # Step 2: resolve → plan (no workpad yet)
       assert {:dispatch, %Unit{kind: :plan}} = resolve(ws, @issue)
 
-      # Simulate plan complete with workpad
       workpad = """
       ## Codex Workpad
       `host:dir@abc123`
@@ -109,44 +106,40 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       # Step 3: resolve → implement_subtask(plan-1)
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-1"}} = resolve(ws, @issue, workpad)
-
-      # Simulate subtask-1 complete
       assert :accepted = simulate_unit_complete(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-1"}, @issue)
 
-      # Update workpad (mark plan-1 done)
       workpad_after_1 = String.replace(workpad, "- [ ] [plan-1]", "- [x] [plan-1]")
 
       # Step 4: resolve → implement_subtask(plan-2)
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = resolve(ws, @issue, workpad_after_1)
-
-      # Simulate subtask-2 complete
       assert :accepted = simulate_unit_complete(ws, %{"kind" => "implement_subtask", "subtask_id" => "plan-2"}, @issue)
 
-      # Update workpad (mark plan-2 done)
       workpad_after_2 = String.replace(workpad_after_1, "- [ ] [plan-2]", "- [x] [plan-2]")
 
-      # Step 5: resolve → doc_fix (one-time before verify)
+      # Step 5: resolve → code_review (first round — warm-session loop entry)
+      assert {:dispatch, %Unit{kind: :code_review}} = resolve(ws, @issue, workpad_after_2)
+
+      # Simulate code_review accepting "clean" verdict — closeout sets verdict,
+      # pins last_reviewed_sha, bumps round.
+      IssueExec.start_unit(ws, %{"kind" => "code_review"})
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => "abc123",
+        "review_round" => 1
+      })
+      IssueExec.accept_unit(ws)
+
+      # Step 6: resolve → doc_fix (pre-handoff sweep now that review is clean)
       assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, @issue, workpad_after_2)
       assert :accepted = simulate_unit_complete(ws, %{"kind" => "doc_fix"}, @issue)
-
-      # Step 6: resolve → verify
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, @issue, workpad_after_2)
-
-      # Simulate verify
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      IssueExec.set_verified_sha(ws, "abc123")
-      IssueExec.accept_unit(ws)
-      Ledger.verify_passed(ws, "abc123")
 
       # Step 7: resolve → handoff
       assert {:dispatch, %Unit{kind: :handoff}} = resolve(ws, @issue, workpad_after_2)
 
-      # Verify ledger has full history
       {:ok, entries} = Ledger.read(ws)
       events = Enum.map(entries, & &1["event"])
       assert "unit_started" in events
       assert "unit_accepted" in events
-      assert "verify_passed" in events
     end
   end
 
@@ -203,13 +196,22 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  describe "Scenario D: HEAD change invalidates verification" do
-    test "verified at sha A, HEAD moves to sha B → re-verify", %{workspace: ws} do
+  describe "Scenario D: HEAD change invalidates review" do
+    test "review clean at sha A, HEAD moves to sha B → re-review before handoff", %{workspace: ws} do
+      # Warm-session equivalent of "verified sha doesn't match HEAD": if the
+      # implement session committed something AFTER review accepted a clean
+      # verdict, handoff must wait for the reviewer to look again at the new
+      # diff. This guards against agents landing untested follow-up commits
+      # between review and handoff.
       IssueExec.mark_bootstrapped(ws)
       IssueExec.bump_plan_version(ws)
-      IssueExec.set_verified_sha(ws, "sha_A")
-      # Doc fix already done in this cycle
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "verify"}})
+
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => "sha_A",
+        "review_round" => 1,
+        "last_accepted_unit" => %{"kind" => "code_review"}
+      })
 
       workpad_all_done = """
       ## Codex Workpad
@@ -217,11 +219,15 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       ### Plan
       - [x] [plan-1] Done
       - [x] [plan-2] Done
+
+      ### Code Review
+      - Verdict: clean
       """
 
-      # HEAD is now sha_B (different from verified sha_A)
       {:ok, exec} = IssueExec.read(ws)
 
+      # HEAD moved past the reviewed sha. Under warm-session this is the
+      # "clean verdict is stale" signal.
       ctx = %{
         issue: %{state: "In Progress"},
         exec: exec,
@@ -229,15 +235,75 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
         git_head: "sha_B"
       }
 
-      # Should dispatch verify, NOT handoff
-      assert {:dispatch, %Unit{kind: :verify}} = DispatchResolver.resolve(ctx)
+      # handoff must not fire — the gate's HEAD-match check catches this.
+      refute match?({:dispatch, %Unit{kind: :handoff}}, DispatchResolver.resolve(ctx))
 
-      # After re-verification at sha_B
-      IssueExec.set_verified_sha(ws, "sha_B")
+      # Reviewer picks up sha_B with a fresh verdict.
+      IssueExec.update(ws, %{
+        "last_reviewed_sha" => "sha_B",
+        "review_round" => 2
+      })
+
       {:ok, exec} = IssueExec.read(ws)
       ctx = %{ctx | exec: exec}
 
-      # Now should dispatch handoff
+      # With review now aligned to HEAD, doc_fix fires (pre-handoff sweep),
+      # then handoff.
+      assert {:dispatch, %Unit{kind: :doc_fix}} = DispatchResolver.resolve(ctx)
+
+      # Simulate doc_fix closeout: flag is set AND last_accepted_unit transitions.
+      # The authoritative gate is `doc_fix_applied` — without it the test would
+      # pass via last_accepted_unit scraping, hiding the real regression.
+      IssueExec.update(ws, %{
+        "doc_fix_applied" => true,
+        "last_accepted_unit" => %{"kind" => "doc_fix"}
+      })
+
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{ctx | exec: exec}
+
+      assert {:dispatch, %Unit{kind: :handoff}} = DispatchResolver.resolve(ctx)
+    end
+
+    test "post-doc_fix real commit → re-review → doc_fix does NOT fire again", %{workspace: ws} do
+      # The exact scenario Lens 1/3 flagged: first doc_fix commits real changes
+      # → HEAD advances → code_review re-fires → last_accepted_unit shifts to
+      # "code_review". Scrape-based gates would re-dispatch doc_fix. The flag
+      # makes this impossible.
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.bump_plan_version(ws)
+
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => "sha_B",
+        "review_round" => 2,
+        # First doc_fix ran, committed changes, re-review ran clean on the new HEAD.
+        "doc_fix_applied" => true,
+        "last_accepted_unit" => %{"kind" => "code_review"}
+      })
+
+      workpad = """
+      ## Codex Workpad
+
+      ### Plan
+      - [x] [plan-1] Done
+
+      ### Code Review
+      - Verdict: clean
+      """
+
+      {:ok, exec} = IssueExec.read(ws)
+
+      ctx = %{
+        issue: %{state: "In Progress"},
+        exec: exec,
+        workpad_text: workpad,
+        git_head: "sha_B"
+      }
+
+      # Must fire handoff, NOT doc_fix. Regression guard: removing the flag
+      # check makes this test fail because last_accepted_unit=="code_review"
+      # is interpreted as "doc_fix hasn't run."
       assert {:dispatch, %Unit{kind: :handoff}} = DispatchResolver.resolve(ctx)
     end
   end
@@ -257,9 +323,12 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  describe "Scenario E: rework fix does NOT loop through doc_fix" do
-    test "rework fix → doc_fix → verify (not another rework fix)", %{workspace: ws} do
-      # Setup: completed normal cycle, now in Rework
+  describe "Scenario E: rework fix → code_review (warm-session)" do
+    test "rework fix does NOT re-loop and does NOT detour through verify", %{workspace: ws} do
+      # Under warm-session there's no verify unit between rework fix and code
+      # review. Rework fix commits, then code_review is dispatched against
+      # the new HEAD. doc_fix is a pre-handoff sweep now, not a pre-verify
+      # one.
       IssueExec.mark_bootstrapped(ws)
 
       workpad_all_done = """
@@ -272,85 +341,27 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       rework_issue = %{state: "Rework", identifier: "ENT-42", title: "Fix"}
 
-      # Step 1: resolve → rework fix (workpad complete, rework_fix_applied=false)
+      # Step 1: rework fix dispatches (workpad complete, rework_fix_applied=false)
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "rework-1"}} =
                resolve(ws, rework_issue, workpad_all_done)
 
-      # Simulate rework fix accepted (sets rework_fix_applied flag via closeout)
       IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "rework-1"})
       IssueExec.accept_unit(ws)
       IssueExec.update(ws, %{"rework_fix_applied" => true})
 
-      # Step 2: resolve → doc_fix (mandatory pre-verify sweep, NOT another rework fix!)
-      assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad_all_done)
+      # Step 2: next dispatch is code_review — NOT another rework fix, NOT
+      # doc_fix (doc_fix only runs after clean verdict), NOT verify (deleted).
+      assert {:dispatch, %Unit{kind: :code_review}} = resolve(ws, rework_issue, workpad_all_done)
 
-      # Simulate doc_fix accepted
-      IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
-      IssueExec.accept_unit(ws)
-
-      # Step 3: resolve → verify (NOT rework fix again!)
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad_all_done)
-
-      # Verify rework_fix_applied flag blocked re-dispatch
+      # Regression guard: rework_fix_applied stays true so the loop can't
+      # re-dispatch rework-1.
       {:ok, exec} = IssueExec.read(ws)
       assert exec["rework_fix_applied"] == true
     end
   end
 
-  describe "Scenario F: verify failure dispatches verify-fix (not blind retry)" do
-    test "verify fails → sets verify_error → verify-fix dispatched", %{workspace: ws} do
-      # Need a git repo for Verifier.current_head
-      System.cmd("git", ["init"], cd: ws)
-      File.write!(Path.join(ws, "test.txt"), "hello")
-      System.cmd("git", ["add", "."], cd: ws)
-      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cd: ws)
-
-      IssueExec.mark_bootstrapped(ws)
-      IssueExec.set_verified_sha(ws, nil)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      workpad_all_done = """
-      ## Codex Workpad
-
-      ### Plan
-      - [x] [plan-1] Done
-      """
-
-      # Verify fails (non-exhausted, attempt 1)
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      assert {:retry, _} = result
-
-      # verify_error set, current_unit cleared, verify_attempt=1
-      {:ok, exec} = IssueExec.read(ws)
-      assert is_binary(exec["verify_error"])
-      assert exec["current_unit"] == nil
-      assert exec["verify_attempt"] == 1
-
-      # verified_sha NOT set
-      assert exec["last_verified_sha"] == nil
-
-      # Next dispatch: verify_fix_rule fires (NOT replay verify)
-      {:ok, head_sha} =
-        case System.cmd("git", ["rev-parse", "HEAD"], cd: ws) do
-          {sha, 0} -> {:ok, String.trim(sha)}
-          _ -> {:ok, "abc"}
-        end
-
-      ctx = %{
-        issue: %{state: @issue.state},
-        exec: exec,
-        workpad_text: workpad_all_done,
-        git_head: head_sha
-      }
-
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
-               DispatchResolver.resolve(ctx)
-    end
-  end
-
   describe "Scenario G: full rework cycle end-to-end" do
-    test "normal flow → Rework → fix → doc_fix → verify → handoff", %{workspace: ws} do
+    test "normal flow → Rework → fix → code_review → doc_fix → handoff (warm-session flow)", %{workspace: ws} do
       IssueExec.mark_bootstrapped(ws)
       IssueExec.bump_plan_version(ws)
 
@@ -361,8 +372,7 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [x] [plan-1] Implement feature
       """
 
-      # Verify + handoff
-      IssueExec.set_verified_sha(ws, "abc123")
+      # Pretend a prior cycle handed off
       IssueExec.start_unit(ws, %{"kind" => "handoff"})
       IssueExec.accept_unit(ws)
 
@@ -374,17 +384,25 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
 
       IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "rework-1"})
       IssueExec.accept_unit(ws)
-      IssueExec.update(ws, %{"rework_fix_applied" => true, "last_verified_sha" => nil})
+      IssueExec.update(ws, %{"rework_fix_applied" => true})
 
-      # Step 2: doc_fix (mandatory pre-verify sweep)
-      assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad)
-      IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
+      # Step 2: code_review first round (replaces doc_fix → verify chain)
+      assert {:dispatch, %Unit{kind: :code_review}} = resolve(ws, rework_issue, workpad)
+      IssueExec.start_unit(ws, %{"kind" => "code_review"})
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => "abc123",
+        "review_round" => 1
+      })
       IssueExec.accept_unit(ws)
 
-      # Step 3: verify
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad)
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      IssueExec.set_verified_sha(ws, "abc123")
+      # Step 3: doc_fix (pre-handoff sweep)
+      assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad)
+      IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
+      # Simulate closeout setting the authoritative flag — scrape-based
+      # tests would pass via last_accepted_unit="doc_fix" but the real gate
+      # is `doc_fix_applied`.
+      IssueExec.update(ws, %{"doc_fix_applied" => true})
       IssueExec.accept_unit(ws)
 
       # Step 4: handoff
@@ -593,8 +611,12 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
   # the cleanup logic at each dispatch boundary.
   # ──────────────────────────────────────────────────────────────────
 
-  describe "Scenario N: rework cycle does not loop (with agent_runner cleanup)" do
-    test "rework_fix → doc_fix → verify → handoff (no re-dispatch of rework_fix)", %{workspace: ws} do
+  describe "Scenario N: warm-session rework cycle with agent_runner cleanup" do
+    test "rework_fix → code_review → doc_fix → handoff (no re-dispatch of rework_fix)", %{workspace: ws} do
+      # Covers Scenario G's ground but also invokes the agent_runner cleanup
+      # between dispatches. The cleanup clears rework_fix_applied whenever we
+      # re-enter a rework cycle from handoff/merge — it must not clear during
+      # mid-cycle.
       IssueExec.mark_bootstrapped(ws)
       IssueExec.bump_plan_version(ws)
 
@@ -605,55 +627,54 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
       - [x] [plan-1] Implement feature
       """
 
-      # Simulate: previous cycle completed handoff, supervisor moved to Rework
       IssueExec.update(ws, %{
         "last_accepted_unit" => %{"kind" => "handoff"},
-        "last_verified_sha" => "old_sha",
         "rework_fix_applied" => false
       })
 
       rework_issue = %{state: "Rework", identifier: "ENT-42", title: "Fix review"}
 
-      # --- Dispatch 1: simulate agent_runner rework cleanup, then resolve ---
-      # This is what agent_runner.ex:44-61 does before every dispatch in Rework.
+      # Dispatch 1: cleanup + resolve → rework fix
       simulate_rework_cleanup(ws)
 
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "rework-1"}} =
                resolve(ws, rework_issue, workpad)
 
-      # Simulate rework-1 completion (closeout sets rework_fix_applied)
       IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "rework-1"})
       IssueExec.accept_unit(ws)
-      IssueExec.update(ws, %{"rework_fix_applied" => true, "last_verified_sha" => nil})
+      IssueExec.update(ws, %{"rework_fix_applied" => true})
 
-      # --- Dispatch 2: cleanup + resolve → doc_fix ---
+      # Dispatch 2: cleanup + resolve → code_review (first review of fix)
+      simulate_rework_cleanup(ws)
+      assert {:dispatch, %Unit{kind: :code_review}} = resolve(ws, rework_issue, workpad)
+
+      IssueExec.start_unit(ws, %{"kind" => "code_review"})
+      IssueExec.update(ws, %{
+        "review_verdict" => "clean",
+        "last_reviewed_sha" => "abc123",
+        "review_round" => 1
+      })
+      IssueExec.accept_unit(ws)
+
+      # Dispatch 3: cleanup + resolve → doc_fix (pre-handoff sweep)
       simulate_rework_cleanup(ws)
       assert {:dispatch, %Unit{kind: :doc_fix}} = resolve(ws, rework_issue, workpad)
 
       IssueExec.start_unit(ws, %{"kind" => "doc_fix"})
+      # Authoritative gate the real closeout sets.
+      IssueExec.update(ws, %{"doc_fix_applied" => true})
       IssueExec.accept_unit(ws)
 
-      # --- Dispatch 3: cleanup + resolve → verify ---
-      simulate_rework_cleanup(ws)
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, rework_issue, workpad)
-
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      IssueExec.set_verified_sha(ws, "abc123")
-      IssueExec.accept_unit(ws)
-
-      # --- Dispatch 4: cleanup + resolve → handoff (NOT rework-1 again!) ---
+      # Dispatch 4: cleanup + resolve → handoff
       simulate_rework_cleanup(ws)
 
-      result = resolve(ws, rework_issue, workpad)
-
-      assert {:dispatch, %Unit{kind: :handoff}} = result,
-             "After verify in rework cycle, should dispatch handoff — not loop back to rework_fix"
+      assert {:dispatch, %Unit{kind: :handoff}} = resolve(ws, rework_issue, workpad),
+             "After clean verdict + doc_fix, rework cycle exits to handoff"
     end
   end
 
-  # Simulates the rework cleanup logic from agent_runner.ex:44-61.
-  # Must be called before each resolve() in Rework tests to match
-  # production behavior.
+  # Simulates the rework cleanup logic from agent_runner.ex. Must be called
+  # before each resolve() in Rework tests to match production behavior.
   defp simulate_rework_cleanup(workspace) do
     case IssueExec.read(workspace) do
       {:ok, exec} ->
@@ -678,212 +699,50 @@ defmodule SymphonyElixir.IntegrationUnitLiteTest do
     end
   end
 
-  # ──────────────────────────────────────────────────────────────────
-  # Scenario O: verify fails → verify-fix → re-verify passes
-  # ──────────────────────────────────────────────────────────────────
-
-  describe "Scenario O: verify-fix dispatches on verification failure" do
-    test "verify fails → verify-fix → verify passes → handoff", %{workspace: ws} do
-      System.cmd("git", ["init"], cd: ws)
-      File.write!(Path.join(ws, "test.txt"), "hello")
-      System.cmd("git", ["add", "."], cd: ws)
-      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cd: ws)
-
-      IssueExec.mark_bootstrapped(ws)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      workpad = """
-      ## Codex Workpad
-
-      ### Plan
-      - [x] [plan-1] Done
-      """
-
-      # Step 1: verify dispatched
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, @issue, workpad)
-
-      # Simulate verify failure (non-exhausted)
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      assert {:retry, _} = result
-
-      # verify_error set, current_unit cleared
-      {:ok, exec} = IssueExec.read(ws)
-      assert is_binary(exec["verify_error"])
-      assert exec["current_unit"] == nil
-      assert exec["verify_attempt"] == 1
-
-      # Step 2: dispatch → verify-fix (NOT verify replay)
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
-               resolve(ws, @issue, workpad)
-
-      # Simulate verify-fix accepted — agent commits a real fix so the
-      # commit-advancement guard clears verify_error.
-      simulate_verify_fix_done(ws)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      # verify_error cleared
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_error"] == nil
-
-      # Step 3: verify again (passes this time)
-      assert {:dispatch, %Unit{kind: :verify}} = resolve(ws, @issue, workpad)
-
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["true"])
-      assert :accepted = result
-      IssueExec.accept_unit(ws)
-      # Align verified_sha with the hardcoded git_head used by resolve/3
-      IssueExec.set_verified_sha(ws, "abc123")
-
-      # Step 4: handoff
-      assert {:dispatch, %Unit{kind: :handoff}} = resolve(ws, @issue, workpad)
-    end
-  end
+  # Scenarios O / P (verify-fix cold-session cycle) deleted under the
+  # warm-session redesign. Verify failures are handled inside the implement
+  # session's own multi-turn loop; no separate verify-fix-* dispatch exists.
+  # The old tests asserted on verify_error state machines that no longer
+  # apply. See docs/design/warm-session-review-loop.md.
 
   # ──────────────────────────────────────────────────────────────────
-  # Scenario P: verify-fix cycle exhausts after max attempts
-  # ──────────────────────────────────────────────────────────────────
-
-  describe "Scenario P: verify-fix cycle cap and eventual exhaustion" do
-    test "after 2 fix cycles, 3rd failure stops dispatching fixes and exhausts", %{workspace: ws} do
-      System.cmd("git", ["init"], cd: ws)
-      File.write!(Path.join(ws, "test.txt"), "hello")
-      System.cmd("git", ["add", "."], cd: ws)
-      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "init"], cd: ws)
-
-      IssueExec.mark_bootstrapped(ws)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      workpad = """
-      ## Codex Workpad
-
-      ### Plan
-      - [x] [plan-1] Done
-      """
-
-      # Fix cycle 1: verify fails → sets verify_error → verify-fix dispatched
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_fix_count"] == 1
-      assert is_binary(exec["verify_error"])
-
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
-               resolve(ws, @issue, workpad)
-
-      simulate_verify_fix_done(ws)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      # Fix cycle 2: verify fails → fix again
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      assert {:retry, _} = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_fix_count"] == 2
-      assert is_binary(exec["verify_error"])
-
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
-               resolve(ws, @issue, workpad)
-
-      simulate_verify_fix_done(ws)
-      IssueExec.update(ws, %{"last_accepted_unit" => %{"kind" => "doc_fix"}})
-
-      # 3rd verify failure: fix_count >= 2 → no verify_error, plain retry
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      assert {:retry, _} = result
-
-      {:ok, exec} = IssueExec.read(ws)
-      assert exec["verify_error"] == nil, "should NOT set verify_error when fix cycles exhausted"
-
-      # Next retries will accumulate verify_attempt until @max_verify_attempts → exhaustion
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      assert {:retry, _} = result
-
-      IssueExec.start_unit(ws, %{"kind" => "verify"})
-      result = Closeout.run(ws, %{"kind" => "verify"}, @issue, verify_commands: ["false"])
-      assert {:fail, reason} = result
-      assert reason =~ "exhausted"
-    end
-  end
-
-  defp simulate_verify_fix_done(ws) do
-    # Snapshot HEAD, simulate an agent commit, then run closeout with the
-    # dispatch_head so the commit-advancement guard sees HEAD advanced.
-    {dispatch_head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: ws)
-    dispatch_head = String.trim(dispatch_head)
-
-    fix_file = "verify_fix_#{System.unique_integer([:positive])}.txt"
-    File.write!(Path.join(ws, fix_file), "fix\n")
-    System.cmd("git", ["add", "."], cd: ws)
-
-    System.cmd(
-      "git",
-      ["-c", "user.name=Test", "-c", "user.email=t@t.com", "commit", "-m", "verify-fix"],
-      cd: ws
-    )
-
-    IssueExec.start_unit(ws, %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"})
-
-    Closeout.run(
-      ws,
-      %{"kind" => "implement_subtask", "subtask_id" => "verify-fix-1"},
-      @issue,
-      dispatch_head: dispatch_head
-    )
-
-    IssueExec.accept_unit(ws)
-  end
-
-  # ──────────────────────────────────────────────────────────────────
-  # Scenario Q: programmatic merge — CI pass, pending, fail paths
+  # Scenario Q: programmatic merge — merge-sync vs merge, no verify-fix
   # ──────────────────────────────────────────────────────────────────
 
   describe "Scenario Q: programmatic merge dispatch paths" do
-    test "CI fail during merge → verify_error set, verify-fix dispatched", %{workspace: ws} do
+    test "merge dispatches regardless of stale verify_error (warm-session: no verify-fix hijack)", %{workspace: ws} do
+      # Under warm-session, verify_fix_rule is gone. A stale verify_error
+      # from a pre-warm-session upgrade must not prevent merge from firing.
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"phase" => "merging"})
+      IssueExec.set_verify_error(ws, "FAIL: old error from pre-warm-session")
+
+      merging_issue = %{state: "Merging"}
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+
+      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
+    end
+
+    test "merge_rule fires when no conflict and no merge_needs_verify flag", %{workspace: ws} do
       IssueExec.mark_bootstrapped(ws)
       IssueExec.update(ws, %{"phase" => "merging"})
 
-      # Simulate what do_merge_with_ci_check does on CI failure
-      IssueExec.set_verify_error(ws, "FAIL: board-actions.test.ts:222")
-      IssueExec.update(ws, %{"current_unit" => nil, "verify_fix_count" => 1})
-
-      # Dispatch in Merging state should give verify-fix (not merge)
       merging_issue = %{state: "Merging"}
       {:ok, exec} = IssueExec.read(ws)
       ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
+    end
 
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+    test "merge_sync_rule wins when merge_conflict is set", %{workspace: ws} do
+      IssueExec.mark_bootstrapped(ws)
+      IssueExec.update(ws, %{"phase" => "merging", "merge_conflict" => true})
+
+      merging_issue = %{state: "Merging"}
+      {:ok, exec} = IssueExec.read(ws)
+      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-1"}} =
                DispatchResolver.resolve(ctx)
-    end
-
-    test "after verify-fix clears error → merge_rule fires again", %{workspace: ws} do
-      IssueExec.mark_bootstrapped(ws)
-      IssueExec.update(ws, %{"phase" => "merging", "verify_error" => nil})
-
-      merging_issue = %{state: "Merging"}
-      {:ok, exec} = IssueExec.read(ws)
-      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
-      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
-    end
-
-    test "verify_fix_count caps prevent infinite CI-fail loop", %{workspace: ws} do
-      IssueExec.mark_bootstrapped(ws)
-      IssueExec.update(ws, %{"phase" => "merging", "verify_fix_count" => 2})
-
-      # With fix_count at cap (2), CI failure should NOT set verify_error
-      # Simulating the agent_runner CI-fail logic:
-      {:ok, exec_state} = IssueExec.read(ws)
-      fix_count = exec_state["verify_fix_count"] || 0
-      assert fix_count >= 2, "fix_count should be at cap"
-
-      # merge_rule fires (no verify_error set), CI fails, returns :error → replay → circuit breaker
-      merging_issue = %{state: "Merging"}
-      {:ok, exec} = IssueExec.read(ws)
-      ctx = %{issue: merging_issue, exec: exec, workpad_text: nil, git_head: "abc"}
-      # Should dispatch merge (not verify-fix, since no verify_error)
-      assert {:dispatch, %Unit{kind: :merge}} = DispatchResolver.resolve(ctx)
     end
 
     test "merge closeout accepts when PR merged", %{workspace: ws} do

@@ -9,7 +9,16 @@ defmodule SymphonyElixir.DispatchResolverTest do
     "current_unit" => nil,
     "last_accepted_unit" => nil,
     "last_commit_sha" => nil,
+    # Warm-session review loop state (see docs/design/warm-session-review-loop.md).
+    # last_verified_sha stays around for backward-compat with other tests, but
+    # the new flow keys its gate off review_verdict, not this.
     "last_verified_sha" => nil,
+    "implement_thread_id" => nil,
+    "review_thread_id" => nil,
+    "review_verdict" => nil,
+    "review_round" => 0,
+    "last_reviewed_sha" => nil,
+    "doc_fix_applied" => false,
     "bootstrapped" => false,
     "plan_version" => 0
   }
@@ -81,8 +90,11 @@ defmodule SymphonyElixir.DispatchResolverTest do
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = result
     end
 
-    test "dispatches doc_fix before verify when all subtasks done" do
-      exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => nil}
+    test "dispatches code_review when all subtasks done and no prior review" do
+      # Warm-session flow: plan subtasks done → loop entry is code_review, not
+      # doc_fix. doc_fix moves to a pre-handoff sweep (runs only after review
+      # is clean). See docs/design/warm-session-review-loop.md.
+      exec = %{@default_exec | "bootstrapped" => true}
 
       result =
         DispatchResolver.resolve(
@@ -93,21 +105,19 @@ defmodule SymphonyElixir.DispatchResolverTest do
           })
         )
 
-      assert {:dispatch, %Unit{kind: :doc_fix}} = result
+      assert {:dispatch, %Unit{kind: :code_review}} = result
     end
 
-    test "ignores legacy doc_fix_required flag — pre-verify doc_fix is workpad-driven only" do
-      # Round-4 removed the DocImpact heuristic and the doc_fix_required flag.
-      # If a stale fixture or upgraded workspace still carries the flag, the
-      # resolver must not gate doc_fix dispatch on it; the only remaining
-      # trigger is "all checklist items done + last_accepted_unit isn't a
-      # post-implementation kind". This pin guards against silent re-introduction.
+    test "ignores stale pre-warm-session exec flags (doc_fix_required, verify_error)" do
+      # Workspaces predating the warm-session refactor may carry stale flags
+      # (doc_fix_required, verify_error). The new flow keys off review_verdict
+      # and must not be hijacked by either.
       exec =
         @default_exec
         |> Map.merge(%{
           "bootstrapped" => true,
-          "last_verified_sha" => nil,
-          "doc_fix_required" => true
+          "doc_fix_required" => true,
+          "verify_error" => "stale error"
         })
 
       result =
@@ -119,10 +129,10 @@ defmodule SymphonyElixir.DispatchResolverTest do
           })
         )
 
-      assert {:dispatch, %Unit{kind: :doc_fix}} = result
+      assert {:dispatch, %Unit{kind: :code_review}} = result
 
-      # Mid-implementation (workpad has unchecked items): doc_fix must NOT
-      # fire even though doc_fix_required is true — the flag is dead.
+      # Mid-implementation (workpad has unchecked items): implement_subtask
+      # still wins regardless of stale flags.
       mid_workpad = """
       ## Codex Workpad
 
@@ -143,53 +153,14 @@ defmodule SymphonyElixir.DispatchResolverTest do
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = result_mid
     end
 
-    test "dispatches verify after doc_fix when all subtasks done" do
-      exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => nil, "last_accepted_unit" => %{"kind" => "doc_fix"}}
-
-      result =
-        DispatchResolver.resolve(
-          ctx(%{
-            exec: exec,
-            workpad_text: @workpad_all_done,
-            git_head: "abc123"
-          })
-        )
-
-      assert {:dispatch, %Unit{kind: :verify}} = result
-    end
-
-    test "dispatches verify when HEAD changed after verification" do
-      exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => "old_sha", "last_accepted_unit" => %{"kind" => "doc_fix"}}
-
-      result =
-        DispatchResolver.resolve(
-          ctx(%{
-            exec: exec,
-            workpad_text: @workpad_all_done,
-            git_head: "new_sha"
-          })
-        )
-
-      assert {:dispatch, %Unit{kind: :verify}} = result
-    end
-
-    test "dispatches handoff when verified and all done" do
-      exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => "abc123", "last_accepted_unit" => %{"kind" => "doc_fix"}}
-
-      result =
-        DispatchResolver.resolve(
-          ctx(%{
-            exec: exec,
-            workpad_text: @workpad_all_done,
-            git_head: "abc123"
-          })
-        )
-
-      assert {:dispatch, %Unit{kind: :handoff}} = result
-    end
-
     test "stops when handoff was last accepted" do
-      exec = %{@default_exec | "bootstrapped" => true, "last_verified_sha" => "abc123", "last_accepted_unit" => %{"kind" => "handoff"}}
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "clean",
+          "last_reviewed_sha" => "abc123",
+          "last_accepted_unit" => %{"kind" => "handoff"}
+      }
 
       result =
         DispatchResolver.resolve(
@@ -201,6 +172,284 @@ defmodule SymphonyElixir.DispatchResolverTest do
         )
 
       assert {:stop, :all_complete} = result
+    end
+  end
+
+  # Warm-session review loop — see docs/design/warm-session-review-loop.md.
+  # The state machine below replaces the old verify → code_review gate chain:
+  # after all plan subtasks are done, an implement↔review loop runs until the
+  # reviewer writes Verdict: clean (or review_round exceeds the cap).
+  describe "warm-session review loop" do
+    @workpad_clean_verdict """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] done
+    - [x] [plan-2] done
+
+    ### Code Review
+    - Reviewed SHA: abc123
+    - Findings: none
+    - Verdict: clean
+    """
+
+    @workpad_findings_verdict """
+    ## Codex Workpad
+
+    ### Plan
+    - [x] [plan-1] done
+
+    ### Code Review
+    - Reviewed SHA: abc123
+    - Findings: 2 HIGH
+    - Verdict: findings
+    """
+
+    test "dispatches code_review (first round) after all plan subtasks done" do
+      # Subtasks complete, no review ever ran. Loop entry point.
+      exec = %{@default_exec | "bootstrapped" => true, "last_accepted_unit" => %{"kind" => "doc_fix"}}
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_all_done,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :code_review}} = result
+    end
+
+    test "dispatches implement (resume) when review verdict is findings" do
+      # Reviewer wrote findings on the last round. Loop kicks back to the
+      # implement session; agent_runner will resume_session on the stored
+      # thread_id. subtask_id "review-fix" distinguishes this from the plan-N
+      # subtask cycle so PromptBuilder can inject the findings delta instead of
+      # the full workpad.
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "findings",
+          "review_round" => 1,
+          "last_reviewed_sha" => "abc123",
+          "implement_thread_id" => "thread-impl-1",
+          "review_thread_id" => "thread-rev-1"
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_findings_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "review-fix-1"}} = result
+    end
+
+    test "dispatches code_review (resume) when implement fixed the findings and HEAD advanced" do
+      # Implement session just committed fixes after a "findings" verdict.
+      # HEAD > last_reviewed_sha signals new code to examine; review_verdict
+      # stays "findings" until the next review turn updates it.
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "findings",
+          "review_round" => 1,
+          "last_reviewed_sha" => "abc123",
+          "implement_thread_id" => "thread-impl-1",
+          "review_thread_id" => "thread-rev-1",
+          "last_accepted_unit" => %{"kind" => "implement_subtask", "subtask_id" => "review-fix-1"}
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_findings_verdict,
+            git_head: "new_sha"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :code_review}} = result
+    end
+
+    test "dispatches doc_fix once review verdict is clean" do
+      # Clean verdict releases the loop. doc_fix runs its one-time sweep, then
+      # handoff.
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "clean",
+          "review_round" => 2,
+          "last_reviewed_sha" => "abc123",
+          "last_accepted_unit" => %{"kind" => "code_review"}
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_clean_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :doc_fix}} = result
+    end
+
+    test "dispatches handoff once verdict is clean and doc_fix_applied is set" do
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "clean",
+          "review_round" => 2,
+          "last_reviewed_sha" => "abc123",
+          # Flag is the authoritative gate: it survives a post-doc_fix
+          # re-review that shifts last_accepted_unit back to "code_review".
+          "doc_fix_applied" => true,
+          "last_accepted_unit" => %{"kind" => "doc_fix"}
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_clean_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :handoff}} = result
+    end
+
+    test "handoff rule refuses to fire when review_verdict is not clean" do
+      # Second gate (symmetric with handoff_rule pre-warm-session design): even
+      # if some other rule would try to advance, handoff refuses without a
+      # clean verdict.
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "findings",
+          "last_reviewed_sha" => "abc123"
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_findings_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      refute match?({:dispatch, %Unit{kind: :handoff}}, result)
+    end
+
+    test "escalates to {:stop, :review_exhausted} when review_round exceeds max" do
+      # If AI can't converge to clean within max_review_rounds, bail to human
+      # input rather than burn tokens forever. The orchestrator translates
+      # :review_exhausted to Human Input Needed upstream.
+      #
+      # Semantics: `max_review_rounds` = max FIX cycles. review_round bumps on
+      # each accepted review; strict > stops. With cap=5, rounds 1..5 get
+      # review-fix dispatch; round 6 → exhaustion. The test uses cap+1 to
+      # pin the boundary.
+      cap = SymphonyElixir.Config.max_review_rounds()
+
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "findings",
+          "review_round" => cap + 1,
+          "last_reviewed_sha" => "abc123"
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_findings_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:stop, :review_exhausted} = result
+    end
+
+    test "still dispatches review-fix at exactly max_review_rounds (boundary: N fix cycles allowed)" do
+      # Pin the off-by-one invariant: review_round == cap still gets a fix
+      # cycle. Exhaustion only at cap+1.
+      cap = SymphonyElixir.Config.max_review_rounds()
+
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "review_verdict" => "findings",
+          "review_round" => cap,
+          "last_reviewed_sha" => "abc123"
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_findings_verdict,
+            git_head: "abc123"
+          })
+        )
+
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: id}} = result
+      assert String.starts_with?(id, "review-fix-")
+    end
+
+    test "verify unit no longer appears in the :normal rule chain (regression guard)" do
+      # verify used to dispatch when plan was done + last_verified_sha was nil.
+      # Under warm-session, tests run inside the implement session and the
+      # only gate after plan completion is code_review. Any resurrection of
+      # the verify rule must surface here.
+      exec = %{
+        @default_exec
+        | "bootstrapped" => true,
+          "last_verified_sha" => nil,
+          "last_accepted_unit" => %{"kind" => "doc_fix"}
+      }
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_all_done,
+            git_head: "abc123"
+          })
+        )
+
+      refute match?({:dispatch, %Unit{kind: :verify}}, result)
+    end
+
+    test "verify-fix subtask is never dispatched under warm-session flow" do
+      # Previously verify_fix_rule fired on any non-nil verify_error. Under
+      # warm-session, verify failures are handled inside the implement session
+      # itself (warm context), never as a cold verify-fix-* subtask dispatch.
+      exec =
+        @default_exec
+        |> Map.merge(%{
+          "bootstrapped" => true,
+          "verify_error" => "some stale error text"
+        })
+
+      result =
+        DispatchResolver.resolve(
+          ctx(%{
+            exec: exec,
+            workpad_text: @workpad_all_done,
+            git_head: "abc123"
+          })
+        )
+
+      refute match?({:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _}}, result)
     end
   end
 
@@ -277,9 +526,11 @@ defmodule SymphonyElixir.DispatchResolverTest do
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-1"}} = result
     end
 
-    test "verify_fix wins over merge_sync when verify_error is set" do
-      # After merge-sync lands, if verify_error is still live from an earlier
-      # failure, fix the code first.
+    test "merge-sync wins even if stale verify_error lingers (warm-session: verify-fix never fires)" do
+      # Under warm-session, verify_fix_rule is gone from every rule table.
+      # A stale verify_error from an upgraded workspace must not hijack the
+      # merge flow; merge-sync takes precedence and tests are handled inside
+      # that session.
       exec =
         @default_exec
         |> Map.put("merge_conflict", true)
@@ -293,7 +544,7 @@ defmodule SymphonyElixir.DispatchResolverTest do
           })
         )
 
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} = result
+      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "merge-sync-1"}} = result
     end
   end
 
@@ -344,16 +595,17 @@ defmodule SymphonyElixir.DispatchResolverTest do
       assert {:dispatch, %Unit{kind: :implement_subtask}} = result
     end
 
-    test "after rework fix accepted, dispatches doc_fix then verify (not another fix)" do
-      # After rework fix → doc_fix first
+    test "after rework fix accepted, dispatches code_review (warm-session replaces doc_fix→verify chain)" do
+      # Warm-session: after rework fix lands, we go straight to code_review
+      # (no interstitial doc_fix or verify). Tests were run inside the rework
+      # session. Clean review eventually leads to doc_fix → handoff.
       exec =
         @default_exec
         |> Map.merge(%{
           "bootstrapped" => true,
           "phase" => "implementing",
           "last_accepted_unit" => %{"kind" => "implement_subtask", "subtask_id" => "rework-1"},
-          "rework_fix_applied" => true,
-          "last_verified_sha" => nil
+          "rework_fix_applied" => true
         })
 
       result =
@@ -366,22 +618,7 @@ defmodule SymphonyElixir.DispatchResolverTest do
           })
         )
 
-      assert {:dispatch, %Unit{kind: :doc_fix}} = result
-
-      # After doc_fix → verify
-      exec2 = Map.put(exec, "last_accepted_unit", %{"kind" => "doc_fix"})
-
-      result2 =
-        DispatchResolver.resolve(
-          ctx(%{
-            issue: %{state: "Rework"},
-            exec: exec2,
-            workpad_text: @workpad_all_done,
-            git_head: "abc123"
-          })
-        )
-
-      assert {:dispatch, %Unit{kind: :verify}} = result2
+      assert {:dispatch, %Unit{kind: :code_review}} = result
     end
   end
 

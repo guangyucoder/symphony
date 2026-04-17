@@ -141,7 +141,11 @@ defmodule SymphonyElixir.FailurePathTest do
       assert exec["verify_error"] == nil, "verify-fix must clear verify_error"
     end
 
-    test "verify_error triggers verify_fix_rule dispatch" do
+    test "stale verify_error does NOT trigger verify-fix under warm-session (rule deleted)" do
+      # Under warm-session, verify_fix_rule is removed. A stale verify_error
+      # from pre-warm-session exec state must not hijack dispatch. The
+      # ticket falls through to normal flow rules based on workpad +
+      # review_verdict state.
       exec = %{
         "mode" => "unit_lite",
         "phase" => "verifying",
@@ -149,7 +153,6 @@ defmodule SymphonyElixir.FailurePathTest do
         "last_accepted_unit" => %{"kind" => "doc_fix"},
         "bootstrapped" => true,
         "plan_version" => 1,
-        "last_verified_sha" => nil,
         "rework_fix_applied" => false,
         "verify_error" => "test/foo_test.exs:12 assertion failed",
         "verify_attempt" => 1
@@ -158,8 +161,10 @@ defmodule SymphonyElixir.FailurePathTest do
       workpad = "## Codex Workpad\n\n### Plan\n- [x] [plan-1] Done\n"
       ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: workpad, git_head: "abc"}
 
-      assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-1"}} =
+      refute match?(
+               {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "verify-fix-" <> _}},
                DispatchResolver.resolve(ctx)
+             )
     end
 
     test "exhaustion is recorded in ledger", %{workspace: ws} do
@@ -229,8 +234,10 @@ defmodule SymphonyElixir.FailurePathTest do
       assert {:dispatch, %Unit{kind: :plan}} = DispatchResolver.resolve(ctx)
     end
 
-    test "circuit breaker applies to all unit kinds" do
-      for kind <- ~w(bootstrap plan implement_subtask doc_fix verify handoff merge) do
+    test "circuit breaker applies to all currently-dispatchable unit kinds" do
+      # verify / verify-fix removed under warm-session — they're no longer in
+      # the dispatchable set. See docs/design/warm-session-review-loop.md.
+      for kind <- ~w(bootstrap plan implement_subtask doc_fix code_review handoff merge) do
         exec = %{@default_exec | "current_unit" => %{"kind" => kind, "subtask_id" => nil, "attempt" => 3}}
         ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: nil, git_head: "abc"}
         result = DispatchResolver.resolve(ctx)
@@ -501,15 +508,14 @@ defmodule SymphonyElixir.FailurePathTest do
       assert reason =~ "cannot verify HEAD state"
     end
 
-    test "flag blocks redundant rework fix dispatch" do
+    test "flag blocks redundant rework fix dispatch (warm-session: goes to code_review next)" do
       exec = %{
         "mode" => "unit_lite",
         "phase" => "implementing",
         "current_unit" => nil,
-        "last_accepted_unit" => %{"kind" => "doc_fix"},
+        "last_accepted_unit" => %{"kind" => "implement_subtask", "subtask_id" => "rework-1"},
         "bootstrapped" => true,
         "rework_fix_applied" => true,
-        "last_verified_sha" => nil,
         "plan_version" => 1
       }
 
@@ -523,20 +529,22 @@ defmodule SymphonyElixir.FailurePathTest do
       ctx = %{issue: %{state: "Rework"}, exec: exec, workpad_text: workpad, git_head: "abc"}
       result = DispatchResolver.resolve(ctx)
 
-      # Should dispatch verify (not another rework fix)
-      assert {:dispatch, %Unit{kind: :verify}} = result
+      # Under warm-session: after rework fix lands, code_review fires (not
+      # another rework, not verify which is deleted).
+      assert {:dispatch, %Unit{kind: :code_review}} = result
     end
   end
 
   # ──────────────────────────────────────────────────────────────────
-  # Invariant 5: doc_fix runs once before verify, not per-subtask
+  # Invariant 5: doc_fix runs once as a pre-handoff sweep (warm-session)
   #
-  # Finding: per-subtask doc_fix burned N×1.5M tokens for N subtasks.
-  # Invariant: doc_fix dispatches exactly once after all subtasks done,
-  #            and does not re-dispatch after verify/handoff.
+  # Under warm-session, doc_fix moved from pre-verify to pre-handoff: it
+  # fires only AFTER code_review lands a clean verdict. The N×1.5M token
+  # concern (per-subtask doc_fix) is unchanged — the rule still dispatches
+  # at most once per cycle.
   # ──────────────────────────────────────────────────────────────────
 
-  describe "doc_fix runs once before verify" do
+  describe "doc_fix runs once as pre-handoff sweep" do
     @doc_fix_exec %{
       "mode" => "unit_lite",
       "phase" => "implementing",
@@ -545,7 +553,10 @@ defmodule SymphonyElixir.FailurePathTest do
       "last_commit_sha" => nil,
       "last_verified_sha" => nil,
       "bootstrapped" => true,
-      "plan_version" => 1
+      "plan_version" => 1,
+      "review_verdict" => nil,
+      "review_round" => 0,
+      "last_reviewed_sha" => nil
     }
 
     @done_workpad """
@@ -554,30 +565,43 @@ defmodule SymphonyElixir.FailurePathTest do
     ### Plan
     - [x] [plan-1] Done
     - [x] [plan-2] Done
+
+    ### Code Review
+    - Verdict: clean
     """
 
-    test "dispatches doc_fix when last_accepted is implement_subtask" do
-      exec = Map.put(@doc_fix_exec, "last_accepted_unit", %{"kind" => "implement_subtask", "subtask_id" => "plan-2"})
+    test "dispatches doc_fix after code_review accepts clean verdict" do
+      exec =
+        @doc_fix_exec
+        |> Map.put("last_accepted_unit", %{"kind" => "code_review"})
+        |> Map.put("review_verdict", "clean")
+        |> Map.put("last_reviewed_sha", "abc")
+
       ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: @done_workpad, git_head: "abc"}
       assert {:dispatch, %Unit{kind: :doc_fix}} = DispatchResolver.resolve(ctx)
     end
 
-    test "does NOT re-dispatch after doc_fix accepted" do
-      exec = Map.put(@doc_fix_exec, "last_accepted_unit", %{"kind" => "doc_fix"})
-      ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: @done_workpad, git_head: "abc"}
-      # Should go to verify, not doc_fix again
-      assert {:dispatch, %Unit{kind: :verify}} = DispatchResolver.resolve(ctx)
-    end
-
-    test "does NOT re-dispatch after verify accepted" do
+    test "does NOT re-dispatch after doc_fix accepted (handoff fires instead)" do
       exec =
         @doc_fix_exec
-        |> Map.put("last_accepted_unit", %{"kind" => "verify"})
-        |> Map.put("last_verified_sha", "old")
+        |> Map.put("last_accepted_unit", %{"kind" => "doc_fix"})
+        |> Map.put("review_verdict", "clean")
+        |> Map.put("last_reviewed_sha", "abc")
+        # Authoritative gate that closeout sets; scrape on last_accepted_unit is fallback.
+        |> Map.put("doc_fix_applied", true)
 
       ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: @done_workpad, git_head: "abc"}
-      # HEAD differs from verified → verify again, not doc_fix
-      assert {:dispatch, %Unit{kind: :verify}} = DispatchResolver.resolve(ctx)
+      assert {:dispatch, %Unit{kind: :handoff}} = DispatchResolver.resolve(ctx)
+    end
+
+    test "does NOT dispatch before review (first dispatch after plan completes is code_review)" do
+      exec =
+        @doc_fix_exec
+        |> Map.put("last_accepted_unit", %{"kind" => "implement_subtask", "subtask_id" => "plan-2"})
+
+      ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: @done_workpad, git_head: "abc"}
+      # All subtasks done, no review yet → code_review first, NOT doc_fix
+      assert {:dispatch, %Unit{kind: :code_review}} = DispatchResolver.resolve(ctx)
     end
 
     test "does NOT dispatch per-subtask (mid-implementation)" do
@@ -592,7 +616,6 @@ defmodule SymphonyElixir.FailurePathTest do
       """
 
       ctx = %{issue: %{state: "In Progress"}, exec: exec, workpad_text: partial_workpad, git_head: "abc"}
-      # Should dispatch plan-2, not doc_fix
       assert {:dispatch, %Unit{kind: :implement_subtask, subtask_id: "plan-2"}} = DispatchResolver.resolve(ctx)
     end
   end
@@ -751,16 +774,22 @@ defmodule SymphonyElixir.FailurePathTest do
              "in-flight rework-1 must replay for circuit breaker correctness"
     end
 
-    test "unexpected current_unit kind triggers narrow :stale cleanup only" do
+    test "unexpected current_unit kind triggers :stale cleanup that also resets warm-session state" do
       # Defensive branch — corrupted exec with non-standard kind should
-      # still let the orchestrator make forward progress.
+      # still let the orchestrator make forward progress AND not leak
+      # stale warm-session threads / verdicts / flags into the next cycle.
+      # Iter3 Lens3 observation: the narrow stale cleanup was preserving
+      # stale implement_thread_id / review_thread_id from the prior cycle,
+      # so a subsequent plan-1 would resume the wrong conversation.
       exec =
         @base_exec
         |> Map.merge(%{
           "current_unit" => %{"kind" => "bootstrap", "attempt" => 1, "subtask_id" => nil},
           "last_accepted_unit" => %{"kind" => "plan"},
           "rework_fix_applied" => true,
-          "last_verified_sha" => "abc123"
+          "last_verified_sha" => "abc123",
+          "implement_thread_id" => "thread-pre-rework",
+          "review_verdict" => "clean"
         })
 
       result = AgentRunner.plan_rework_entry_cleanup(exec)
@@ -768,9 +797,12 @@ defmodule SymphonyElixir.FailurePathTest do
       assert result.action == :stale
       assert result.updates["current_unit"] == nil
       assert result.updates["last_verified_sha"] == nil
-
-      refute Map.has_key?(result.updates, "rework_fix_applied"),
-             "stale cleanup must NOT clear rework_fix_applied — that's fresh-only behavior"
+      # Stale cleanup now uses the same shared field set as :fresh. Stale
+      # state at Rework entry means the prior cycle was interrupted
+      # unexpectedly; warm-session threads from that cycle must not leak.
+      assert result.updates["rework_fix_applied"] == false
+      assert result.updates["implement_thread_id"] == nil
+      assert result.updates["review_verdict"] == nil
     end
 
     test "end-to-end: stale handoff → fresh_rework reset → rework_fix_rule fires" do
