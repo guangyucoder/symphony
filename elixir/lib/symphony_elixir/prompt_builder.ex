@@ -9,9 +9,11 @@ defmodule SymphonyElixir.PromptBuilder do
 
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
+    workflow_path = Keyword.get(opts, :workflow_path)
+
     template =
-      Workflow.current()
-      |> prompt_template!()
+      (if is_binary(workflow_path), do: Workflow.load(workflow_path), else: Workflow.current())
+      |> prompt_template!(workflow_path)
       |> parse_template!()
 
     template
@@ -25,9 +27,13 @@ defmodule SymphonyElixir.PromptBuilder do
     |> IO.iodata_to_binary()
   end
 
-  defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)
+  defp prompt_template!({:ok, %{prompt_template: prompt}}, workflow_path) when is_binary(workflow_path) do
+    if String.trim(prompt) == "", do: raise(RuntimeError, "stage_workflow_empty_body: #{workflow_path}"), else: prompt
+  end
 
-  defp prompt_template!({:error, reason}) do
+  defp prompt_template!({:ok, %{prompt_template: prompt}}, _workflow_path), do: default_prompt(prompt)
+
+  defp prompt_template!({:error, reason}, _workflow_path) do
     raise RuntimeError, "workflow_unavailable: #{inspect(reason)}"
   end
 
