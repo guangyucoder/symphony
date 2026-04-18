@@ -1,6 +1,55 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule FakeStageOrchestrator do
+    def next_stage(workpad, linear_state, workspace_path) do
+      notify({:stage_next_stage, workpad, linear_state, workspace_path})
+      Application.get_env(:symphony_elixir, :fake_stage_next_stage_result, :implement)
+    end
+
+    defp notify(message) do
+      case Application.get_env(:symphony_elixir, :fake_stage_test_recipient) do
+        pid when is_pid(pid) -> send(pid, message)
+        _ -> :ok
+      end
+    end
+  end
+
+  defmodule FakeAgentRunner do
+    def run(issue, recipient, opts) do
+      case Application.get_env(:symphony_elixir, :fake_stage_test_recipient) do
+        pid when is_pid(pid) -> send(pid, {:agent_runner_run, issue, recipient, opts})
+        _ -> :ok
+      end
+
+      :ok
+    end
+  end
+
+  defmodule FakeStageCloseout do
+    def check_review(workspace_path, workpad_text, dispatch_head_sha, issue_identifier) do
+      notify({:stage_closeout_review, workspace_path, workpad_text, dispatch_head_sha, issue_identifier})
+      Application.get_env(:symphony_elixir, :fake_stage_closeout_review_result, :ok)
+    end
+
+    def check_doc_fix(workspace_path, workpad_text, issue_identifier) do
+      notify({:stage_closeout_doc_fix, workspace_path, workpad_text, issue_identifier})
+      Application.get_env(:symphony_elixir, :fake_stage_closeout_doc_fix_result, :ok)
+    end
+
+    def check_implement(workspace_path, workpad_text, issue_identifier) do
+      notify({:stage_closeout_implement, workspace_path, workpad_text, issue_identifier})
+      Application.get_env(:symphony_elixir, :fake_stage_closeout_implement_result, :ok)
+    end
+
+    defp notify(message) do
+      case Application.get_env(:symphony_elixir, :fake_stage_test_recipient) do
+        pid when is_pid(pid) -> send(pid, message)
+        _ -> :ok
+      end
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -551,6 +600,147 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
+    assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "orchestrator evaluates next stage before dispatching a ticket" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_stage_orchestrator = Application.get_env(:symphony_elixir, :stage_orchestrator_module)
+    previous_stage_closeout = Application.get_env(:symphony_elixir, :stage_closeout_module)
+    previous_agent_runner = Application.get_env(:symphony_elixir, :orchestrator_agent_runner_module)
+    previous_stage_recipient = Application.get_env(:symphony_elixir, :fake_stage_test_recipient)
+    previous_next_stage = Application.get_env(:symphony_elixir, :fake_stage_next_stage_result)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:stage_orchestrator_module, previous_stage_orchestrator)
+      restore_app_env(:stage_closeout_module, previous_stage_closeout)
+      restore_app_env(:orchestrator_agent_runner_module, previous_agent_runner)
+      restore_app_env(:fake_stage_test_recipient, previous_stage_recipient)
+      restore_app_env(:fake_stage_next_stage_result, previous_next_stage)
+    end)
+
+    issue = %Issue{
+      id: "issue-stage-dispatch",
+      identifier: "MT-562",
+      title: "Dispatch through stage orchestrator",
+      description: "## Workpad\n",
+      state: "In Progress"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :stage_orchestrator_module, FakeStageOrchestrator)
+    Application.put_env(:symphony_elixir, :stage_closeout_module, FakeStageCloseout)
+    Application.put_env(:symphony_elixir, :orchestrator_agent_runner_module, FakeAgentRunner)
+    Application.put_env(:symphony_elixir, :fake_stage_test_recipient, self())
+    Application.put_env(:symphony_elixir, :fake_stage_next_stage_result, :review)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    orchestrator_name = Module.concat(__MODULE__, :StageDispatchOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_receive {:stage_next_stage, "## Workpad\n", "In Progress", workspace_path}, 1_000
+    assert {:ok, ^workspace_path} = Workspace.path_for_issue(issue)
+    assert_receive {:agent_runner_run, ^issue, ^pid, opts}, 1_000
+    assert Keyword.get(opts, :attempt) == nil
+    assert Keyword.get(opts, :worker_host) == nil
+    assert Keyword.get(opts, :max_turns) == 1
+
+    assert Keyword.get(opts, :workflow_path) ==
+             Path.join(Path.dirname(Workflow.workflow_file_path()), "WORKFLOW-review.md")
+  end
+
+  test "closeout failure moves the issue to Rework and appends narration to the workpad" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_stage_closeout = Application.get_env(:symphony_elixir, :stage_closeout_module)
+    previous_stage_recipient = Application.get_env(:symphony_elixir, :fake_stage_test_recipient)
+    previous_closeout_result = Application.get_env(:symphony_elixir, :fake_stage_closeout_review_result)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+      restore_app_env(:stage_closeout_module, previous_stage_closeout)
+      restore_app_env(:fake_stage_test_recipient, previous_stage_recipient)
+      restore_app_env(:fake_stage_closeout_review_result, previous_closeout_result)
+    end)
+
+    refreshed_issue = %Issue{
+      id: "issue-closeout",
+      identifier: "MT-563",
+      title: "Handle closeout failure",
+      description: "Fresh workpad\n<!-- SYMPHONY-MARKERS-BEGIN -->\n<!-- SYMPHONY-MARKERS-END -->\n",
+      state: "In Progress"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [refreshed_issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    Application.put_env(:symphony_elixir, :stage_closeout_module, FakeStageCloseout)
+    Application.put_env(:symphony_elixir, :fake_stage_test_recipient, self())
+
+    Application.put_env(
+      :symphony_elixir,
+      :fake_stage_closeout_review_result,
+      {:error, {:working_tree_dirty, ["?? scratch.txt"]}}
+    )
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = refreshed_issue.id
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CloseoutFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: refreshed_issue.identifier,
+      issue: %{refreshed_issue | description: "stale workpad"},
+      stage: :review,
+      dispatch_head_sha: String.duplicate("a", 40),
+      workspace_path: "/tmp/stage-workspace",
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+
+    assert_receive {:stage_closeout_review, "/tmp/stage-workspace", workpad_text, dispatch_head_sha, "MT-563"}, 1_000
+    assert workpad_text =~ "Fresh workpad"
+    assert dispatch_head_sha == String.duplicate("a", 40)
+    assert_receive {:memory_tracker_state_update, "issue-closeout", "Rework"}, 1_000
+    assert_receive {:memory_tracker_description_update, "issue-closeout", updated_workpad}, 1_000
+    assert updated_workpad =~ "Fresh workpad"
+    assert updated_workpad =~ "Symphony closeout failure"
+    assert updated_workpad =~ "stage: review"
+    assert updated_workpad =~ "gate_failed: working_tree_dirty"
+    assert updated_workpad =~ "reason: {:working_tree_dirty, [\"?? scratch.txt\"]}"
+
+    state = :sys.get_state(pid)
+
+    assert MapSet.member?(state.completed, issue_id)
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 

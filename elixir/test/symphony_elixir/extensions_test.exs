@@ -193,12 +193,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert :ok = SymphonyElixir.Tracker.update_issue_description("issue-1", "updated workpad")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_description_update, "issue-1", "updated workpad"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
+    assert :ok = Memory.update_issue_description("issue-1", "quiet workpad")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
@@ -228,6 +231,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put(
       {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.update_issue_description("issue-1", "updated workpad")
+
+    assert_receive {:graphql_called, update_description_query, %{description: "updated workpad", issueId: "issue-1"}}
+
+    assert update_description_query =~ "issueUpdate"
+    assert update_description_query =~ "description"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
       {:ok, %{"data" => %{"commentCreate" => %{"success" => false}}}}
     )
 
@@ -238,11 +253,21 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:error, :boom} = Adapter.create_comment("issue-1", "boom")
 
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :boom})
+
+    assert {:error, :boom} = Adapter.update_issue_description("issue-1", "boom workpad")
+
     Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "weird")
 
+    Process.put({FakeLinearClient, :graphql_result}, {:ok, %{"data" => %{}}})
+    assert {:error, :issue_update_failed} = Adapter.update_issue_description("issue-1", "weird workpad")
+
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+    assert {:error, :issue_update_failed} = Adapter.update_issue_description("issue-1", "odd workpad")
 
     Process.put(
       {FakeLinearClient, :graphql_results},

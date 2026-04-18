@@ -10,6 +10,14 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
 
+  @spec path_for_issue(map() | String.t() | nil, worker_host()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def path_for_issue(issue_or_identifier, worker_host \\ nil) do
+    issue_context = issue_context(issue_or_identifier)
+    safe_id = safe_identifier(issue_context.issue_identifier)
+    workspace_path_for_issue(safe_id, worker_host)
+  end
+
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do

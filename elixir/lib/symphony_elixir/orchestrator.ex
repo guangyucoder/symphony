@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StageCloseout, StageOrchestrator, StatusDashboard, Tracker, Workflow, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -133,6 +133,7 @@ defmodule SymphonyElixir.Orchestrator do
           case reason do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+              maybe_handle_stage_closeout_failure(running_entry)
 
               state
               |> complete_issue(issue_id)
@@ -691,54 +692,96 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
-         end) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
+    case stage_dispatch_context(issue, worker_host) do
+      {:ok, stage, workspace_path, dispatch_head_sha} ->
+        case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+               agent_runner_module().run(
+                 issue,
+                 recipient,
+                 Keyword.merge(
+                   [attempt: attempt, worker_host: worker_host],
+                   stage_dispatch_opts(stage)
+                 )
+               )
+             end) do
+          {:ok, pid} ->
+            ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+            Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"} stage=#{stage}")
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
+            running =
+              Map.put(state.running, issue.id, %{
+                pid: pid,
+                ref: ref,
+                identifier: issue.identifier,
+                issue: issue,
+                stage: stage,
+                dispatch_head_sha: dispatch_head_sha,
+                worker_host: worker_host,
+                workspace_path: workspace_path,
+                session_id: nil,
+                last_codex_message: nil,
+                last_codex_timestamp: nil,
+                last_codex_event: nil,
+                codex_app_server_pid: nil,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                codex_last_reported_input_tokens: 0,
+                codex_last_reported_output_tokens: 0,
+                codex_last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: normalize_retry_attempt(attempt),
+                started_at: DateTime.utc_now()
+              })
 
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+            %{
+              state
+              | running: running,
+                claimed: MapSet.put(state.claimed, issue.id),
+                retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            }
+
+          {:error, reason} ->
+            Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
+            next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+            schedule_issue_retry(state, issue.id, next_attempt, %{
+              identifier: issue.identifier,
+              error: "failed to spawn agent: #{inspect(reason)}",
+              worker_host: worker_host,
+              workspace_path: workspace_path
+            })
+        end
+
+      :stop ->
+        Logger.info("Skipping dispatch after stage evaluation: #{issue_context(issue)}")
+        state
 
       {:error, reason} ->
-        Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
+        Logger.error("Unable to prepare stage dispatch for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
-          error: "failed to spawn agent: #{inspect(reason)}",
+          error: "failed to prepare stage dispatch: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
+  end
+
+  defp stage_dispatch_context(%Issue{} = issue, worker_host) do
+    with {:ok, workspace_path} <- Workspace.path_for_issue(issue, worker_host) do
+      stage = stage_orchestrator_module().next_stage(issue.description, issue.state, workspace_path)
+
+      case stage do
+        :stop ->
+          :stop
+
+        _ ->
+          dispatch_head_sha = if stage == :review, do: workspace_head(workspace_path), else: nil
+          {:ok, stage, workspace_path, dispatch_head_sha}
+      end
     end
   end
 
@@ -900,6 +943,125 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
+  defp maybe_handle_stage_closeout_failure(running_entry) when is_map(running_entry) do
+    case run_stage_closeout(running_entry) do
+      {:error, issue, stage, reason} ->
+        Logger.warning("Stage closeout failed for #{issue_context(issue)} stage=#{stage} reason=#{inspect(reason)}; moving issue to Rework")
+        move_issue_to_rework(issue, stage, reason)
+
+      :ok ->
+        :ok
+    end
+  end
+
+  defp maybe_handle_stage_closeout_failure(_running_entry), do: :ok
+
+  defp run_stage_closeout(running_entry) do
+    issue = refresh_issue_for_closeout(running_entry)
+    stage = Map.get(running_entry, :stage, :implement)
+    workspace_path = Map.get(running_entry, :workspace_path)
+    issue_identifier = issue.identifier || Map.get(running_entry, :identifier)
+    workpad_text = issue.description || ""
+
+    result =
+      case stage do
+        :review ->
+          stage_closeout_module().check_review(
+            workspace_path,
+            workpad_text,
+            Map.get(running_entry, :dispatch_head_sha),
+            issue_identifier
+          )
+
+        :doc_fix ->
+          stage_closeout_module().check_doc_fix(workspace_path, workpad_text, issue_identifier)
+
+        _ ->
+          stage_closeout_module().check_implement(workspace_path, workpad_text, issue_identifier)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, issue, stage, reason}
+    end
+  end
+
+  defp refresh_issue_for_closeout(%{issue: %Issue{id: issue_id} = issue})
+       when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> refreshed_issue
+      _ -> issue
+    end
+  end
+
+  defp refresh_issue_for_closeout(%{issue: %Issue{} = issue}), do: issue
+  defp refresh_issue_for_closeout(_running_entry), do: %Issue{}
+
+  defp move_issue_to_rework(%Issue{id: issue_id} = issue, stage, reason) when is_binary(issue_id) do
+    narration = closeout_failure_narration(stage, reason)
+
+    case Tracker.update_issue_state(issue_id, "Rework") do
+      :ok ->
+        :ok
+
+      {:error, tracker_reason} ->
+        Logger.warning("Failed to move issue to Rework after closeout failure: #{inspect(tracker_reason)}")
+    end
+
+    case Tracker.update_issue_description(issue_id, append_closeout_narration(issue.description, narration)) do
+      :ok ->
+        :ok
+
+      {:error, tracker_reason} ->
+        Logger.warning("Failed to append closeout narration to workpad: #{inspect(tracker_reason)}")
+    end
+  end
+
+  defp move_issue_to_rework(_issue, _stage, _reason), do: :ok
+
+  defp closeout_failure_narration(stage, reason) do
+    """
+    Symphony closeout failure
+    stage: #{stage}
+    gate_failed: #{reason |> elem(0) |> to_string()}
+    reason: #{inspect(reason)}
+    """
+    |> String.trim_trailing()
+  end
+
+  defp append_closeout_narration(description, narration) when is_binary(description) do
+    suffix =
+      case String.trim_trailing(description) do
+        "" -> narration
+        trimmed -> trimmed <> "\n\n" <> narration
+      end
+
+    suffix <> "\n"
+  end
+
+  defp append_closeout_narration(_description, narration), do: narration <> "\n"
+
+  defp workspace_head(workspace_path) when is_binary(workspace_path) do
+    case System.cmd("git", ["rev-parse", "HEAD"], cd: workspace_path, stderr_to_stdout: true) do
+      {head, 0} -> String.trim(head)
+      _ -> nil
+    end
+  end
+
+  defp workspace_head(_workspace_path), do: nil
+
+  defp stage_dispatch_opts(:implement) do
+    [workflow_path: Workflow.workflow_file_path(), max_turns: 1]
+  end
+
+  defp stage_dispatch_opts(:review) do
+    [workflow_path: Path.join(Path.dirname(Workflow.workflow_file_path()), "WORKFLOW-review.md"), max_turns: 1]
+  end
+
+  defp stage_dispatch_opts(:doc_fix) do
+    [workflow_path: Path.join(Path.dirname(Workflow.workflow_file_path()), "WORKFLOW-docfix.md"), max_turns: 1]
+  end
+
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
@@ -962,6 +1124,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
+  end
+
+  defp stage_orchestrator_module do
+    Application.get_env(:symphony_elixir, :stage_orchestrator_module, StageOrchestrator)
+  end
+
+  defp stage_closeout_module do
+    Application.get_env(:symphony_elixir, :stage_closeout_module, StageCloseout)
+  end
+
+  defp agent_runner_module do
+    Application.get_env(:symphony_elixir, :orchestrator_agent_runner_module, AgentRunner)
   end
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry

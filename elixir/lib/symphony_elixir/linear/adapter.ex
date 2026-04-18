@@ -15,6 +15,14 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @update_description_mutation """
+  mutation SymphonyUpdateIssueDescription($issueId: String!, $description: String!) {
+    issueUpdate(id: $issueId, input: {description: $description}) {
+      success
+    }
+  }
+  """
+
   @update_state_mutation """
   mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
     issueUpdate(id: $issueId, input: {stateId: $stateId}) {
@@ -55,6 +63,23 @@ defmodule SymphonyElixir.Linear.Adapter do
       false -> {:error, :comment_create_failed}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :comment_create_failed}
+    end
+  end
+
+  @spec update_issue_description(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_issue_description(issue_id, description)
+      when is_binary(issue_id) and is_binary(description) do
+    with {:ok, response} <-
+           client_module().graphql(
+             @update_description_mutation,
+             %{issueId: issue_id, description: description}
+           ),
+         true <- get_in(response, ["data", "issueUpdate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :issue_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :issue_update_failed}
     end
   end
 
