@@ -201,6 +201,21 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec run_after_implement_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+          :ok | :skip | {:error, term()}
+  def run_after_implement_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.after_implement do
+      nil ->
+        :skip
+
+      command ->
+        run_hook(command, workspace, issue_context, "after_implement", worker_host)
+    end
+  end
+
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.settings!().workspace.root
     |> Path.join(safe_id)

@@ -4,6 +4,17 @@ defmodule SymphonyElixir.MarkerParser do
   defmodule Marker do
     @enforce_keys [:kind, :round_id, :stage_round, :reviewed_sha, :issue_identifier]
     defstruct @enforce_keys ++ [:verdict, :findings, :docfix_outcome]
+
+    @type t :: %__MODULE__{
+            kind: :review_request | :code_review | :docs_checked,
+            round_id: pos_integer(),
+            stage_round: pos_integer(),
+            reviewed_sha: String.t(),
+            issue_identifier: String.t(),
+            verdict: :clean | :findings | nil,
+            findings: [map()] | nil,
+            docfix_outcome: :no_updates | :updated | nil
+          }
   end
 
   @region_regex ~r/<!--\s*SYMPHONY-MARKERS-BEGIN\s*-->(.*?)<!--\s*SYMPHONY-MARKERS-END\s*-->/ms
@@ -18,6 +29,7 @@ defmodule SymphonyElixir.MarkerParser do
   @docfix_outcomes %{"no-updates" => :no_updates, "updated" => :updated}
   @severities %{"high" => :high, "medium" => :medium, "low" => :low}
 
+  @spec parse(String.t(), String.t()) :: [Marker.t()]
   def parse(workpad, issue_identifier) when is_binary(workpad) and is_binary(issue_identifier) do
     case Regex.run(@region_regex, workpad, capture: :all_but_first) do
       [region] ->
@@ -35,6 +47,7 @@ defmodule SymphonyElixir.MarkerParser do
     end
   end
 
+  @spec review_pending?([Marker.t()]) :: boolean()
   def review_pending?(markers) do
     case current_round(markers)
          |> Enum.filter(&(&1.kind in [:review_request, :code_review]))
@@ -44,12 +57,14 @@ defmodule SymphonyElixir.MarkerParser do
     end
   end
 
+  @spec latest_code_review([Marker.t()]) :: Marker.t() | nil
   def latest_code_review(markers) do
     current_round(markers)
     |> Enum.filter(&match?(%Marker{kind: :code_review}, &1))
     |> List.last()
   end
 
+  @spec latest_review_sha([Marker.t()]) :: String.t() | nil
   def latest_review_sha(markers) do
     case latest_code_review(markers) do
       %Marker{verdict: :clean, reviewed_sha: reviewed_sha} -> reviewed_sha
@@ -57,6 +72,7 @@ defmodule SymphonyElixir.MarkerParser do
     end
   end
 
+  @spec docs_checked_matches_review?([Marker.t()]) :: boolean()
   def docs_checked_matches_review?(markers) do
     case latest_review_sha(markers) do
       nil ->

@@ -23,6 +23,12 @@ hooks:
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
+  after_implement: |
+    if command -v mise >/dev/null 2>&1; then
+      cd elixir && mise exec -- mix test
+    else
+      cd elixir && mix test
+    fi
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
@@ -101,6 +107,17 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `pull`: keep branch updated with latest `origin/main` before handoff.
 - `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
 
+## Stage-chain handoff
+
+- Keep the existing `## Codex Workpad` artifact and preserve a bounded marker section inside it:
+  - `<!-- SYMPHONY-MARKERS-BEGIN -->`
+  - `<!-- SYMPHONY-MARKERS-END -->`
+- Markers are machine-owned data. Keep all free-form notes outside that bounded section.
+- When creating or reconciling the workpad, ensure the bounded marker section exists even if it is empty.
+- Normal implement mode (`Todo`, `In Progress`, or findings-driven rework while the issue stays active): after the branch is pushed and `git status --porcelain` is empty, stop the turn without writing a `review-request` marker. Symphony will run the repo's standard post-implement check and append `review-request` automatically if it passes.
+- Handoff mode: if the current round already has a clean `code-review` plus matching `docs-checked` for the current `HEAD`, run the final PR/check sweep and move the issue to `Human Review`.
+- Rework mode keeps ownership of branch reset / archival / state-reset steps in this prompt. Do not delete the bounded marker section during rework.
+
 ## Status map
 
 - `Backlog` -> out of scope for this workflow; do not modify.
@@ -142,6 +159,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
     - If found, reuse that comment; do not create a new workpad comment.
     - If not found, create one workpad comment and use it for all updates.
     - Persist the workpad comment ID and only write progress updates to that ID.
+    - Ensure the bounded marker section exists in the workpad before continuing.
 2.  If arriving from `Todo`, do not delay on additional status transitions: the issue should already be `In Progress` before this step begins.
 3.  Immediately reconcile the workpad before new edits:
     - Check off items that are already done.
@@ -209,6 +227,7 @@ Use this only when completion is blocked by missing required tools or missing au
 5.  Run validation/tests required for the scope.
     - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
     - Prefer a targeted proof that directly demonstrates the behavior you changed.
+    - Symphony will run the repo's standard post-implement check after the turn. Use in-turn validation for targeted proof, ticket-specific requirements, and quick iteration before you push.
     - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
     - Revert every temporary proof edit before commit/push.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
@@ -224,16 +243,20 @@ Use this only when completion is blocked by missing required tools or missing au
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
-11. Before moving to `Human Review`, poll PR feedback and checks:
+11. Before ending a normal implement turn:
+    - Ensure the branch is pushed, the workpad is current, and `git status --porcelain` is empty.
+    - Do not move the issue to `Human Review` yet.
+    - Stop the turn and let Symphony run the configured post-implement check plus automatic `review-request` handoff.
+12. Handoff mode only: before moving to `Human Review`, poll PR feedback and checks:
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
     - Run the full PR feedback sweep protocol.
     - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
+13. Only then move issue to `Human Review`.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-13. For `Todo` tickets that already had a PR attached at kickoff:
+14. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
     - Then move to `Human Review`.
@@ -252,11 +275,11 @@ Use this only when completion is blocked by missing required tools or missing au
 1. Treat `Rework` as a full approach reset, not incremental patching.
 2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
 3. Close the existing PR tied to the issue.
-4. Remove the existing `## Codex Workpad` comment from the issue.
+4. Keep the existing `## Codex Workpad` artifact, preserve the bounded marker section, and refresh the free-form plan/notes in place.
 5. Create a fresh branch from `origin/main`.
 6. Start over from the normal kickoff flow:
    - If current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state.
-   - Create a new bootstrap `## Codex Workpad` comment.
+   - Reconcile the existing workpad and bounded marker section instead of creating a new one.
    - Build a fresh plan/checklist and execute end-to-end.
 
 ## Completion bar before Human Review
@@ -278,6 +301,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
 - If comment editing is unavailable in-session, use the update script. Only report blocked if both MCP editing and script-based editing are unavailable.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
+- Keep the bounded `SYMPHONY-MARKERS` section intact; never put free-form notes inside it.
 - If out-of-scope improvements are found, create a separate Backlog issue rather
   than expanding current scope, and include a clear
   title/description/acceptance criteria, same-project assignment, a `related`
@@ -323,4 +347,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 ### Confusions
 
 - <only include when something was confusing during execution>
+
+<!-- SYMPHONY-MARKERS-BEGIN -->
+<!-- SYMPHONY-MARKERS-END -->
 ````

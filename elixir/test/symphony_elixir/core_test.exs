@@ -157,6 +157,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
+    assert Map.get(hooks, "after_implement") =~ "cd elixir && mise exec -- mix test"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
@@ -744,6 +745,190 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "implement success runs after_implement hook and appends review-request marker" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_stage_closeout = Application.get_env(:symphony_elixir, :stage_closeout_module)
+    previous_stage_recipient = Application.get_env(:symphony_elixir, :fake_stage_test_recipient)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+      restore_app_env(:stage_closeout_module, previous_stage_closeout)
+      restore_app_env(:fake_stage_test_recipient, previous_stage_recipient)
+    end)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-implement-handoff-success-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-implement-success"
+
+    try do
+      workspace_path = init_git_repo!(test_root)
+      head = git!(workspace_path, ["rev-parse", "HEAD"]) |> String.trim()
+
+      refreshed_issue = %Issue{
+        id: issue_id,
+        identifier: "MT-700",
+        title: "Successful implement handoff",
+        description: workpad_fixture("Fresh workpad"),
+        state: "In Progress"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [refreshed_issue])
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :stage_closeout_module, FakeStageCloseout)
+      Application.put_env(:symphony_elixir, :fake_stage_test_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        hook_after_implement: "git rev-parse HEAD >/dev/null"
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :ImplementHandoffSuccessOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: refreshed_issue.identifier,
+        issue: %{refreshed_issue | description: "stale workpad"},
+        stage: :implement,
+        workspace_path: workspace_path,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, running_entry.ref, :process, self(), :normal})
+
+      assert_receive {:stage_closeout_implement, ^workspace_path, workpad_text, "MT-700"}, 1_000
+      assert workpad_text =~ "Fresh workpad"
+      assert_receive {:memory_tracker_description_update, ^issue_id, updated_workpad}, 1_000
+      assert updated_workpad =~ "Fresh workpad"
+      assert updated_workpad =~ "kind: review-request"
+      assert updated_workpad =~ "round_id: 1"
+      assert updated_workpad =~ "stage_round: 1"
+      assert updated_workpad =~ "reviewed_sha: #{head}"
+      assert updated_workpad =~ "issue_identifier: MT-700"
+      refute_received {:memory_tracker_state_update, ^issue_id, _}
+
+      state = :sys.get_state(pid)
+      assert MapSet.member?(state.completed, issue_id)
+      assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+      assert_due_in_range(due_at_ms, 500, 1_100)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "implement handoff failure appends narration and leaves the issue active" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    previous_stage_closeout = Application.get_env(:symphony_elixir, :stage_closeout_module)
+    previous_stage_recipient = Application.get_env(:symphony_elixir, :fake_stage_test_recipient)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+      restore_app_env(:stage_closeout_module, previous_stage_closeout)
+      restore_app_env(:fake_stage_test_recipient, previous_stage_recipient)
+    end)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-implement-handoff-failure-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-implement-failure"
+
+    try do
+      workspace_path = init_git_repo!(test_root)
+
+      refreshed_issue = %Issue{
+        id: issue_id,
+        identifier: "MT-701",
+        title: "Failed implement handoff",
+        description: workpad_fixture("Fresh workpad"),
+        state: "In Progress"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [refreshed_issue])
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :stage_closeout_module, FakeStageCloseout)
+      Application.put_env(:symphony_elixir, :fake_stage_test_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        hook_after_implement: "echo test-failed && exit 17"
+      )
+
+      orchestrator_name = Module.concat(__MODULE__, :ImplementHandoffFailureOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: make_ref(),
+        identifier: refreshed_issue.identifier,
+        issue: %{refreshed_issue | description: "stale workpad"},
+        stage: :implement,
+        workspace_path: workspace_path,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, running_entry.ref, :process, self(), :normal})
+
+      assert_receive {:stage_closeout_implement, ^workspace_path, workpad_text, "MT-701"}, 1_000
+      assert workpad_text =~ "Fresh workpad"
+      assert_receive {:memory_tracker_description_update, ^issue_id, updated_workpad}, 1_000
+      assert updated_workpad =~ "Fresh workpad"
+      assert updated_workpad =~ "Symphony implement handoff blocked"
+      assert updated_workpad =~ "stage: implement"
+      assert updated_workpad =~ ~s(reason: {:workspace_hook_failed, "after_implement", 17, "test-failed\\n"})
+      refute updated_workpad =~ "kind: review-request"
+      refute_received {:memory_tracker_state_update, ^issue_id, _}
+
+      state = :sys.get_state(pid)
+      assert MapSet.member?(state.completed, issue_id)
+      assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+      assert_due_in_range(due_at_ms, 500, 1_100)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -949,6 +1134,36 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp workpad_fixture(note) do
+    """
+    ## Codex Workpad
+
+    #{note}
+
+    <!-- SYMPHONY-MARKERS-BEGIN -->
+    <!-- SYMPHONY-MARKERS-END -->
+    """
+  end
+
+  defp init_git_repo!(test_root) do
+    workspace_path = Path.join(test_root, "workspace")
+    File.mkdir_p!(workspace_path)
+    File.write!(Path.join(workspace_path, "README.md"), "# handoff\n")
+    git!(workspace_path, ["init", "-b", "main"])
+    git!(workspace_path, ["config", "user.name", "Test User"])
+    git!(workspace_path, ["config", "user.email", "test@example.com"])
+    git!(workspace_path, ["add", "README.md"])
+    git!(workspace_path, ["commit", "-m", "initial"])
+    workspace_path
+  end
+
+  defp git!(workspace_path, args) do
+    case System.cmd("git", args, cd: workspace_path, stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> flunk("git #{Enum.join(args, " ")} failed with status #{status}: #{output}")
+    end
+  end
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])

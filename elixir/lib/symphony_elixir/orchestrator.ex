@@ -7,13 +7,25 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StageCloseout, StageOrchestrator, StatusDashboard, Tracker, Workflow, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    MarkerParser,
+    StageCloseout,
+    StageOrchestrator,
+    StatusDashboard,
+    Tracker,
+    Workflow,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @marker_region_regex ~r/(<!--\s*SYMPHONY-MARKERS-BEGIN\s*-->)(.*?)(<!--\s*SYMPHONY-MARKERS-END\s*-->)/ms
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -133,7 +145,7 @@ defmodule SymphonyElixir.Orchestrator do
           case reason do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-              maybe_handle_stage_closeout_failure(running_entry)
+              maybe_handle_stage_completion(running_entry)
 
               state
               |> complete_issue(issue_id)
@@ -943,18 +955,177 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
-  defp maybe_handle_stage_closeout_failure(running_entry) when is_map(running_entry) do
+  defp maybe_handle_stage_completion(running_entry) when is_map(running_entry) do
     case run_stage_closeout(running_entry) do
+      {:ok, issue, stage} ->
+        maybe_handle_implement_handoff(issue, running_entry, stage)
+
       {:error, issue, stage, reason} ->
         Logger.warning("Stage closeout failed for #{issue_context(issue)} stage=#{stage} reason=#{inspect(reason)}; moving issue to Rework")
         move_issue_to_rework(issue, stage, reason)
-
-      :ok ->
-        :ok
     end
   end
 
-  defp maybe_handle_stage_closeout_failure(_running_entry), do: :ok
+  defp maybe_handle_stage_completion(_running_entry), do: :ok
+
+  defp maybe_handle_implement_handoff(%Issue{} = issue, running_entry, :implement) do
+    workspace_path = Map.get(running_entry, :workspace_path)
+    worker_host = Map.get(running_entry, :worker_host)
+    issue_identifier = issue.identifier || Map.get(running_entry, :identifier)
+    workpad_text = issue.description || ""
+    head = workspace_head(workspace_path)
+    markers = if is_binary(issue_identifier), do: MarkerParser.parse(workpad_text, issue_identifier), else: []
+
+    cond do
+      !is_binary(issue.id) or !is_binary(issue_identifier) or !is_binary(workspace_path) ->
+        :ok
+
+      is_binary(issue.state) and normalize_issue_state(issue.state) == "rework" ->
+        :ok
+
+      !active_issue_state?(issue.state, active_state_set()) ->
+        :ok
+
+      implement_handoff_ready?(markers, head) ->
+        :ok
+
+      MarkerParser.review_pending?(markers) ->
+        :ok
+
+      true ->
+        case Workspace.run_after_implement_hook(workspace_path, issue, worker_host) do
+          :skip ->
+            :ok
+
+          :ok ->
+            maybe_append_review_request(issue, workpad_text, issue_identifier, workspace_path, markers)
+
+          {:error, reason} ->
+            append_implement_handoff_narration(issue, reason)
+        end
+    end
+  end
+
+  defp maybe_handle_implement_handoff(_issue, _running_entry, _stage), do: :ok
+
+  defp maybe_append_review_request(%Issue{id: issue_id} = issue, workpad_text, issue_identifier, workspace_path, markers)
+       when is_binary(issue_id) and is_binary(issue_identifier) and is_binary(workspace_path) do
+    head = workspace_head(workspace_path)
+
+    with head when is_binary(head) <- head,
+         :ok <- ensure_clean_workspace(workspace_path),
+         {:ok, updated_workpad} <- append_review_request_marker(workpad_text, issue_identifier, head, markers) do
+      case Tracker.update_issue_description(issue_id, updated_workpad) do
+        :ok ->
+          :ok
+
+        {:error, tracker_reason} ->
+          Logger.warning("Failed to append review-request marker to workpad: #{inspect(tracker_reason)}")
+      end
+    else
+      nil ->
+        append_implement_handoff_narration(issue, :missing_head)
+
+      {:error, reason} ->
+        append_implement_handoff_narration(issue, reason)
+    end
+  end
+
+  defp maybe_append_review_request(_issue, _workpad_text, _issue_identifier, _workspace_path, _markers), do: :ok
+
+  defp implement_handoff_ready?(markers, head) when is_binary(head) do
+    MarkerParser.docs_checked_matches_review?(markers) and MarkerParser.latest_review_sha(markers) == head
+  end
+
+  defp implement_handoff_ready?(_markers, _head), do: false
+
+  defp ensure_clean_workspace(workspace_path) when is_binary(workspace_path) do
+    case System.cmd("git", ["status", "--porcelain"], cd: workspace_path, stderr_to_stdout: true) do
+      {output, 0} ->
+        dirty_lines =
+          output
+          |> String.split("\n", trim: true)
+
+        if dirty_lines == [], do: :ok, else: {:error, {:working_tree_dirty, dirty_lines}}
+
+      {output, status} ->
+        {:error, {:git_status_failed, status, String.trim(output)}}
+    end
+  end
+
+  defp ensure_clean_workspace(_workspace_path), do: {:error, :missing_workspace_path}
+
+  defp append_review_request_marker(workpad_text, issue_identifier, reviewed_sha, markers)
+       when is_binary(workpad_text) and is_binary(issue_identifier) and is_binary(reviewed_sha) do
+    round_id = markers |> Enum.map(& &1.round_id) |> Enum.max(fn -> 0 end) |> max(1)
+
+    stage_round =
+      markers
+      |> Enum.filter(&(&1.round_id == round_id and &1.kind == :review_request))
+      |> Enum.map(& &1.stage_round)
+      |> Enum.max(fn -> 0 end)
+      |> Kernel.+(1)
+
+    marker =
+      """
+      ```symphony-marker
+      kind: review-request
+      round_id: #{round_id}
+      stage_round: #{stage_round}
+      reviewed_sha: #{reviewed_sha}
+      issue_identifier: #{issue_identifier}
+      ```
+      """
+      |> String.trim_trailing()
+
+    case Regex.run(@marker_region_regex, workpad_text, capture: :all_but_first) do
+      [begin_marker, body, end_marker] ->
+        trimmed_body = String.trim(body)
+
+        updated_body =
+          case trimmed_body do
+            "" -> "\n" <> marker <> "\n"
+            _ -> "\n" <> trimmed_body <> "\n\n" <> marker <> "\n"
+          end
+
+        {:ok,
+         Regex.replace(
+           @marker_region_regex,
+           workpad_text,
+           begin_marker <> updated_body <> end_marker,
+           global: false
+         )}
+
+      _ ->
+        {:error, :missing_marker_region}
+    end
+  end
+
+  defp append_review_request_marker(_workpad_text, _issue_identifier, _reviewed_sha, _markers),
+    do: {:error, :invalid_review_request_marker}
+
+  defp append_implement_handoff_narration(%Issue{id: issue_id} = issue, reason) when is_binary(issue_id) do
+    narration = implement_handoff_narration(reason)
+
+    case Tracker.update_issue_description(issue_id, append_closeout_narration(issue.description, narration)) do
+      :ok ->
+        :ok
+
+      {:error, tracker_reason} ->
+        Logger.warning("Failed to append implement handoff narration to workpad: #{inspect(tracker_reason)}")
+    end
+  end
+
+  defp append_implement_handoff_narration(_issue, _reason), do: :ok
+
+  defp implement_handoff_narration(reason) do
+    """
+    Symphony implement handoff blocked
+    stage: implement
+    reason: #{inspect(reason)}
+    """
+    |> String.trim_trailing()
+  end
 
   defp run_stage_closeout(running_entry) do
     issue = refresh_issue_for_closeout(running_entry)
@@ -981,7 +1152,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     case result do
-      :ok -> :ok
+      :ok -> {:ok, issue, stage}
       {:error, reason} -> {:error, issue, stage, reason}
     end
   end

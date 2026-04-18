@@ -12,7 +12,7 @@ defmodule SymphonyElixir.PromptBuilder do
     workflow_path = Keyword.get(opts, :workflow_path)
 
     template =
-      (if is_binary(workflow_path), do: Workflow.load(workflow_path), else: Workflow.current())
+      if(is_binary(workflow_path), do: Workflow.load(workflow_path), else: Workflow.current())
       |> prompt_template!(workflow_path)
       |> parse_template!()
 
